@@ -2,6 +2,15 @@ import numpy as np
 import tensorflow as tf
 from typing import Dict
 
+
+def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
+    diff = y_pred - y_true
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(diff)))
+    bias = float(np.mean(diff))
+    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
 def train_lstm_supervised(config: Dict, data_splits, results_dir: str, tag="lstm"):
     L, H = config["L"], config["H"]
     n_in = data_splits["Xtr"].shape[-1]
@@ -37,8 +46,6 @@ def train_lstm_supervised(config: Dict, data_splits, results_dir: str, tag="lstm
 
     tr = model.predict(data_splits["Xtr"], verbose=0)
     te = model.predict(data_splits["Xte"], verbose=0)
-    train_rmse = float(np.sqrt(np.mean((tr.reshape(-1)-data_splits["Ytr"].reshape(-1))**2)))
-    train_mae  = float(np.mean(np.abs(tr.reshape(-1)-data_splits["Ytr"].reshape(-1))))
-    test_rmse  = float(np.sqrt(np.mean((te.reshape(-1)-data_splits["Yte"].reshape(-1))**2)))
-    test_mae   = float(np.mean(np.abs(te.reshape(-1)-data_splits["Yte"].reshape(-1))))
-    return {"model": model, "history": hist, "train_rmse": train_rmse, "train_mae": train_mae, "test_rmse": test_rmse, "test_mae": test_mae}
+    train_stats = _error_stats(data_splits["Ytr"].reshape(-1), tr.reshape(-1))
+    test_stats = _error_stats(data_splits["Yte"].reshape(-1), te.reshape(-1))
+    return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
