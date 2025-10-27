@@ -2,11 +2,11 @@
 
 This repository implements the end-to-end pipeline described in the accompanying research draft for **Regression-GAN (R-GAN)** time-series forecasting. The workflow faithfully mirrors the instructor's original R prototype while extending it with:
 
-- ✅ **Generator/Discriminator inspection** – Experiment runs capture layer-by-layer descriptions and key hyperparameters.
-- ✅ **Expanded metrics** – RMSE, MSE, MAE, and bias for R-GAN, an LSTM baseline, and a naïve persistence model.
-- ✅ **Professor-required figures** – Matching plots for each single model, bar charts for model comparison, the original naïve baseline graphic, classical ETS/ARIMA curves, and learning curves as the sample size grows.
-- ✅ **Noise robustness** – Automatic evaluation with Gaussian noise injected into the test windows.
-- ✅ **Camera-ready paper builder** – Injects every figure, the R-GAN architecture, and an error table into the LaTeX template.
+- **Generator/Discriminator inspection** – Experiment runs capture layer-by-layer descriptions and key hyperparameters.
+- **Expanded metrics** – RMSE, MSE, MAE, and bias for R-GAN, an LSTM baseline, and a naïve persistence model.
+- **Professor-required figures** – Matching plots for each single model, bar charts for model comparison, the original naïve baseline graphic, classical ETS/ARIMA curves, and learning curves as the sample size grows.
+- **Noise robustness** – Automatic evaluation with Gaussian noise injected into the test windows.
+- **Camera-ready paper builder** – Injects every figure, the R-GAN architecture, and an error table into the LaTeX template.
 
 The tooling handles data loading, resampling, interpolation, feature standardisation, sliding-window generation (with optional covariates), GAN/LSTM training with early stopping, automatic tuning, and report generation.
 
