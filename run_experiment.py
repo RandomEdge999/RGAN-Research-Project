@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-import os, json, argparse, numpy as np, pandas as pd
+import json, argparse, numpy as np
 from pathlib import Path
 from datetime import datetime
 
 from src.mit_rgan.data import load_csv_series, interpolate_and_standardize, make_windows_univariate, make_windows_with_covariates
 from src.mit_rgan.models_keras import build_generator, build_discriminator
-from src.mit_rgan.rgan_keras import train_rgan_keras, compute_rmse_mae
+from src.mit_rgan.rgan_keras import train_rgan_keras, compute_metrics
 from src.mit_rgan.lstm_supervised import train_lstm_supervised
 from src.mit_rgan.baselines import naive_baseline, classical_curves_vs_samples
-from src.mit_rgan.plots import plot_single_train_test, plot_compare_models_bars, plot_classical_curves
+from src.mit_rgan.plots import (
+    plot_single_train_test,
+    plot_constant_train_test,
+    plot_compare_models_bars,
+    plot_classical_curves,
+    plot_learning_curves,
+)
 from src.mit_rgan.tune import tune_rgan_keras
 
 import tensorflow as tf
@@ -16,6 +22,127 @@ tf.keras.backend.set_floatx("float32")
 
 def set_seed(seed=42):
     np.random.seed(seed); tf.random.set_seed(seed)
+
+
+def describe_model(model) -> list:
+    """Return a human-readable description of the model layers."""
+    description = []
+    for layer in model.layers:
+        name = layer.__class__.__name__
+        if name == "InputLayer":
+            shape = getattr(layer, "input_shape", None)
+            if shape is not None:
+                description.append(f"Input(shape={tuple(shape[1:])})")
+            else:
+                description.append("Input")
+        elif name == "LSTM":
+            cfg = layer.get_config()
+            description.append(
+                f"LSTM(units={cfg['units']}, return_sequences={cfg['return_sequences']}, "
+                f"activation={cfg['activation']}, recurrent_activation={cfg['recurrent_activation']})"
+            )
+        elif name == "Dense":
+            cfg = layer.get_config()
+            description.append(f"Dense(units={cfg['units']}, activation={cfg.get('activation', 'linear')})")
+        elif name == "Dropout":
+            cfg = layer.get_config()
+            description.append(f"Dropout(rate={cfg['rate']})")
+        elif name == "Reshape":
+            cfg = layer.get_config()
+            description.append(f"Reshape(target_shape={tuple(cfg['target_shape'])})")
+        else:
+            description.append(name)
+    return description
+
+
+def error_stats(y_true, y_pred):
+    diff = y_pred - y_true
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(diff)))
+    bias = float(np.mean(diff))
+    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
+
+def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_features):
+    if args.curve_steps <= 0:
+        return [], {}
+
+    total = len(Xfull_tr)
+    if total < 2:
+        return [], {}
+
+    min_size = max(int(args.curve_min_frac * total), 5)
+    if args.curve_steps == 1:
+        sizes = np.array([total], dtype=int)
+    else:
+        sizes = np.linspace(min_size, total, args.curve_steps, dtype=int)
+    sizes = np.clip(sizes, 2, total)
+    sizes = np.unique(sizes)
+
+    curves = {"R-GAN": [], "LSTM": [], "Naïve": []}
+    used_sizes = []
+    naive_test_stats, _ = naive_baseline(Xte, Yte)
+
+    for size in sizes:
+        if size < 2:
+            continue
+        val_size = max(1, int(0.1 * size))
+        if size - val_size < 1:
+            continue
+
+        Xsubset = Xfull_tr[:size]
+        Ysubset = Yfull_tr[:size]
+        Xtr_sub = Xsubset[:-val_size]
+        Ytr_sub = Ysubset[:-val_size]
+        Xval_sub = Xsubset[-val_size:]
+        Yval_sub = Ysubset[-val_size:]
+
+        data_splits = {
+            "Xtr": Xtr_sub,
+            "Ytr": Ytr_sub,
+            "Xval": Xval_sub,
+            "Yval": Yval_sub,
+            "Xte": Xte,
+            "Yte": Yte,
+        }
+
+        curve_config = dict(base_config)
+        curve_config["epochs"] = max(1, min(base_config["epochs"], args.curve_epochs))
+        curve_config["patience"] = min(curve_config["patience"], curve_config["epochs"])
+
+        set_seed(args.seed)
+        G_curve = build_generator(
+            base_config["L"],
+            base_config["H"],
+            n_in=n_features,
+            units=curve_config["units_g"],
+            dropout=curve_config["dropout"],
+            num_layers=args.g_layers,
+            activation=args.g_activation,
+            recurrent_activation=args.g_recurrent_activation,
+            dense_activation=args.g_dense_activation if args.g_dense_activation else None,
+        )
+        D_curve = build_discriminator(
+            base_config["L"],
+            base_config["H"],
+            units=curve_config["units_d"],
+            dropout=curve_config["dropout"],
+            num_layers=args.d_layers,
+            activation=args.d_activation,
+            recurrent_activation=args.d_recurrent_activation,
+        )
+        rgan_curve_out = train_rgan_keras(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
+        curves["R-GAN"].append(rgan_curve_out["test_stats"]["rmse"])
+
+        set_seed(args.seed)
+        lstm_curve_out = train_lstm_supervised(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
+        curves["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
+
+        curves["Naïve"].append(naive_test_stats["rmse"])
+        used_sizes.append(int(size))
+
+    return used_sizes, curves
 
 def main():
     ap = argparse.ArgumentParser()
@@ -31,6 +158,13 @@ def main():
     ap.add_argument("--lambda_reg", type=float, default=0.1)
     ap.add_argument("--units_g", type=int, default=64)
     ap.add_argument("--units_d", type=int, default=64)
+    ap.add_argument("--g_layers", type=int, default=1)
+    ap.add_argument("--d_layers", type=int, default=1)
+    ap.add_argument("--g_activation", default="tanh")
+    ap.add_argument("--g_recurrent_activation", default="sigmoid")
+    ap.add_argument("--g_dense_activation", default="")
+    ap.add_argument("--d_activation", default="tanh")
+    ap.add_argument("--d_recurrent_activation", default="sigmoid")
     ap.add_argument("--lrG", type=float, default=1e-3)
     ap.add_argument("--lrD", type=float, default=1e-3)
     ap.add_argument("--label_smooth", type=float, default=0.9)
@@ -38,6 +172,9 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=12)
     ap.add_argument("--train_ratio", type=float, default=0.8)
+    ap.add_argument("--curve_steps", type=int, default=4)
+    ap.add_argument("--curve_min_frac", type=float, default=0.4)
+    ap.add_argument("--curve_epochs", type=int, default=40)
     ap.add_argument("--tune", default="true")
     ap.add_argument("--tune_csv", default="")
     ap.add_argument("--results_dir", default="./results")
@@ -86,8 +223,27 @@ def main():
         df_tune_res.to_csv(results_dir/"tuning_results.csv", index=False)
         base_config.update({k: v for k, v in best_hp.items() if k in ["units_g","units_d","lambda_reg"]})
 
-    G = build_generator(args.L, args.H, n_in=Xtr.shape[-1], units=base_config["units_g"], dropout=base_config["dropout"])
-    D = build_discriminator(args.L, args.H, units=base_config["units_d"], dropout=base_config["dropout"])
+    g_dense_act = args.g_dense_activation if args.g_dense_activation else None
+    G = build_generator(
+        args.L,
+        args.H,
+        n_in=Xtr.shape[-1],
+        units=base_config["units_g"],
+        dropout=base_config["dropout"],
+        num_layers=args.g_layers,
+        activation=args.g_activation,
+        recurrent_activation=args.g_recurrent_activation,
+        dense_activation=g_dense_act,
+    )
+    D = build_discriminator(
+        args.L,
+        args.H,
+        units=base_config["units_d"],
+        dropout=base_config["dropout"],
+        num_layers=args.d_layers,
+        activation=args.d_activation,
+        recurrent_activation=args.d_recurrent_activation,
+    )
     rgan_out = train_rgan_keras(base_config, (G,D), {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="rgan")
 
     lstm_out = train_lstm_supervised(base_config, {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="lstm")
@@ -97,8 +253,16 @@ def main():
     plot_single_train_test(lstm_out["history"]["epoch"], lstm_out["history"]["train_rmse"], lstm_out["history"]["test_rmse"],
                            "LSTM (Supervised): Error vs Epochs", results_dir/"lstm_train_test_rmse_vs_epochs.png")
 
-    naive_test_rmse, naive_test_mae = naive_baseline(Xte, Yte)
-    naive_train_rmse, naive_train_mae = naive_baseline(Xtr, Ytr)
+    naive_test_stats, _ = naive_baseline(Xte, Yte)
+    naive_train_stats, _ = naive_baseline(Xtr, Ytr)
+    naive_curve_path = results_dir/"naive_train_test_rmse_vs_epochs.png"
+    plot_constant_train_test(naive_train_stats["rmse"], naive_test_stats["rmse"],
+                             "Naïve Baseline: Error vs Epochs", naive_curve_path)
+
+    learning_sizes, learning_curve_values = compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, Xtr.shape[-1])
+    learning_curve_path = None
+    if learning_sizes:
+        learning_curve_path = plot_learning_curves(learning_sizes, learning_curve_values, results_dir/"ml_error_vs_samples.png")
 
     sizes, ets_curve, arima_curve = classical_curves_vs_samples(prep["train_df"][target_col].values, prep["test_df"][target_col].values, min_frac=0.3, steps=6)
     class_curve_path = plot_classical_curves(sizes, ets_curve, arima_curve, results_dir/"classical_error_vs_samples.png") if sizes is not None else None
@@ -108,33 +272,83 @@ def main():
     # Noise robustness
     noise_sd = 0.05
     Xte_noisy = Xte + np.random.normal(0, noise_sd, size=Xte.shape).astype(Xte.dtype)
-    rgan_noisy_rmse, rgan_noisy_mae, _ = compute_rmse_mae(rgan_out["G"], Xte_noisy, Yte)
+    rgan_noisy_stats, _ = compute_metrics(rgan_out["G"], Xte_noisy, Yte)
     lstm_noisy_pred = lstm_out["model"].predict(Xte_noisy, verbose=0)
-    lstm_noisy_rmse = float(np.sqrt(np.mean((lstm_noisy_pred.reshape(-1)-Yte.reshape(-1))**2)))
-    lstm_noisy_mae  = float(np.mean(np.abs(lstm_noisy_pred.reshape(-1)-Yte.reshape(-1))))
+    lstm_noisy_stats = error_stats(Yte.reshape(-1), lstm_noisy_pred.reshape(-1))
 
-    test_errors = {"R-GAN": rgan_out["test_rmse"], "LSTM": lstm_out["test_rmse"], "Naive": naive_test_rmse}
-    train_errors = {"R-GAN": rgan_out["train_rmse"], "LSTM": lstm_out["train_rmse"], "Naive": naive_train_rmse}
+    test_errors = {"R-GAN": rgan_out["test_stats"]["rmse"], "LSTM": lstm_out["test_stats"]["rmse"], "Naïve": naive_test_stats["rmse"]}
+    train_errors = {"R-GAN": rgan_out["train_stats"]["rmse"], "LSTM": lstm_out["train_stats"]["rmse"], "Naïve": naive_train_stats["rmse"]}
     compare_test = results_dir/"models_test_error.png"; compare_train = results_dir/"models_train_error.png"
     plot_compare_models_bars(train_errors, test_errors, compare_test, compare_train)
 
+    rgan_architecture = {
+        "generator": describe_model(G),
+        "discriminator": describe_model(D),
+    }
+    lstm_architecture = describe_model(lstm_out["model"])
+
+    learning_curves_serializable = {k: [float(v) for v in vals] for k, vals in learning_curve_values.items()}
+
     metrics = dict(
-        dataset=args.csv, tuning_dataset=used_tune, time_col_used=time_used, target_col=target_col,
-        L=args.L, H=args.H, train_size=int(prep["split"]), test_size=len(prep["test_df"]),
-        num_train_windows=int(Xfull_tr.shape[0]), num_test_windows=int(Xte.shape[0]),
-        rgan=dict(train_rmse=rgan_out["train_rmse"], test_rmse=rgan_out["test_rmse"],
-                  train_mae=rgan_out["train_mae"], test_mae=rgan_out["test_mae"],
-                  rmse_noisy=rgan_noisy_rmse, mae_noisy=rgan_noisy_mae,
-                  curve=str(results_dir/"rgan_train_test_rmse_vs_epochs.png"), history=rgan_out["history"]),
-        lstm=dict(train_rmse=lstm_out["train_rmse"], test_rmse=lstm_out["test_rmse"],
-                  train_mae=lstm_out["train_mae"], test_mae=lstm_out["test_mae"],
-                  rmse_noisy=lstm_noisy_rmse, mae_noisy=lstm_noisy_mae,
-                  curve=str(results_dir/"lstm_train_test_rmse_vs_epochs.png"), history=lstm_out["history"]),
-        naive=dict(train_rmse=naive_train_rmse, test_rmse=naive_test_rmse,
-                   train_mae=naive_train_mae, test_mae=naive_test_mae),
+        dataset=args.csv,
+        tuning_dataset=used_tune,
+        time_col_used=time_used,
+        target_col=target_col,
+        L=args.L,
+        H=args.H,
+        train_size=int(prep["split"]),
+        test_size=len(prep["test_df"]),
+        num_train_windows=int(Xfull_tr.shape[0]),
+        num_test_windows=int(Xte.shape[0]),
+        rgan=dict(
+            train=rgan_out["train_stats"],
+            test=rgan_out["test_stats"],
+            noisy=rgan_noisy_stats,
+            curve=str(results_dir/"rgan_train_test_rmse_vs_epochs.png"),
+            history=rgan_out["history"],
+            architecture=rgan_architecture,
+            config=dict(
+                units_g=base_config["units_g"],
+                units_d=base_config["units_d"],
+                lambda_reg=base_config["lambda_reg"],
+                lrG=base_config["lrG"],
+                lrD=base_config["lrD"],
+                dropout=base_config["dropout"],
+                g_layers=args.g_layers,
+                d_layers=args.d_layers,
+                g_activation=args.g_activation,
+                g_recurrent=args.g_recurrent_activation,
+                g_dense=g_dense_act if g_dense_act else "linear",
+                d_activation=args.d_activation,
+                d_recurrent=args.d_recurrent_activation,
+            ),
+        ),
+        lstm=dict(
+            train=lstm_out["train_stats"],
+            test=lstm_out["test_stats"],
+            noisy=lstm_noisy_stats,
+            curve=str(results_dir/"lstm_train_test_rmse_vs_epochs.png"),
+            history=lstm_out["history"],
+            architecture=lstm_architecture,
+            config=dict(units=base_config["units_g"], lr=base_config["lrG"], dropout=base_config["dropout"]),
+        ),
+        naive=dict(
+            train=naive_train_stats,
+            test=naive_test_stats,
+            curve=str(naive_curve_path),
+        ),
         compare_plots=dict(test=str(compare_test), train=str(compare_train)),
-        classical=dict(ets_rmse_full=ets_rmse_full, arima_rmse_full=arima_rmse_full, curves=str(class_curve_path) if class_curve_path else ""),
-        created=datetime.utcnow().isoformat()
+        classical=dict(
+            ets_rmse_full=ets_rmse_full,
+            arima_rmse_full=arima_rmse_full,
+            curves=str(class_curve_path) if class_curve_path else "",
+        ),
+        learning_curves=dict(
+            sizes=[int(s) for s in learning_sizes],
+            curves=learning_curves_serializable,
+            plot=str(learning_curve_path) if learning_curve_path else "",
+        ),
+        created=datetime.utcnow().isoformat(),
     )
     with open(results_dir/"metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
