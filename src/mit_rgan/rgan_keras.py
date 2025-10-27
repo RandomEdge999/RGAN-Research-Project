@@ -33,13 +33,20 @@ def step_generator(G, D, optG, bce, mse, Xb, Yb, lambda_reg=0.1, clip_value=5.0)
     optG.apply_gradients(zip(grads, G.trainable_variables))
     return G_loss, adv_loss, reg_loss
 
-def compute_rmse_mae(G, X, Y) -> Tuple[float, float, np.ndarray]:
+def _error_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    diff = y_pred - y_true
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(diff)))
+    bias = float(np.mean(diff))
+    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
+def compute_metrics(G, X, Y) -> Tuple[Dict[str, float], np.ndarray]:
     Yp = G.predict(X, verbose=0)
     y_true = Y.reshape(-1)
     y_pred = Yp.reshape(-1)
-    rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
-    mae = float(np.mean(np.abs(y_pred - y_true)))
-    return rmse, mae, Yp
+    stats = _error_stats(y_true, y_pred)
+    return stats, Yp
 
 def train_rgan_keras(config: Dict, models, data_splits, results_dir: str, tag="rgan") -> Dict:
     G, D = models
@@ -82,17 +89,20 @@ def train_rgan_keras(config: Dict, models, data_splits, results_dir: str, tag="r
             Gl, Ga, Gr = step_generator(G, D, optG, bce, mse, Xb, Yb, lambda_reg=config["lambda_reg"], clip_value=config["grad_clip"])
             D_losses.append(float(Dl)); G_losses.append(float(Gl)); G_advs.append(float(Ga)); G_regs.append(float(Gr))
 
-        tr_rmse, _, _ = compute_rmse_mae(G, Xtr, Ytr)
-        te_rmse, _, _ = compute_rmse_mae(G, Xte, Yte)
-        va_rmse, _, _ = compute_rmse_mae(G, Xval, Yval)
+        tr_stats, _ = compute_metrics(G, Xtr, Ytr)
+        te_stats, _ = compute_metrics(G, Xte, Yte)
+        va_stats, _ = compute_metrics(G, Xval, Yval)
+        va_rmse = va_stats["rmse"]
 
         hist["epoch"].append(epoch)
         hist["D_loss"].append(np.mean(D_losses)); hist["G_loss"].append(np.mean(G_losses))
         hist["G_adv"].append(np.mean(G_advs));   hist["G_reg"].append(np.mean(G_regs))
-        hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
+        hist["train_rmse"].append(tr_stats["rmse"])
+        hist["test_rmse"].append(te_stats["rmse"])
+        hist["val_rmse"].append(va_stats["rmse"])
 
         print(f"[R-GAN] Epoch {epoch:03d} | D {np.mean(D_losses):.4f} | G {np.mean(G_losses):.4f} | "
-              f"Train {tr_rmse:.5f} | Val {va_rmse:.5f} | Test {te_rmse:.5f}")
+              f"Train {tr_stats['rmse']:.5f} | Val {va_stats['rmse']:.5f} | Test {te_stats['rmse']:.5f}")
 
         if va_rmse < best_val - 1e-7:
             best_val = va_rmse; best_weights = G.get_weights(); bad_epochs = 0
@@ -104,12 +114,12 @@ def train_rgan_keras(config: Dict, models, data_splits, results_dir: str, tag="r
     if best_weights is not None:
         G.set_weights(best_weights)
 
-    train_rmse, train_mae, _ = compute_rmse_mae(G, Xtr, Ytr)
-    test_rmse, test_mae, Y_pred = compute_rmse_mae(G, Xte, Yte)
+    train_stats, _ = compute_metrics(G, Xtr, Ytr)
+    test_stats, Y_pred = compute_metrics(G, Xte, Yte)
 
     return {
         "G": G, "D": D, "history": hist,
-        "train_rmse": train_rmse, "train_mae": train_mae,
-        "test_rmse": test_rmse, "test_mae": test_mae,
+        "train_stats": train_stats,
+        "test_stats": test_stats,
         "pred_test": Y_pred
     }
