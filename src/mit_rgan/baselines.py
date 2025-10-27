@@ -8,14 +8,20 @@ try:
 except Exception:
     _HAS_STATSMODELS = False
 
+def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
+    diff = y_pred - y_true
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(diff)))
+    bias = float(np.mean(diff))
+    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
 def naive_baseline(X, Y):
     H = Y.shape[1]
     last_vals = X[:, -1, 0:1]
     naive_pred = np.repeat(last_vals[:, None, :], H, axis=1)
-    y_true = Y.reshape(-1); y_pred = naive_pred.reshape(-1)
-    rmse = float(np.sqrt(np.mean((y_pred - y_true)**2)))
-    mae = float(np.mean(np.abs(y_pred - y_true)))
-    return rmse, mae
+    stats = _error_stats(Y.reshape(-1), naive_pred.reshape(-1))
+    return stats, naive_pred
 
 def classical_curves_vs_samples(train_series, test_series, min_frac=0.3, steps=6):
     if not _HAS_STATSMODELS:
