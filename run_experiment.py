@@ -7,13 +7,15 @@ from src.mit_rgan.data import load_csv_series, interpolate_and_standardize, make
 from src.mit_rgan.models_keras import build_generator, build_discriminator
 from src.mit_rgan.rgan_keras import train_rgan_keras, compute_metrics
 from src.mit_rgan.lstm_supervised import train_lstm_supervised
-from src.mit_rgan.baselines import naive_baseline, classical_curves_vs_samples
+from src.mit_rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
 from src.mit_rgan.plots import (
     plot_single_train_test,
     plot_constant_train_test,
     plot_compare_models_bars,
     plot_classical_curves,
     plot_learning_curves,
+    create_error_metrics_table,
+    plot_naive_bayes_comparison,
 )
 from src.mit_rgan.tune import tune_rgan_keras
 
@@ -80,9 +82,10 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
     sizes = np.clip(sizes, 2, total)
     sizes = np.unique(sizes)
 
-    curves = {"R-GAN": [], "LSTM": [], "Naïve": []}
+    curves = {"R-GAN": [], "LSTM": [], "Naïve Baseline": [], "Naïve Bayes": []}
     used_sizes = []
     naive_test_stats, _ = naive_baseline(Xte, Yte)
+    naive_bayes_test_stats, _ = naive_bayes_forecast(Xte, Yte)
 
     for size in sizes:
         if size < 2:
@@ -139,7 +142,9 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
         lstm_curve_out = train_lstm_supervised(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
         curves["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
 
-        curves["Naïve"].append(naive_test_stats["rmse"])
+        # Naïve baseline and Naïve Bayes don't need training, just use test stats
+        curves["Naïve Baseline"].append(naive_test_stats["rmse"])
+        curves["Naïve Bayes"].append(naive_bayes_test_stats["rmse"])
         used_sizes.append(int(size))
 
     return used_sizes, curves
@@ -172,14 +177,21 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=12)
     ap.add_argument("--train_ratio", type=float, default=0.8)
-    ap.add_argument("--curve_steps", type=int, default=4)
+    ap.add_argument("--curve_steps", type=int, default=0)
     ap.add_argument("--curve_min_frac", type=float, default=0.4)
     ap.add_argument("--curve_epochs", type=int, default=40)
-    ap.add_argument("--tune", default="true")
+    ap.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run the R-GAN hyperparameter sweep (disabled by default).",
+    )
     ap.add_argument("--tune_csv", default="")
     ap.add_argument("--results_dir", default="./results")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    if args.tune_csv and not args.tune:
+        args.tune = True
 
     set_seed(args.seed)
     results_dir = Path(args.results_dir); results_dir.mkdir(parents=True, exist_ok=True)
@@ -206,7 +218,7 @@ def main():
     )
 
     used_tune = ""
-    if args.tune.lower() == "true":
+    if args.tune:
         if args.tune_csv:
             df_tune, target_tune, _ = load_csv_series(args.tune_csv, args.target, args.time_col, args.resample, args.agg)
             prep_t = interpolate_and_standardize(df_tune, target_tune, train_ratio=args.train_ratio)
@@ -259,6 +271,17 @@ def main():
     plot_constant_train_test(naive_train_stats["rmse"], naive_test_stats["rmse"],
                              "Naïve Baseline: Error vs Epochs", naive_curve_path)
 
+    # Naïve Bayes implementation
+    naive_bayes_test_stats, _ = naive_bayes_forecast(Xte, Yte)
+    naive_bayes_train_stats, _ = naive_bayes_forecast(Xtr, Ytr)
+    naive_bayes_curve_path = results_dir/"naive_bayes_train_test_rmse_vs_epochs.png"
+    plot_constant_train_test(naive_bayes_train_stats["rmse"], naive_bayes_test_stats["rmse"],
+                             "Naïve Bayes: Error vs Epochs", naive_bayes_curve_path)
+
+    # Plot comparison between Naïve Baseline and Naïve Bayes (similar to Fig 1)
+    naive_comparison_path = results_dir/"naive_baseline_vs_naive_bayes.png"
+    plot_naive_bayes_comparison(naive_test_stats, naive_bayes_test_stats, naive_comparison_path)
+
     learning_sizes, learning_curve_values = compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, Xtr.shape[-1])
     learning_curve_path = None
     if learning_sizes:
@@ -276,10 +299,38 @@ def main():
     lstm_noisy_pred = lstm_out["model"].predict(Xte_noisy, verbose=0)
     lstm_noisy_stats = error_stats(Yte.reshape(-1), lstm_noisy_pred.reshape(-1))
 
-    test_errors = {"R-GAN": rgan_out["test_stats"]["rmse"], "LSTM": lstm_out["test_stats"]["rmse"], "Naïve": naive_test_stats["rmse"]}
-    train_errors = {"R-GAN": rgan_out["train_stats"]["rmse"], "LSTM": lstm_out["train_stats"]["rmse"], "Naïve": naive_train_stats["rmse"]}
+    test_errors = {"R-GAN": rgan_out["test_stats"]["rmse"], "LSTM": lstm_out["test_stats"]["rmse"], "Naïve Baseline": naive_test_stats["rmse"], "Naïve Bayes": naive_bayes_test_stats["rmse"]}
+    train_errors = {"R-GAN": rgan_out["train_stats"]["rmse"], "LSTM": lstm_out["train_stats"]["rmse"], "Naïve Baseline": naive_train_stats["rmse"], "Naïve Bayes": naive_bayes_train_stats["rmse"]}
     compare_test = results_dir/"models_test_error.png"; compare_train = results_dir/"models_train_error.png"
     plot_compare_models_bars(train_errors, test_errors, compare_test, compare_train)
+
+    # Create comprehensive error metrics table
+    model_results = {
+        "R-GAN": {
+            "train": rgan_out["train_stats"],
+            "test": rgan_out["test_stats"]
+        },
+        "LSTM": {
+            "train": lstm_out["train_stats"],
+            "test": lstm_out["test_stats"]
+        },
+        "Naïve Baseline": {
+            "train": naive_train_stats,
+            "test": naive_test_stats
+        },
+        "Naïve Bayes": {
+            "train": naive_bayes_train_stats,
+            "test": naive_bayes_test_stats
+        }
+    }
+    
+    # Generate and save error metrics table
+    metrics_table = create_error_metrics_table(model_results, results_dir/"error_metrics_table.csv")
+    print("\n" + "="*80)
+    print("ERROR METRICS TABLE (RMSE, MSE, BIAS, MAE)")
+    print("="*80)
+    print(metrics_table.to_string(index=False))
+    print("="*80)
 
     rgan_architecture = {
         "generator": describe_model(G),
@@ -332,12 +383,17 @@ def main():
             architecture=lstm_architecture,
             config=dict(units=base_config["units_g"], lr=base_config["lrG"], dropout=base_config["dropout"]),
         ),
-        naive=dict(
+        naive_baseline=dict(
             train=naive_train_stats,
             test=naive_test_stats,
             curve=str(naive_curve_path),
         ),
-        compare_plots=dict(test=str(compare_test), train=str(compare_train)),
+        naive_bayes=dict(
+            train=naive_bayes_train_stats,
+            test=naive_bayes_test_stats,
+            curve=str(naive_bayes_curve_path),
+        ),
+        compare_plots=dict(test=str(compare_test), train=str(compare_train), naive_comparison=str(naive_comparison_path)),
         classical=dict(
             ets_rmse_full=ets_rmse_full,
             arima_rmse_full=arima_rmse_full,
