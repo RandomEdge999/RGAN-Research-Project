@@ -3,8 +3,8 @@
 This repository implements the end-to-end pipeline described in the accompanying research draft for **Regression-GAN (R-GAN)** time-series forecasting. The workflow faithfully mirrors the instructor's original R prototype while extending it with:
 
 - **Generator/Discriminator inspection** – Experiment runs capture layer-by-layer descriptions and key hyperparameters.
-- **Expanded metrics** – RMSE, MSE, MAE, and bias for R-GAN, an LSTM baseline, and a naïve persistence model.
-- **Professor-required figures** – Matching plots for each single model, bar charts for model comparison, the original naïve baseline graphic, classical ETS/ARIMA curves, and learning curves as the sample size grows.
+- **Expanded metrics** – RMSE, MSE, MAE, and bias for R-GAN, an LSTM baseline, the naïve persistence model, and the Gaussian Naïve Bayes baseline.
+- **Professor-required figures** – Matching plots for each single model (including Naïve Bayes), bar charts for model comparison, the original naïve baseline graphic plus a baseline-vs-Naïve Bayes comparison, classical ETS/ARIMA curves, and learning curves as the sample size grows.
 - **Noise robustness** – Automatic evaluation with Gaussian noise injected into the test windows.
 - **Camera-ready paper builder** – Injects every figure, the R-GAN architecture, and an error table into the LaTeX template.
 
@@ -94,6 +94,8 @@ Running `run_experiment.py` populates the chosen `--results_dir` with:
   - `rgan_train_test_rmse_vs_epochs.png`
   - `lstm_train_test_rmse_vs_epochs.png`
   - `naive_train_test_rmse_vs_epochs.png`
+  - `naive_bayes_train_test_rmse_vs_epochs.png`
+  - `naive_baseline_vs_naive_bayes.png`
   - `models_test_error.png` / `models_train_error.png`
   - `classical_error_vs_samples.png` (when ETS/ARIMA fits succeed)
   - `ml_error_vs_samples.png` (learning curves for R-GAN, LSTM, Naïve)
