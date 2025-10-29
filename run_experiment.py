@@ -4,9 +4,9 @@ from pathlib import Path
 from datetime import datetime
 
 from src.mit_rgan.data import load_csv_series, interpolate_and_standardize, make_windows_univariate, make_windows_with_covariates
-from src.mit_rgan.models_keras import build_generator, build_discriminator
-from src.mit_rgan.rgan_keras import train_rgan_keras, compute_metrics
-from src.mit_rgan.lstm_supervised import train_lstm_supervised
+from src.mit_rgan.models_keras import build_generator as build_generator_tf, build_discriminator as build_discriminator_tf
+from src.mit_rgan.rgan_keras import train_rgan_keras as train_rgan_tf, compute_metrics as compute_metrics_tf
+from src.mit_rgan.lstm_supervised import train_lstm_supervised as train_lstm_tf
 from src.mit_rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
 from src.mit_rgan.plots import (
     plot_single_train_test,
@@ -114,7 +114,27 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
         curve_config["patience"] = min(curve_config["patience"], curve_config["epochs"])
 
         set_seed(args.seed)
-        G_curve = build_generator(
+        if args.backend == "torch":
+            from src.mit_rgan.models_torch import build_generator as build_generator_th, build_discriminator as build_discriminator_th
+            from src.mit_rgan.rgan_torch import train_rgan_torch as train_rgan_backend
+            from src.mit_rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
+            G_curve = build_generator_th(
+                base_config["L"],
+                base_config["H"],
+                n_in=n_features,
+                units=curve_config["units_g"],
+                dropout=curve_config["dropout"],
+                num_layers=args.g_layers,
+            )
+            D_curve = build_discriminator_th(
+                base_config["L"],
+                base_config["H"],
+                units=curve_config["units_d"],
+                dropout=curve_config["dropout"],
+                num_layers=args.d_layers,
+            )
+        else:
+            G_curve = build_generator_tf(
             base_config["L"],
             base_config["H"],
             n_in=n_features,
@@ -124,8 +144,8 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
             activation=args.g_activation,
             recurrent_activation=args.g_recurrent_activation,
             dense_activation=args.g_dense_activation if args.g_dense_activation else None,
-        )
-        D_curve = build_discriminator(
+            )
+            D_curve = build_discriminator_tf(
             base_config["L"],
             base_config["H"],
             units=curve_config["units_d"],
@@ -133,12 +153,14 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
             num_layers=args.d_layers,
             activation=args.d_activation,
             recurrent_activation=args.d_recurrent_activation,
-        )
-        rgan_curve_out = train_rgan_keras(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
+            )
+        if args.backend == "torch":
+            rgan_curve_out = train_rgan_backend(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
+            lstm_curve_out = train_lstm_backend(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
+        else:
+            rgan_curve_out = train_rgan_tf(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
+            lstm_curve_out = train_lstm_tf(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
         curves["R-GAN"].append(rgan_curve_out["test_stats"]["rmse"])
-
-        set_seed(args.seed)
-        lstm_curve_out = train_lstm_supervised(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
         curves["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
 
         # Naïve baseline does not require training and stays constant across sizes
@@ -180,6 +202,7 @@ def main():
     ap.add_argument("--curve_steps", type=int, default=0)
     ap.add_argument("--curve_min_frac", type=float, default=0.4)
     ap.add_argument("--curve_epochs", type=int, default=40)
+    ap.add_argument("--backend", choices=["tf","torch"], default="tf")
     ap.add_argument(
         "--tune",
         action="store_true",
@@ -236,29 +259,40 @@ def main():
         base_config.update({k: v for k, v in best_hp.items() if k in ["units_g","units_d","lambda_reg"]})
 
     g_dense_act = args.g_dense_activation if args.g_dense_activation else None
-    G = build_generator(
+    if args.backend == "torch":
+        from src.mit_rgan.models_torch import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
+        from src.mit_rgan.rgan_torch import train_rgan_torch as train_rgan_backend, compute_metrics as compute_metrics_backend
+        from src.mit_rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
+    else:
+        build_generator_backend = build_generator_tf
+        build_discriminator_backend = build_discriminator_tf
+        train_rgan_backend = train_rgan_tf
+        compute_metrics_backend = compute_metrics_tf
+        train_lstm_backend = train_lstm_tf
+
+    G = build_generator_backend(
         args.L,
         args.H,
         n_in=Xtr.shape[-1],
         units=base_config["units_g"],
         dropout=base_config["dropout"],
         num_layers=args.g_layers,
-        activation=args.g_activation,
-        recurrent_activation=args.g_recurrent_activation,
-        dense_activation=g_dense_act,
+        activation=args.g_activation if args.backend=="tf" else None,
+        recurrent_activation=args.g_recurrent_activation if args.backend=="tf" else None,
+        dense_activation=g_dense_act if args.backend=="tf" else None,
     )
-    D = build_discriminator(
+    D = build_discriminator_backend(
         args.L,
         args.H,
         units=base_config["units_d"],
         dropout=base_config["dropout"],
         num_layers=args.d_layers,
-        activation=args.d_activation,
-        recurrent_activation=args.d_recurrent_activation,
+        activation=args.d_activation if args.backend=="tf" else None,
+        recurrent_activation=args.d_recurrent_activation if args.backend=="tf" else None,
     )
-    rgan_out = train_rgan_keras(base_config, (G,D), {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="rgan")
+    rgan_out = train_rgan_backend(base_config, (G,D), {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="rgan")
 
-    lstm_out = train_lstm_supervised(base_config, {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="lstm")
+    lstm_out = train_lstm_backend(base_config, {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="lstm")
 
     plot_single_train_test(rgan_out["history"]["epoch"], rgan_out["history"]["train_rmse"], rgan_out["history"]["test_rmse"],
                            "R-GAN: Error vs Epochs", results_dir/"rgan_train_test_rmse_vs_epochs.png")
@@ -295,9 +329,16 @@ def main():
     # Noise robustness
     noise_sd = 0.05
     Xte_noisy = Xte + np.random.normal(0, noise_sd, size=Xte.shape).astype(Xte.dtype)
-    rgan_noisy_stats, _ = compute_metrics(rgan_out["G"], Xte_noisy, Yte)
-    lstm_noisy_pred = lstm_out["model"].predict(Xte_noisy, verbose=0)
-    lstm_noisy_stats = error_stats(Yte.reshape(-1), lstm_noisy_pred.reshape(-1))
+    rgan_noisy_stats, _ = (compute_metrics_backend(rgan_out["G"], Xte_noisy, Yte))
+    if args.backend == "torch":
+        import torch
+        device = next(lstm_out["model"].parameters()).device
+        with torch.no_grad():
+            yp = lstm_out["model"](torch.from_numpy(Xte_noisy).to(device)).cpu().numpy()
+        lstm_noisy_stats = error_stats(Yte.reshape(-1), yp.reshape(-1))
+    else:
+        lstm_noisy_pred = lstm_out["model"].predict(Xte_noisy, verbose=0)
+        lstm_noisy_stats = error_stats(Yte.reshape(-1), lstm_noisy_pred.reshape(-1))
 
     test_errors = {"R-GAN": rgan_out["test_stats"]["rmse"], "LSTM": lstm_out["test_stats"]["rmse"], "Naïve Baseline": naive_test_stats["rmse"], "Naïve Bayes": naive_bayes_test_stats["rmse"]}
     train_errors = {"R-GAN": rgan_out["train_stats"]["rmse"], "LSTM": lstm_out["train_stats"]["rmse"], "Naïve Baseline": naive_train_stats["rmse"], "Naïve Bayes": naive_bayes_train_stats["rmse"]}
