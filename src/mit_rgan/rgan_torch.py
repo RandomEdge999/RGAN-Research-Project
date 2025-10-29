@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from typing import Dict, Tuple
 
 
@@ -35,7 +36,7 @@ def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], n
                 while idx < n_samples:
                     end = min(idx + bs, n_samples)
                     Xb = torch.from_numpy(X[idx:end]).to(device=device)
-                    with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                    with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
                         Yb = G(Xb).detach().cpu().numpy()
                     Yp[idx:end] = Yb
                     idx = end
@@ -61,7 +62,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
 
     optG = torch.optim.Adam(G.parameters(), lr=config["lrG"])
     optD = torch.optim.Adam(D.parameters(), lr=config["lrD"])
-    bce = nn.BCELoss()
+    bce = nn.BCEWithLogitsLoss()
     mse = nn.MSELoss()
 
     best_val = float("inf")
@@ -70,28 +71,43 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     batch_size = config["batch_size"]
 
     amp_enabled = bool(config.get("amp", True)) and (device.type == "cuda")
-    scaler_G = torch.cuda.amp.GradScaler(enabled=amp_enabled)
-    scaler_D = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler_G = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
+    scaler_D = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
 
     hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [],
             "D_loss": [], "G_loss": [], "G_adv": [], "G_reg": []}
 
-    N = len(Xtr)
-    steps = max(1, int(np.ceil(N / batch_size)))
+    # DataLoader configuration
+    num_workers = int(config.get("num_workers", 2))
+    prefetch_factor = int(config.get("prefetch_factor", 2))
+    persistent_workers = bool(config.get("persistent_workers", True)) and num_workers > 0
+    pin_memory = bool(config.get("pin_memory", device.type == "cuda"))
+
+    # Build TensorDataset/DataLoader for training
+    Xtr_t = torch.from_numpy(Xtr)
+    Ytr_t = torch.from_numpy(Ytr)
+    train_ds = TensorDataset(Xtr_t, Ytr_t)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers,
+    )
 
     for epoch in range(1, config["epochs"] + 1):
-        perm = np.random.permutation(N)
         D_losses, G_losses, G_advs, G_regs = [], [], [], []
-        for s in range(steps):
-            b0 = s * batch_size; b1 = min((s + 1) * batch_size, N)
-            idx = perm[b0:b1]
-            Xb = torch.from_numpy(Xtr[idx]).to(device)
-            Yb = torch.from_numpy(Ytr[idx]).to(device)
+        for Xb, Yb in train_loader:
+            Xb = Xb.to(device, non_blocking=True)
+            Yb = Yb.to(device, non_blocking=True)
 
             # Discriminator step
             G.train(); D.train()
             optD.zero_grad()
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
                 Y_fake = G(Xb)
                 real_pairs = torch.cat([Xb[..., :1], Yb], dim=1)
                 fake_pairs = torch.cat([Xb[..., :1], Y_fake.detach()], dim=1)
@@ -110,7 +126,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
 
             # Generator step
             optG.zero_grad()
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
                 Y_fake = G(Xb)
                 fake_pairs = torch.cat([Xb[..., :1], Y_fake], dim=1)
                 D_fake = D(fake_pairs)
