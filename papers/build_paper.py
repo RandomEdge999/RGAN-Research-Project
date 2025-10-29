@@ -29,7 +29,14 @@ def hyperparam_summary(cfg):
 
 def build_error_rows(metrics):
     rows = []
-    for key, label in [("rgan", "R-GAN"), ("lstm", "LSTM"), ("naive", "Naïve")]:
+    for key, label in [
+        ("rgan", "R-GAN"),
+        ("lstm", "LSTM"),
+        ("naive_baseline", "Naïve Baseline"),
+        ("naive_bayes", "Naïve Bayes"),
+    ]:
+        if key not in metrics:
+            continue
         train = metrics[key].get("train", {})
         test = metrics[key].get("test", {})
         row = "{} & {} & {} & {} & {} & {} & {} \\\\".format(
@@ -59,9 +66,11 @@ def main():
     filled = template.read_text() % dict(
         rgan_curve=m["rgan"]["curve"],
         lstm_curve=m["lstm"]["curve"],
-        naive_curve=m["naive"].get("curve") or m["rgan"]["curve"],
+        naive_curve=m["naive_baseline"].get("curve") or m["rgan"]["curve"],
+        naive_bayes_curve=m["naive_bayes"].get("curve") or m["lstm"]["curve"],
         compare_test=m["compare_plots"]["test"],
         compare_train=m["compare_plots"]["train"],
+        naive_comparison=m["compare_plots"].get("naive_comparison", m["compare_plots"]["test"]),
         classical_curve=m["classical"]["curves"] if m["classical"].get("curves") else m["compare_plots"]["test"],
         learning_curve=learning_curve_plot,
         generator_arch=to_itemize(m["rgan"]["architecture"]["generator"]),
