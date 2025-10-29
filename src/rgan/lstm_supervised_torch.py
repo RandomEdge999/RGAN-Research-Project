@@ -27,6 +27,22 @@ class LSTMSupervised(nn.Module):
         return y.view(y.size(0), -1, 1)
 
 
+def _predict_in_batches(model: nn.Module, data: np.ndarray, device: torch.device, batch_size: int) -> np.ndarray:
+    """Run model inference on ``data`` without exhausting GPU memory."""
+
+    if len(data) == 0:
+        out_dim = getattr(model, "fc", None).out_features if hasattr(model, "fc") else data.shape[1]
+        return np.empty((0, out_dim, 1), dtype=np.float32)
+
+    preds = []
+    with torch.no_grad():
+        for start in range(0, len(data), batch_size):
+            stop = start + batch_size
+            xb = torch.from_numpy(data[start:stop]).to(device)
+            preds.append(model(xb).cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
 def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag="lstm"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     L, H = config["L"], config["H"]
@@ -65,10 +81,10 @@ def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag
                 opt.step()
 
             model.eval()
-            with torch.no_grad():
-                tr = model(torch.from_numpy(Xtr).to(device)).cpu().numpy()
-                te = model(torch.from_numpy(Xte).to(device)).cpu().numpy()
-                va = model(torch.from_numpy(Xval).to(device)).cpu().numpy()
+            eval_batch_size = max(1, min(batch_size, 1024))
+            tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
+            te = _predict_in_batches(model, Xte, device, eval_batch_size)
+            va = _predict_in_batches(model, Xval, device, eval_batch_size)
             tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
             te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
             va_rmse = float(np.sqrt(np.mean((va.reshape(-1) - Yval.reshape(-1)) ** 2)))
@@ -86,9 +102,9 @@ def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    with torch.no_grad():
-        tr = model(torch.from_numpy(Xtr).to(device)).cpu().numpy()
-        te = model(torch.from_numpy(Xte).to(device)).cpu().numpy()
+    eval_batch_size = max(1, min(batch_size, 1024))
+    tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
+    te = _predict_in_batches(model, Xte, device, eval_batch_size)
     train_stats = _error_stats(Ytr.reshape(-1), tr.reshape(-1))
     test_stats = _error_stats(Yte.reshape(-1), te.reshape(-1))
     return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
