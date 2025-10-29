@@ -214,6 +214,19 @@ def main():
     ap.add_argument("--curve_steps", type=int, default=0)
     ap.add_argument("--curve_min_frac", type=float, default=0.4)
     ap.add_argument("--curve_epochs", type=int, default=40)
+    # Torch-specific runtime knobs (safe to ignore on TF backend)
+    ap.add_argument("--amp", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
+                    help="Enable automatic mixed precision for torch backend")
+    ap.add_argument("--eval_batch_size", type=int, default=512,
+                    help="Evaluation batch size for torch backend")
+    ap.add_argument("--num_workers", type=int, default=2,
+                    help="DataLoader workers (torch backend)")
+    ap.add_argument("--prefetch_factor", type=int, default=2,
+                    help="DataLoader prefetch_factor (torch backend)")
+    ap.add_argument("--persistent_workers", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
+                    help="Use persistent workers for DataLoader (torch backend)")
+    ap.add_argument("--pin_memory", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
+                    help="Pin host memory for faster H2D copies (torch backend)")
     ap.add_argument("--backend", choices=["tf","torch"], default="tf")
     ap.add_argument(
         "--tune",
@@ -298,6 +311,13 @@ def main():
         patience=args.patience,
         g_layers=args.g_layers,
         d_layers=args.d_layers,
+        # Torch runtime knobs
+        amp=args.amp,
+        eval_batch_size=args.eval_batch_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
+        pin_memory=args.pin_memory,
     )
 
     used_tune = ""
