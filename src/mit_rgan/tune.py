@@ -33,8 +33,21 @@ def tune_rgan_keras(hp_grid: Dict, base_config: Dict, data_splits: Dict, results
                 cfg = dict(base_config); cfg.update({"units_g": units_g, "units_d": units_d, "lambda_reg": lambda_reg, "epochs": hp_grid.get("epochs_each", 30)})
                 if clear_session is not None:
                     clear_session()
-                G = build_generator_backend(cfg["L"], cfg["H"], n_in=Xtr.shape[-1], units=units_g, dropout=cfg["dropout"])
-                D = build_discriminator_backend(cfg["L"], cfg["H"], units=units_d, dropout=cfg["dropout"])
+                G = build_generator_backend(
+                    cfg["L"],
+                    cfg["H"],
+                    n_in=Xtr.shape[-1],
+                    units=units_g,
+                    dropout=cfg["dropout"],
+                    num_layers=cfg.get("g_layers", 1),
+                )
+                D = build_discriminator_backend(
+                    cfg["L"],
+                    cfg["H"],
+                    units=units_d,
+                    dropout=cfg["dropout"],
+                    num_layers=cfg.get("d_layers", 1),
+                )
                 splits = dict(Xtr=Xtr, Ytr=Ytr, Xval=Xval, Yval=Yval, Xte=Xval, Yte=Yval)
                 out = train_rgan_backend(cfg, (G,D), splits, results_dir, tag=f"tune_g{units_g}_d{units_d}_l{lambda_reg}")
                 val_rmse = out["history"]["val_rmse"][-1]
