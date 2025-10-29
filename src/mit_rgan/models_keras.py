@@ -2,6 +2,43 @@ from typing import Optional
 
 import tensorflow as tf
 
+"""
+RGAN (Recurrent Generative Adversarial Network) Architecture Documentation
+=======================================================================
+
+This module implements the RGAN architecture for time series forecasting, consisting of:
+
+1. GENERATOR ARCHITECTURE:
+   - Input: Sequential data of shape (L, n_in) where L is sequence length and n_in is number of features
+   - LSTM Stack: Configurable number of LSTM layers with dropout regularization
+   - Dense Layer: Projects LSTM output to forecast horizon H
+   - Reshape: Outputs predictions of shape (H, 1) for H-step ahead forecasting
+   
+   Purpose: Generates realistic future time series values that fool the discriminator
+   
+2. DISCRIMINATOR ARCHITECTURE:
+   - Input: Concatenated sequences of shape (L + H, 1) - input sequence + generated/predicted sequence
+   - LSTM Stack: Configurable number of LSTM layers with dropout regularization  
+   - Dense Layer: Single output with sigmoid activation for real/fake classification
+   
+   Purpose: Distinguishes between real historical patterns and generated predictions
+   
+3. TRAINING PROCESS:
+   - Adversarial Training: Generator tries to fool discriminator, discriminator learns to detect fakes
+   - Regularization Loss: MSE between generated and actual values ensures realistic predictions
+   - Combined Loss: G_loss = adversarial_loss + λ * regularization_loss
+   
+4. KEY PARAMETERS:
+   - L: Input sequence length (lookback window)
+   - H: Forecast horizon (number of future steps to predict)
+   - units: Number of LSTM units in each layer
+   - num_layers: Depth of LSTM stack
+   - dropout: Regularization rate
+   - activation: LSTM activation function (default: tanh)
+   - recurrent_activation: LSTM recurrent activation (default: sigmoid)
+   - lambda_reg: Regularization weight in generator loss
+"""
+
 def _apply_lstm_stack(x, units, num_layers, dropout, prefix, activation, recurrent_activation):
     """Builds a stack of LSTM layers with optional dropout between layers."""
     for i in range(num_layers):

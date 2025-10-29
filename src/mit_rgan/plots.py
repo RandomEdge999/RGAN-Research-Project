@@ -1,4 +1,6 @@
 import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 
 
 def plot_single_train_test(curve_epoch, train_rmse, test_rmse, title, out_path, ylabel="RMSE"):
@@ -75,5 +77,85 @@ def plot_learning_curves(sizes, curves: dict, out_path, ylabel="RMSE"):
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
+    plt.close()
+    return out_path
+
+def create_error_metrics_table(model_results: dict, out_path: str = None):
+    """
+    Create a comprehensive error metrics table showing RMSE, MSE, and BIAS for all models.
+    
+    Args:
+        model_results: Dictionary containing results for each model
+        out_path: Optional path to save the table as CSV
+    
+    Returns:
+        pandas.DataFrame: Formatted error metrics table
+    """
+    # Prepare data for the table
+    data = []
+    
+    for model_name, results in model_results.items():
+        if 'train' in results and 'test' in results:
+            # Training metrics
+            train_row = {
+                'Model': f"{model_name} (Train)",
+                'RMSE': f"{results['train']['rmse']:.6f}",
+                'MSE': f"{results['train']['mse']:.6f}",
+                'BIAS': f"{results['train']['bias']:.6f}",
+                'MAE': f"{results['train']['mae']:.6f}"
+            }
+            data.append(train_row)
+            
+            # Test metrics
+            test_row = {
+                'Model': f"{model_name} (Test)",
+                'RMSE': f"{results['test']['rmse']:.6f}",
+                'MSE': f"{results['test']['mse']:.6f}",
+                'BIAS': f"{results['test']['bias']:.6f}",
+                'MAE': f"{results['test']['mae']:.6f}"
+            }
+            data.append(test_row)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data)
+    
+    # Save to CSV if path provided
+    if out_path:
+        df.to_csv(out_path, index=False)
+        print(f"Error metrics table saved to: {out_path}")
+    
+    return df
+
+def plot_naive_bayes_comparison(naive_baseline_stats, naive_bayes_stats, out_path):
+    """
+    Plot comparison between Naive Baseline and Naive Bayes (similar to Fig 1).
+    """
+    models = ['Naive Baseline', 'Naive Bayes']
+    rmse_values = [naive_baseline_stats['rmse'], naive_bayes_stats['rmse']]
+    mse_values = [naive_baseline_stats['mse'], naive_bayes_stats['mse']]
+    bias_values = [naive_baseline_stats['bias'], naive_bayes_stats['bias']]
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # RMSE comparison
+    ax1.bar(models, rmse_values, color=['skyblue', 'lightcoral'])
+    ax1.set_title('RMSE Comparison')
+    ax1.set_ylabel('RMSE')
+    ax1.tick_params(axis='x', rotation=45)
+    
+    # MSE comparison
+    ax2.bar(models, mse_values, color=['skyblue', 'lightcoral'])
+    ax2.set_title('MSE Comparison')
+    ax2.set_ylabel('MSE')
+    ax2.tick_params(axis='x', rotation=45)
+    
+    # BIAS comparison
+    ax3.bar(models, bias_values, color=['skyblue', 'lightcoral'])
+    ax3.set_title('BIAS Comparison')
+    ax3.set_ylabel('BIAS')
+    ax3.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
     return out_path

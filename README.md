@@ -8,7 +8,7 @@ This repository implements the end-to-end pipeline described in the accompanying
 - **Noise robustness** – Automatic evaluation with Gaussian noise injected into the test windows.
 - **Camera-ready paper builder** – Injects every figure, the R-GAN architecture, and an error table into the LaTeX template.
 
-The tooling handles data loading, resampling, interpolation, feature standardisation, sliding-window generation (with optional covariates), GAN/LSTM training with early stopping, automatic tuning, and report generation.
+The tooling handles data loading, resampling, interpolation, feature standardisation, sliding-window generation (with optional covariates), GAN/LSTM training with early stopping, optional hyperparameter tuning, and report generation.
 
 ---
 
@@ -43,22 +43,22 @@ python run_experiment.py \
   --csv ./path/to/YourData.csv \
   --target auto --time_col auto \
   --L 24 --H 12 --epochs 40 --batch_size 64 \
-  --tune true --results_dir ./results
+  --results_dir ./results
 ```
 
 Key command-line options:
 
 | Flag | Description |
 | ---- | ----------- |
-| `--tune [true|false]` | Grid-search generator/discriminator units and λ. Use `--tune_csv` to tune on a different dataset. |
+| `--tune` | Enable the grid-search over generator/discriminator units and λ. Pair with `--tune_csv` to tune on a different dataset. |
 | `--g_layers`, `--d_layers` | Number of stacked LSTM layers in the generator/discriminator. |
 | `--g_activation`, `--g_recurrent_activation`, `--g_dense_activation` | Generator LSTM/Dense activations. |
 | `--d_activation`, `--d_recurrent_activation` | Discriminator LSTM activations. |
-| `--curve_steps`, `--curve_min_frac`, `--curve_epochs` | Control learning-curve generation across increasing sample sizes. |
+| `--curve_steps`, `--curve_min_frac`, `--curve_epochs` | Control learning-curve generation across increasing sample sizes (disabled when `--curve_steps 0`). |
 | `--train_ratio`, `--resample`, `--agg` | Temporal split and optional resampling strategy. |
 | `--results_dir` | Output directory for metrics, models, and figures (default: `./results`). |
 
-Learning-curve analysis (sample-size sweeps) is enabled by default. Disable it by setting `--curve_steps 0` if you need a minimal run.
+Learning-curve analysis is opt-in. Specify `--curve_steps N` (e.g. `--curve_steps 4`) to train at progressively larger sample sizes.
 
 ### 3. Build the paper
 
@@ -89,7 +89,7 @@ The generated TeX document embeds every figure (naïve baseline, neural models, 
 Running `run_experiment.py` populates the chosen `--results_dir` with:
 
 - `metrics.json` – central log containing dataset metadata, train/test/noisy metrics, architecture summaries, learning-curve values, and classical baseline scores.
-- `tuning_results.csv` – grid-search results (present when `--tune true`).
+- `tuning_results.csv` – grid-search results (present when `--tune` is supplied).
 - Figures required by the professor:
   - `rgan_train_test_rmse_vs_epochs.png`
   - `lstm_train_test_rmse_vs_epochs.png`

@@ -3,3 +3,4 @@ pandas>=1.5
 matplotlib>=3.6
 statsmodels>=0.13
 tensorflow>=2.9
+scikit-learn>=1.1
