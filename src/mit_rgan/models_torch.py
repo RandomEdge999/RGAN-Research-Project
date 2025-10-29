@@ -36,7 +36,7 @@ class Discriminator(nn.Module):
     def __init__(self, L_plus_H: int, units: int, num_layers: int, dropout: float):
         super().__init__()
         self.stack = LSTMStack(input_size=1, units=units, num_layers=num_layers, dropout=dropout)
-        self.out = nn.Sequential(nn.Linear(units, 1), nn.Sigmoid())
+        self.out = nn.Linear(units, 1)
 
     def forward(self, x_concat: torch.Tensor) -> torch.Tensor:
         h = self.stack(x_concat)
