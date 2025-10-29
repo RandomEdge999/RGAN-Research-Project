@@ -14,11 +14,32 @@ def _error_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
 
 
 @torch.no_grad()
-def compute_metrics(G, X, Y) -> Tuple[Dict[str, float], np.ndarray]:
+def compute_metrics(G, X, Y, batch_size: int = 1024) -> Tuple[Dict[str, float], np.ndarray]:
+    """Compute evaluation metrics for a trained generator.
+
+    The original implementation forwarded the entire evaluation set through
+    the generator in a single batch.  When tuning with large datasets this
+    caused the GPU to exhaust its memory (see the CUDA OOM in
+    ``run_experiment.py``).  To keep memory usage bounded we now process the
+    inputs in configurable mini-batches while accumulating the predictions on
+    the CPU.  This mirrors what we do during training but without gradient
+    tracking.
+    """
+
     G.eval()
     device = next(G.parameters()).device
-    X_t = torch.from_numpy(X).to(device)
-    Yp = G(X_t).cpu().numpy()
+    dtype = next(G.parameters()).dtype
+
+    n_samples = len(X)
+    batch_size = max(1, int(batch_size))
+    Yp = np.empty_like(Y)
+
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
+        Xb = torch.from_numpy(X[start:end]).to(device=device, dtype=dtype)
+        Yb = G(Xb).detach().cpu().numpy()
+        Yp[start:end] = Yb
+
     stats = _error_stats(Y.reshape(-1), Yp.reshape(-1))
     return stats, Yp
 
@@ -92,9 +113,10 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
             G_advs.append(float(adv_loss.detach().cpu()))
             G_regs.append(float(reg_loss.detach().cpu()))
 
-        tr_stats, _ = compute_metrics(G, Xtr, Ytr)
-        te_stats, _ = compute_metrics(G, Xte, Yte)
-        va_stats, _ = compute_metrics(G, Xval, Yval)
+        eval_bs = config.get("eval_batch_size", config.get("batch_size", 1024))
+        tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
+        te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
+        va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
         va_rmse = va_stats["rmse"]
 
         hist["epoch"].append(epoch)
@@ -120,8 +142,9 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     if best_state is not None:
         G.load_state_dict(best_state["G"])
 
-    train_stats, _ = compute_metrics(G, Xtr, Ytr)
-    test_stats, Y_pred = compute_metrics(G, Xte, Yte)
+    eval_bs = config.get("eval_batch_size", config.get("batch_size", 1024))
+    train_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
+    test_stats, Y_pred = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
 
     return {
         "G": G, "D": D, "history": hist,
