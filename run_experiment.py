@@ -3,10 +3,12 @@ import json, argparse, numpy as np
 from pathlib import Path
 from datetime import datetime
 
-from src.mit_rgan.data import load_csv_series, interpolate_and_standardize, make_windows_univariate, make_windows_with_covariates
-from src.mit_rgan.models_keras import build_generator as build_generator_tf, build_discriminator as build_discriminator_tf
-from src.mit_rgan.rgan_keras import train_rgan_keras as train_rgan_tf, compute_metrics as compute_metrics_tf
-from src.mit_rgan.lstm_supervised import train_lstm_supervised as train_lstm_tf
+from src.mit_rgan.data import (
+    load_csv_series,
+    interpolate_and_standardize,
+    make_windows_univariate,
+    make_windows_with_covariates,
+)
 from src.mit_rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
 from src.mit_rgan.plots import (
     plot_single_train_test,
@@ -19,41 +21,57 @@ from src.mit_rgan.plots import (
 )
 from src.mit_rgan.tune import tune_rgan_keras
 
-import tensorflow as tf
-tf.keras.backend.set_floatx("float32")
 
-def set_seed(seed=42):
-    np.random.seed(seed); tf.random.set_seed(seed)
+def set_seed(seed=42, backend="tf"):
+    np.random.seed(seed)
+    if backend == "tf":
+        import tensorflow as tf  # Lazy import to avoid TF initialisation when unused
+
+        tf.random.set_seed(seed)
+    elif backend == "torch":
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
 
 def describe_model(model) -> list:
     """Return a human-readable description of the model layers."""
     description = []
-    for layer in model.layers:
-        name = layer.__class__.__name__
-        if name == "InputLayer":
-            shape = getattr(layer, "input_shape", None)
-            if shape is not None:
-                description.append(f"Input(shape={tuple(shape[1:])})")
+    if hasattr(model, "layers"):
+        for layer in model.layers:
+            name = layer.__class__.__name__
+            if name == "InputLayer":
+                shape = getattr(layer, "input_shape", None)
+                if shape is not None:
+                    description.append(f"Input(shape={tuple(shape[1:])})")
+                else:
+                    description.append("Input")
+            elif name == "LSTM":
+                cfg = layer.get_config()
+                description.append(
+                    f"LSTM(units={cfg['units']}, return_sequences={cfg['return_sequences']}, "
+                    f"activation={cfg['activation']}, recurrent_activation={cfg['recurrent_activation']})"
+                )
+            elif name == "Dense":
+                cfg = layer.get_config()
+                description.append(f"Dense(units={cfg['units']}, activation={cfg.get('activation', 'linear')})")
+            elif name == "Dropout":
+                cfg = layer.get_config()
+                description.append(f"Dropout(rate={cfg['rate']})")
+            elif name == "Reshape":
+                cfg = layer.get_config()
+                description.append(f"Reshape(target_shape={tuple(cfg['target_shape'])})")
             else:
-                description.append("Input")
-        elif name == "LSTM":
-            cfg = layer.get_config()
-            description.append(
-                f"LSTM(units={cfg['units']}, return_sequences={cfg['return_sequences']}, "
-                f"activation={cfg['activation']}, recurrent_activation={cfg['recurrent_activation']})"
-            )
-        elif name == "Dense":
-            cfg = layer.get_config()
-            description.append(f"Dense(units={cfg['units']}, activation={cfg.get('activation', 'linear')})")
-        elif name == "Dropout":
-            cfg = layer.get_config()
-            description.append(f"Dropout(rate={cfg['rate']})")
-        elif name == "Reshape":
-            cfg = layer.get_config()
-            description.append(f"Reshape(target_shape={tuple(cfg['target_shape'])})")
-        else:
-            description.append(name)
+                description.append(name)
+    elif hasattr(model, "named_children"):
+        for name, module in model.named_children():
+            description.append(f"{name}: {module.__class__.__name__}")
+        if not description:
+            description.append(model.__class__.__name__)
+    else:
+        description.append(model.__class__.__name__)
     return description
 
 
@@ -86,6 +104,15 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
     used_sizes = []
     naive_test_stats, _ = naive_baseline(Xte, Yte)
 
+    if args.backend == "torch":
+        from src.mit_rgan.models_torch import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
+        from src.mit_rgan.rgan_torch import train_rgan_torch as train_rgan_backend
+        from src.mit_rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
+    else:
+        from src.mit_rgan.models_keras import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
+        from src.mit_rgan.rgan_keras import train_rgan_keras as train_rgan_backend
+        from src.mit_rgan.lstm_supervised import train_lstm_supervised as train_lstm_backend
+
     for size in sizes:
         if size < 2:
             continue
@@ -113,53 +140,38 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
         curve_config["epochs"] = max(1, min(base_config["epochs"], args.curve_epochs))
         curve_config["patience"] = min(curve_config["patience"], curve_config["epochs"])
 
-        set_seed(args.seed)
-        if args.backend == "torch":
-            from src.mit_rgan.models_torch import build_generator as build_generator_th, build_discriminator as build_discriminator_th
-            from src.mit_rgan.rgan_torch import train_rgan_torch as train_rgan_backend
-            from src.mit_rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
-            G_curve = build_generator_th(
-                base_config["L"],
-                base_config["H"],
-                n_in=n_features,
-                units=curve_config["units_g"],
-                dropout=curve_config["dropout"],
-                num_layers=args.g_layers,
-            )
-            D_curve = build_discriminator_th(
-                base_config["L"],
-                base_config["H"],
-                units=curve_config["units_d"],
-                dropout=curve_config["dropout"],
-                num_layers=args.d_layers,
-            )
-        else:
-            G_curve = build_generator_tf(
-            base_config["L"],
-            base_config["H"],
+        set_seed(args.seed, backend=args.backend)
+        gen_kwargs = dict(
+            L=base_config["L"],
+            H=base_config["H"],
             n_in=n_features,
             units=curve_config["units_g"],
             dropout=curve_config["dropout"],
             num_layers=args.g_layers,
-            activation=args.g_activation,
-            recurrent_activation=args.g_recurrent_activation,
-            dense_activation=args.g_dense_activation if args.g_dense_activation else None,
-            )
-            D_curve = build_discriminator_tf(
-            base_config["L"],
-            base_config["H"],
+        )
+        disc_kwargs = dict(
+            L=base_config["L"],
+            H=base_config["H"],
             units=curve_config["units_d"],
             dropout=curve_config["dropout"],
             num_layers=args.d_layers,
-            activation=args.d_activation,
-            recurrent_activation=args.d_recurrent_activation,
+        )
+        if args.backend == "tf":
+            gen_kwargs.update(
+                activation=args.g_activation,
+                recurrent_activation=args.g_recurrent_activation,
+                dense_activation=args.g_dense_activation if args.g_dense_activation else None,
             )
-        if args.backend == "torch":
-            rgan_curve_out = train_rgan_backend(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
-            lstm_curve_out = train_lstm_backend(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
-        else:
-            rgan_curve_out = train_rgan_tf(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
-            lstm_curve_out = train_lstm_tf(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
+            disc_kwargs.update(
+                activation=args.d_activation,
+                recurrent_activation=args.d_recurrent_activation,
+            )
+
+        G_curve = build_generator_backend(**gen_kwargs)
+        D_curve = build_discriminator_backend(**disc_kwargs)
+        rgan_curve_out = train_rgan_backend(curve_config, (G_curve, D_curve), data_splits, str(args.results_dir), tag="rgan_curve")
+        lstm_curve_out = train_lstm_backend(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
+
         curves["R-GAN"].append(rgan_curve_out["test_stats"]["rmse"])
         curves["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
 
@@ -216,8 +228,45 @@ def main():
     if args.tune_csv and not args.tune:
         args.tune = True
 
-    set_seed(args.seed)
-    results_dir = Path(args.results_dir); results_dir.mkdir(parents=True, exist_ok=True)
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.backend == "torch":
+        try:
+            from src.mit_rgan.models_torch import (
+                build_generator as build_generator_backend,
+                build_discriminator as build_discriminator_backend,
+            )
+            from src.mit_rgan.rgan_torch import (
+                train_rgan_torch as train_rgan_backend,
+                compute_metrics as compute_metrics_backend,
+            )
+            from src.mit_rgan.lstm_supervised_torch import (
+                train_lstm_supervised_torch as train_lstm_backend,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name == "torch":
+                raise ModuleNotFoundError(
+                    "Torch backend selected but PyTorch is not installed. Please install the 'torch' package to continue."
+                ) from exc
+            raise
+    else:
+        import tensorflow as tf
+
+        tf.keras.backend.set_floatx("float32")
+        from src.mit_rgan.models_keras import (
+            build_generator as build_generator_backend,
+            build_discriminator as build_discriminator_backend,
+        )
+        from src.mit_rgan.rgan_keras import (
+            train_rgan_keras as train_rgan_backend,
+            compute_metrics as compute_metrics_backend,
+        )
+        from src.mit_rgan.lstm_supervised import (
+            train_lstm_supervised as train_lstm_backend,
+        )
+
+    set_seed(args.seed, backend=args.backend)
 
     df, target_col, time_used = load_csv_series(args.csv, args.target, args.time_col, args.resample, args.agg)
     prep = interpolate_and_standardize(df, target_col, train_ratio=args.train_ratio)
@@ -254,42 +303,46 @@ def main():
             Xtune, Ytune = Xfull_tr, Yfull_tr
             used_tune = args.csv
         hp_grid = {"units_g": [32, 64, 128], "units_d": [32, 64, 128], "lambda_reg": [0.05, 0.1, 0.2], "epochs_each": 30}
-        best_hp, df_tune_res = tune_rgan_keras(hp_grid, base_config, {"Xtr_full": Xtune, "Ytr_full": Ytune}, str(results_dir))
+        best_hp, df_tune_res = tune_rgan_keras(
+            hp_grid,
+            base_config,
+            {"Xtr_full": Xtune, "Ytr_full": Ytune},
+            str(results_dir),
+            backend=args.backend,
+        )
         df_tune_res.to_csv(results_dir/"tuning_results.csv", index=False)
         base_config.update({k: v for k, v in best_hp.items() if k in ["units_g","units_d","lambda_reg"]})
 
     g_dense_act = args.g_dense_activation if args.g_dense_activation else None
-    if args.backend == "torch":
-        from src.mit_rgan.models_torch import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
-        from src.mit_rgan.rgan_torch import train_rgan_torch as train_rgan_backend, compute_metrics as compute_metrics_backend
-        from src.mit_rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
-    else:
-        build_generator_backend = build_generator_tf
-        build_discriminator_backend = build_discriminator_tf
-        train_rgan_backend = train_rgan_tf
-        compute_metrics_backend = compute_metrics_tf
-        train_lstm_backend = train_lstm_tf
 
-    G = build_generator_backend(
-        args.L,
-        args.H,
+    gen_kwargs = dict(
+        L=args.L,
+        H=args.H,
         n_in=Xtr.shape[-1],
         units=base_config["units_g"],
         dropout=base_config["dropout"],
         num_layers=args.g_layers,
-        activation=args.g_activation if args.backend=="tf" else None,
-        recurrent_activation=args.g_recurrent_activation if args.backend=="tf" else None,
-        dense_activation=g_dense_act if args.backend=="tf" else None,
     )
-    D = build_discriminator_backend(
-        args.L,
-        args.H,
+    disc_kwargs = dict(
+        L=args.L,
+        H=args.H,
         units=base_config["units_d"],
         dropout=base_config["dropout"],
         num_layers=args.d_layers,
-        activation=args.d_activation if args.backend=="tf" else None,
-        recurrent_activation=args.d_recurrent_activation if args.backend=="tf" else None,
     )
+    if args.backend == "tf":
+        gen_kwargs.update(
+            activation=args.g_activation,
+            recurrent_activation=args.g_recurrent_activation,
+            dense_activation=g_dense_act,
+        )
+        disc_kwargs.update(
+            activation=args.d_activation,
+            recurrent_activation=args.d_recurrent_activation,
+        )
+
+    G = build_generator_backend(**gen_kwargs)
+    D = build_discriminator_backend(**disc_kwargs)
     rgan_out = train_rgan_backend(base_config, (G,D), {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="rgan")
 
     lstm_out = train_lstm_backend(base_config, {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="lstm")
