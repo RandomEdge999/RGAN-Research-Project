@@ -5,6 +5,11 @@ from typing import Dict
 from .logging_utils import get_console, epoch_progress, update_epoch
 
 
+def _is_cuda_launch_failure(err: RuntimeError) -> bool:
+    msg = str(err)
+    return "cuda" in msg.lower() and "unspecified launch failure" in msg.lower()
+
+
 def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
     diff = y_pred - y_true
     mse = float(np.mean(diff ** 2))
@@ -44,70 +49,84 @@ def _predict_in_batches(model: nn.Module, data: np.ndarray, device: torch.device
 
 
 def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag="lstm"):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    L, H = config["L"], config["H"]
-    n_in = data_splits["Xtr"].shape[-1]
-    model = LSTMSupervised(L, H, n_in=n_in, units=config["units_g"]).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=config["lrG"]) 
-    loss_fn = torch.nn.MSELoss()
-
-    hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}
-    best_val, best_state = float("inf"), None
-    patience, bad_epochs = config["patience"], 0
-    batch_size = config["batch_size"]
-
-    Xtr = data_splits["Xtr"]; Ytr = data_splits["Ytr"]
-    Xte = data_splits["Xte"]; Yte = data_splits["Yte"]
-    Xval = data_splits["Xval"]; Yval = data_splits["Yval"]
-
-    N = len(Xtr)
-    steps = max(1, int(np.ceil(N / batch_size)))
-
     console = get_console()
-    with epoch_progress(config["epochs"], description="LSTM (Torch)") as (progress, task_id):
-        for epoch in range(1, config["epochs"] + 1):
-            perm = np.random.permutation(N)
-            model.train()
-            for s in range(steps):
-                b0 = s * batch_size; b1 = min((s + 1) * batch_size, N)
-                idx = perm[b0:b1]
-                Xb = torch.from_numpy(Xtr[idx]).to(device)
-                Yb = torch.from_numpy(Ytr[idx]).to(device)
-                opt.zero_grad()
-                pred = model(Xb)
-                loss = loss_fn(pred, Yb)
-                loss.backward()
-                torch.nn.utils.clip_grad_value_(model.parameters(), config["grad_clip"])
-                opt.step()
 
-            model.eval()
-            eval_batch_size = max(1, min(batch_size, 1024))
-            tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
-            te = _predict_in_batches(model, Xte, device, eval_batch_size)
-            va = _predict_in_batches(model, Xval, device, eval_batch_size)
-            tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
-            te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
-            va_rmse = float(np.sqrt(np.mean((va.reshape(-1) - Yval.reshape(-1)) ** 2)))
+    preferred = config.get("lstm_device")
+    if preferred is None:
+        preferred = "cuda" if torch.cuda.is_available() else "cpu"
 
-            hist["epoch"].append(epoch); hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
-            update_epoch(progress, task_id, epoch, config["epochs"], {"Train": tr_rmse, "Val": va_rmse, "Test": te_rmse})
+    def _train_on_device(device: torch.device):
+        L, H = config["L"], config["H"]
+        n_in = data_splits["Xtr"].shape[-1]
+        model = LSTMSupervised(L, H, n_in=n_in, units=config["units_g"]).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=config["lrG"])
+        loss_fn = torch.nn.MSELoss()
 
-            if va_rmse < best_val - 1e-7:
-                best_val = va_rmse; best_state = model.state_dict(); bad_epochs = 0
-            else:
-                bad_epochs += 1
-                if bad_epochs >= patience:
-                    console.log(f"[LSTM Torch] Early stopping at epoch {epoch}."); break
+        hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}
+        best_val, best_state = float("inf"), None
+        patience, bad_epochs = config["patience"], 0
+        batch_size = config["batch_size"]
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+        Xtr = data_splits["Xtr"]; Ytr = data_splits["Ytr"]
+        Xte = data_splits["Xte"]; Yte = data_splits["Yte"]
+        Xval = data_splits["Xval"]; Yval = data_splits["Yval"]
 
-    eval_batch_size = max(1, min(batch_size, 1024))
-    tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
-    te = _predict_in_batches(model, Xte, device, eval_batch_size)
-    train_stats = _error_stats(Ytr.reshape(-1), tr.reshape(-1))
-    test_stats = _error_stats(Yte.reshape(-1), te.reshape(-1))
-    return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
+        N = len(Xtr)
+        steps = max(1, int(np.ceil(N / batch_size)))
+
+        with epoch_progress(config["epochs"], description="LSTM (Torch)") as (progress, task_id):
+            for epoch in range(1, config["epochs"] + 1):
+                perm = np.random.permutation(N)
+                model.train()
+                for s in range(steps):
+                    b0 = s * batch_size; b1 = min((s + 1) * batch_size, N)
+                    idx = perm[b0:b1]
+                    Xb = torch.from_numpy(Xtr[idx]).to(device)
+                    Yb = torch.from_numpy(Ytr[idx]).to(device)
+                    opt.zero_grad()
+                    pred = model(Xb)
+                    loss = loss_fn(pred, Yb)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_value_(model.parameters(), config["grad_clip"])
+                    opt.step()
+
+                model.eval()
+                eval_batch_size = max(1, min(batch_size, 1024))
+                tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
+                te = _predict_in_batches(model, Xte, device, eval_batch_size)
+                va = _predict_in_batches(model, Xval, device, eval_batch_size)
+                tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
+                te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
+                va_rmse = float(np.sqrt(np.mean((va.reshape(-1) - Yval.reshape(-1)) ** 2)))
+
+                hist["epoch"].append(epoch); hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
+                update_epoch(progress, task_id, epoch, config["epochs"], {"Train": tr_rmse, "Val": va_rmse, "Test": te_rmse})
+
+                if va_rmse < best_val - 1e-7:
+                    best_val = va_rmse; best_state = model.state_dict(); bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        console.log(f"[LSTM Torch] Early stopping at epoch {epoch}."); break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        eval_batch_size = max(1, min(config["batch_size"], 1024))
+        tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
+        te = _predict_in_batches(model, Xte, device, eval_batch_size)
+        train_stats = _error_stats(Ytr.reshape(-1), tr.reshape(-1))
+        test_stats = _error_stats(Yte.reshape(-1), te.reshape(-1))
+        return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
+
+    try:
+        return _train_on_device(torch.device(preferred))
+    except RuntimeError as err:
+        if isinstance(preferred, str) and preferred != "cpu" and _is_cuda_launch_failure(err):
+            console.log("[LSTM Torch] CUDA failure detected; retrying on CPU.")
+            torch.cuda.empty_cache()
+            return _train_on_device(torch.device("cpu"))
+        raise
 
 
 
