@@ -2,10 +2,15 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Dict
 
-COMMON_TIME_COLS = ["calc_time","date","datetime","time","timestamp","ts"]
+COMMON_TIME_COLS = ["calc_time", "date", "datetime", "time", "timestamp", "ts"]
 
-def load_csv_series(path: str, target: str = "auto", time_col: str = "auto",
-                    resample: str = "", agg: str = "last") -> Tuple[pd.DataFrame, str, Optional[str]]:
+def load_csv_series(
+    path: str,
+    target: str = "auto",
+    time_col: str = "auto",
+    resample: str = "",
+    agg: str = "last",
+) -> Tuple[pd.DataFrame, str, Optional[str]]:
     df = pd.read_csv(path)
     if target == "auto":
         if "index_value" in df.columns:
@@ -39,12 +44,20 @@ def load_csv_series(path: str, target: str = "auto", time_col: str = "auto",
     return df, target_col, time_used
 
 def interpolate_and_standardize(df: pd.DataFrame, target_col: str, train_ratio: float = 0.8) -> Dict:
+    if not 0 < train_ratio < 1:
+        raise ValueError("train_ratio must be between 0 and 1 (exclusive).")
+
     dfx = df.copy()
     for c in dfx.select_dtypes(include=["number"]).columns:
         dfx[c] = dfx[c].astype(float).interpolate().ffill().bfill()
 
     n = len(dfx)
     split = int(train_ratio * n)
+    if split <= 0 or split >= n:
+        raise ValueError(
+            "train_ratio produced an empty train or test set. "
+            "Provide more data or adjust --train_ratio."
+        )
     train_df = dfx.iloc[:split].reset_index(drop=True)
     test_df  = dfx.iloc[split:].reset_index(drop=True)
 
@@ -68,18 +81,32 @@ def interpolate_and_standardize(df: pd.DataFrame, target_col: str, train_ratio: 
         target_mean=t_mean, target_std=t_std, cov_means=cov_means, cov_stds=cov_stds
     )
 
+def _validate_window_lengths(total_length: int, L: int, H: int) -> None:
+    if L <= 0 or H <= 0:
+        raise ValueError("Window lengths L and H must be positive integers.")
+    if total_length < L + H:
+        raise ValueError(
+            "Insufficient rows to create even a single window. "
+            f"Require at least {L + H} rows, received {total_length}."
+        )
+
+
 def make_windows_univariate(scaled: pd.DataFrame, target_col: str, L: int, H: int):
     series = scaled[target_col].values.astype(np.float32)
+    _validate_window_lengths(len(series), L, H)
     X, Y = [], []
     for i in range(len(series) - L - H + 1):
         X.append(series[i:i+L])
         Y.append(series[i+L:i+L+H])
     return np.array(X, dtype=np.float32)[..., None], np.array(Y, dtype=np.float32)[..., None]
 
-def make_windows_with_covariates(scaled: pd.DataFrame, target_col: str, covariates: list, L: int, H: int):
+def make_windows_with_covariates(
+    scaled: pd.DataFrame, target_col: str, covariates: list, L: int, H: int
+):
     cols = [target_col] + list(covariates)
     arr = scaled[cols].values.astype(np.float32)
     tgt = scaled[target_col].values.astype(np.float32)
+    _validate_window_lengths(len(scaled), L, H)
     X, Y = [], []
     for i in range(len(scaled) - L - H + 1):
         X.append(arr[i:i+L, :])

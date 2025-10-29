@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-import json, argparse, numpy as np
-from pathlib import Path
+import argparse
+import json
+import random
 from datetime import datetime
+from pathlib import Path
 
+import numpy as np
+
+from src.mit_rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
 from src.mit_rgan.data import (
     load_csv_series,
     interpolate_and_standardize,
     make_windows_univariate,
     make_windows_with_covariates,
 )
-from src.mit_rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
 from src.mit_rgan.plots import (
     plot_single_train_test,
     plot_constant_train_test,
@@ -23,6 +27,7 @@ from src.mit_rgan.tune import tune_rgan_keras
 
 
 def set_seed(seed=42, backend="tf"):
+    random.seed(seed)
     np.random.seed(seed)
     if backend == "tf":
         import tensorflow as tf  # Lazy import to avoid TF initialisation when unused
@@ -32,8 +37,15 @@ def set_seed(seed=42, backend="tf"):
         import torch
 
         torch.manual_seed(seed)
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
 
 def describe_model(model) -> list:
@@ -284,12 +296,26 @@ def main():
     df, target_col, time_used = load_csv_series(args.csv, args.target, args.time_col, args.resample, args.agg)
     prep = interpolate_and_standardize(df, target_col, train_ratio=args.train_ratio)
 
-    if prep["covariates"]:
-        Xfull_tr, Yfull_tr = make_windows_with_covariates(prep["scaled_train"], target_col, prep["covariates"], args.L, args.H)
-        Xte, Yte = make_windows_with_covariates(prep["scaled_test"], target_col, prep["covariates"], args.L, args.H)
-    else:
-        Xfull_tr, Yfull_tr = make_windows_univariate(prep["scaled_train"], target_col, args.L, args.H)
-        Xte, Yte = make_windows_univariate(prep["scaled_test"], target_col, args.L, args.H)
+    try:
+        if prep["covariates"]:
+            Xfull_tr, Yfull_tr = make_windows_with_covariates(
+                prep["scaled_train"], target_col, prep["covariates"], args.L, args.H
+            )
+            Xte, Yte = make_windows_with_covariates(
+                prep["scaled_test"], target_col, prep["covariates"], args.L, args.H
+            )
+        else:
+            Xfull_tr, Yfull_tr = make_windows_univariate(
+                prep["scaled_train"], target_col, args.L, args.H
+            )
+            Xte, Yte = make_windows_univariate(
+                prep["scaled_test"], target_col, args.L, args.H
+            )
+    except ValueError as exc:
+        raise ValueError(
+            "Unable to construct training/test windows with the provided L/H settings. "
+            "Consider decreasing --L/--H or ensuring the dataset has sufficient rows."
+        ) from exc
 
     n_tr = len(Xfull_tr); n_val = max(1, int(0.1*n_tr))
     Xtr, Ytr = Xfull_tr[:-n_val], Yfull_tr[:-n_val]
