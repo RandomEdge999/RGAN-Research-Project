@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 from typing import Dict, Tuple
+from .logging_utils import get_console, epoch_progress, update_epoch
 
 def step_discriminator(D, optD, bce, Xb, Yb, G, label_smooth=0.9, clip_value=5.0):
     with tf.GradientTape() as tape:
@@ -59,7 +60,6 @@ def train_rgan_keras(config: Dict, models, data_splits, results_dir: str, tag="r
     bce = tf.keras.losses.BinaryCrossentropy()
     mse = tf.keras.losses.MeanSquaredError()
 
-    # Pre-build optimizer slot variables outside any tf.function to avoid tf.Variable creation errors across trials.
     try:
         optD.build(D.trainable_variables)
         optG.build(G.trainable_variables)
@@ -77,39 +77,46 @@ def train_rgan_keras(config: Dict, models, data_splits, results_dir: str, tag="r
     hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [],
             "D_loss": [], "G_loss": [], "G_adv": [], "G_reg": []}
 
-    for epoch in range(1, config["epochs"] + 1):
-        idx = np.random.permutation(len(Xtr))
-        Xtr = Xtr[idx]; Ytr = Ytr[idx]
-        D_losses, G_losses, G_advs, G_regs = [], [], [], []
+    console = get_console()
+    with epoch_progress(config["epochs"], description="R-GAN (TF)") as (progress, task_id):
+        for epoch in range(1, config["epochs"] + 1):
+            idx = np.random.permutation(len(Xtr))
+            Xtr = Xtr[idx]; Ytr = Ytr[idx]
+            D_losses, G_losses, G_advs, G_regs = [], [], [], []
 
-        for s in range(steps):
-            b0 = s * config["batch_size"]; b1 = min((s+1)*config["batch_size"], len(Xtr))
-            Xb, Yb = Xtr[b0:b1], Ytr[b0:b1]
-            Dl = step_discriminator(D, optD, bce, Xb, Yb, G, label_smooth=config["label_smooth"], clip_value=config["grad_clip"])
-            Gl, Ga, Gr = step_generator(G, D, optG, bce, mse, Xb, Yb, lambda_reg=config["lambda_reg"], clip_value=config["grad_clip"])
-            D_losses.append(float(Dl)); G_losses.append(float(Gl)); G_advs.append(float(Ga)); G_regs.append(float(Gr))
+            for s in range(steps):
+                b0 = s * config["batch_size"]; b1 = min((s+1)*config["batch_size"], len(Xtr))
+                Xb, Yb = Xtr[b0:b1], Ytr[b0:b1]
+                Dl = step_discriminator(D, optD, bce, Xb, Yb, G, label_smooth=config["label_smooth"], clip_value=config["grad_clip"])
+                Gl, Ga, Gr = step_generator(G, D, optG, bce, mse, Xb, Yb, lambda_reg=config["lambda_reg"], clip_value=config["grad_clip"])
+                D_losses.append(float(Dl)); G_losses.append(float(Gl)); G_advs.append(float(Ga)); G_regs.append(float(Gr))
 
-        tr_stats, _ = compute_metrics(G, Xtr, Ytr)
-        te_stats, _ = compute_metrics(G, Xte, Yte)
-        va_stats, _ = compute_metrics(G, Xval, Yval)
-        va_rmse = va_stats["rmse"]
+            tr_stats, _ = compute_metrics(G, Xtr, Ytr)
+            te_stats, _ = compute_metrics(G, Xte, Yte)
+            va_stats, _ = compute_metrics(G, Xval, Yval)
+            va_rmse = va_stats["rmse"]
 
-        hist["epoch"].append(epoch)
-        hist["D_loss"].append(np.mean(D_losses)); hist["G_loss"].append(np.mean(G_losses))
-        hist["G_adv"].append(np.mean(G_advs));   hist["G_reg"].append(np.mean(G_regs))
-        hist["train_rmse"].append(tr_stats["rmse"])
-        hist["test_rmse"].append(te_stats["rmse"])
-        hist["val_rmse"].append(va_stats["rmse"])
+            hist["epoch"].append(epoch)
+            hist["D_loss"].append(np.mean(D_losses)); hist["G_loss"].append(np.mean(G_losses))
+            hist["G_adv"].append(np.mean(G_advs));   hist["G_reg"].append(np.mean(G_regs))
+            hist["train_rmse"].append(tr_stats["rmse"])
+            hist["test_rmse"].append(te_stats["rmse"])
+            hist["val_rmse"].append(va_stats["rmse"])
 
-        print(f"[R-GAN] Epoch {epoch:03d} | D {np.mean(D_losses):.4f} | G {np.mean(G_losses):.4f} | "
-              f"Train {tr_stats['rmse']:.5f} | Val {va_stats['rmse']:.5f} | Test {te_stats['rmse']:.5f}")
+            update_epoch(progress, task_id, epoch, config["epochs"], {
+                "D": float(np.mean(D_losses)),
+                "G": float(np.mean(G_losses)),
+                "Train": float(tr_stats["rmse"]),
+                "Val": float(va_stats["rmse"]),
+                "Test": float(te_stats["rmse"]),
+            })
 
-        if va_rmse < best_val - 1e-7:
-            best_val = va_rmse; best_weights = G.get_weights(); bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"[R-GAN] Early stopping at epoch {epoch}."); break
+            if va_rmse < best_val - 1e-7:
+                best_val = va_rmse; best_weights = G.get_weights(); bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    console.log(f"[R-GAN] Early stopping at epoch {epoch}."); break
 
     if best_weights is not None:
         G.set_weights(best_weights)
@@ -123,3 +130,5 @@ def train_rgan_keras(config: Dict, models, data_splits, results_dir: str, tag="r
         "test_stats": test_stats,
         "pred_test": Y_pred
     }
+
+

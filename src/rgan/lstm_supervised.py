@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 from typing import Dict
+from .logging_utils import get_console, epoch_progress, update_epoch
 
 
 def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
@@ -25,22 +26,24 @@ def train_lstm_supervised(config: Dict, data_splits, results_dir: str, tag="lstm
     best_val, best_weights = float("inf"), None
     patience, bad_epochs = config["patience"], 0
 
-    for epoch in range(1, config["epochs"]+1):
-        model.fit(data_splits["Xtr"], data_splits["Ytr"], batch_size=config["batch_size"], epochs=1, verbose=0, shuffle=True)
-        tr = model.predict(data_splits["Xtr"], verbose=0)
-        te = model.predict(data_splits["Xte"], verbose=0)
-        va = model.predict(data_splits["Xval"], verbose=0)
-        tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1)-data_splits["Ytr"].reshape(-1))**2)))
-        te_rmse = float(np.sqrt(np.mean((te.reshape(-1)-data_splits["Yte"].reshape(-1))**2)))
-        va_rmse = float(np.sqrt(np.mean((va.reshape(-1)-data_splits["Yval"].reshape(-1))**2)))
-        hist["epoch"].append(epoch); hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
-        print(f"[LSTM] Epoch {epoch:03d} | Train {tr_rmse:.5f} | Val {va_rmse:.5f} | Test {te_rmse:.5f}")
-        if va_rmse < best_val - 1e-7:
-            best_val = va_rmse; best_weights = model.get_weights(); bad_epochs=0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"[LSTM] Early stopping at epoch {epoch}."); break
+    console = get_console()
+    with epoch_progress(config["epochs"], description="LSTM (TF)") as (progress, task_id):
+        for epoch in range(1, config["epochs"]+1):
+            model.fit(data_splits["Xtr"], data_splits["Ytr"], batch_size=config["batch_size"], epochs=1, verbose=0, shuffle=True)
+            tr = model.predict(data_splits["Xtr"], verbose=0)
+            te = model.predict(data_splits["Xte"], verbose=0)
+            va = model.predict(data_splits["Xval"], verbose=0)
+            tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1)-data_splits["Ytr"].reshape(-1))**2)))
+            te_rmse = float(np.sqrt(np.mean((te.reshape(-1)-data_splits["Yte"].reshape(-1))**2)))
+            va_rmse = float(np.sqrt(np.mean((va.reshape(-1)-data_splits["Yval"].reshape(-1))**2)))
+            hist["epoch"].append(epoch); hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
+            update_epoch(progress, task_id, epoch, config["epochs"], {"Train": tr_rmse, "Val": va_rmse, "Test": te_rmse})
+            if va_rmse < best_val - 1e-7:
+                best_val = va_rmse; best_weights = model.get_weights(); bad_epochs=0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    console.log(f"[LSTM] Early stopping at epoch {epoch}."); break
     if best_weights is not None:
         model.set_weights(best_weights)
 
@@ -49,3 +52,5 @@ def train_lstm_supervised(config: Dict, data_splits, results_dir: str, tag="lstm
     train_stats = _error_stats(data_splits["Ytr"].reshape(-1), tr.reshape(-1))
     test_stats = _error_stats(data_splits["Yte"].reshape(-1), te.reshape(-1))
     return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
+
+

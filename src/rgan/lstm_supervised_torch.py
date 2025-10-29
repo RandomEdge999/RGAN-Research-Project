@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from typing import Dict
+from .logging_utils import get_console, epoch_progress, update_epoch
 
 
 def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
@@ -46,39 +47,41 @@ def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag
     N = len(Xtr)
     steps = max(1, int(np.ceil(N / batch_size)))
 
-    for epoch in range(1, config["epochs"] + 1):
-        perm = np.random.permutation(N)
-        model.train()
-        for s in range(steps):
-            b0 = s * batch_size; b1 = min((s + 1) * batch_size, N)
-            idx = perm[b0:b1]
-            Xb = torch.from_numpy(Xtr[idx]).to(device)
-            Yb = torch.from_numpy(Ytr[idx]).to(device)
-            opt.zero_grad()
-            pred = model(Xb)
-            loss = loss_fn(pred, Yb)
-            loss.backward()
-            torch.nn.utils.clip_grad_value_(model.parameters(), config["grad_clip"])
-            opt.step()
+    console = get_console()
+    with epoch_progress(config["epochs"], description="LSTM (Torch)") as (progress, task_id):
+        for epoch in range(1, config["epochs"] + 1):
+            perm = np.random.permutation(N)
+            model.train()
+            for s in range(steps):
+                b0 = s * batch_size; b1 = min((s + 1) * batch_size, N)
+                idx = perm[b0:b1]
+                Xb = torch.from_numpy(Xtr[idx]).to(device)
+                Yb = torch.from_numpy(Ytr[idx]).to(device)
+                opt.zero_grad()
+                pred = model(Xb)
+                loss = loss_fn(pred, Yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_value_(model.parameters(), config["grad_clip"])
+                opt.step()
 
-        model.eval()
-        with torch.no_grad():
-            tr = model(torch.from_numpy(Xtr).to(device)).cpu().numpy()
-            te = model(torch.from_numpy(Xte).to(device)).cpu().numpy()
-            va = model(torch.from_numpy(Xval).to(device)).cpu().numpy()
-        tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
-        te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
-        va_rmse = float(np.sqrt(np.mean((va.reshape(-1) - Yval.reshape(-1)) ** 2)))
+            model.eval()
+            with torch.no_grad():
+                tr = model(torch.from_numpy(Xtr).to(device)).cpu().numpy()
+                te = model(torch.from_numpy(Xte).to(device)).cpu().numpy()
+                va = model(torch.from_numpy(Xval).to(device)).cpu().numpy()
+            tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
+            te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
+            va_rmse = float(np.sqrt(np.mean((va.reshape(-1) - Yval.reshape(-1)) ** 2)))
 
-        hist["epoch"].append(epoch); hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
-        print(f"[LSTM Torch] Epoch {epoch:03d} | Train {tr_rmse:.5f} | Val {va_rmse:.5f} | Test {te_rmse:.5f}")
+            hist["epoch"].append(epoch); hist["train_rmse"].append(tr_rmse); hist["test_rmse"].append(te_rmse); hist["val_rmse"].append(va_rmse)
+            update_epoch(progress, task_id, epoch, config["epochs"], {"Train": tr_rmse, "Val": va_rmse, "Test": te_rmse})
 
-        if va_rmse < best_val - 1e-7:
-            best_val = va_rmse; best_state = model.state_dict(); bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"[LSTM Torch] Early stopping at epoch {epoch}."); break
+            if va_rmse < best_val - 1e-7:
+                best_val = va_rmse; best_state = model.state_dict(); bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    console.log(f"[LSTM Torch] Early stopping at epoch {epoch}."); break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -89,5 +92,6 @@ def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag
     train_stats = _error_stats(Ytr.reshape(-1), tr.reshape(-1))
     test_stats = _error_stats(Yte.reshape(-1), te.reshape(-1))
     return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
+
 
 

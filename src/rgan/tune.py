@@ -55,3 +55,5 @@ def tune_rgan_keras(hp_grid: Dict, base_config: Dict, data_splits: Dict, results
                 if val_rmse < best["val_rmse"]:
                     best = {"units_g": units_g, "units_d": units_d, "lambda_reg": lambda_reg, "val_rmse": val_rmse}
     return best, pd.DataFrame(results)
+
+

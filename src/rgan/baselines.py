@@ -65,34 +65,19 @@ def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
     for h in range(H):
         y_train_h = Y_train[:, h, 0]
 
-        # Determine a suitable number of quantisation bins based on the sample
-        # count. The square-root heuristic keeps the classification problem
-        # tractable while preserving distributional detail.
         n_bins = int(np.clip(np.sqrt(len(y_train_h)), 5, 50))
 
-        # Compute bin edges from the empirical quantiles. ``np.unique`` ensures
-        # strictly monotonic edges even when the distribution is heavily
-        # concentrated around a few values.
         quantiles = np.linspace(0.0, 1.0, n_bins + 1)
         bin_edges = np.unique(np.quantile(y_train_h, quantiles, method="nearest"))
 
         if bin_edges.size <= 2:
-            # Degenerate case: all observations collapse to a single value. The
-            # optimal Bayesian prediction is the mean of the training targets.
             predictions[:, h, 0] = np.mean(y_train_h, dtype=np.float64)
             continue
 
-        # ``np.digitize`` assigns each observation to a bin index in
-        # ``[0, n_bins-1]``. The ``right=False`` setting ensures the bins are
-        # left-inclusive, right-exclusive, matching the behaviour of the
-        # quantile-derived edges.
         bins = bin_edges[1:-1]
         y_classes = np.digitize(y_train_h, bins, right=False)
         n_effective_bins = int(bin_edges.size - 1)
 
-        # Compute representative values for each class. When a bin receives no
-        # samples we fall back to the mid-point of the bin edges to maintain a
-        # smooth mapping back to the continuous target space.
         class_means = np.zeros(n_effective_bins, dtype=np.float64)
         for cls in range(n_effective_bins):
             mask = y_classes == cls
@@ -105,9 +90,6 @@ def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
         nb_model = GaussianNB()
         nb_model.fit(X_train_flat, y_classes)
 
-        # Use the posterior expectations over the discretised support to
-        # recover continuous forecasts. This yields smoother predictions than
-        # assigning a single class label.
         proba = nb_model.predict_proba(X_eval_flat)
         class_indices = nb_model.classes_.astype(int)
         ordered_means = class_means[class_indices]
@@ -150,3 +132,5 @@ def classical_curves_vs_samples(train_series, test_series, min_frac=0.3, steps=6
             arima_rmse = np.nan
         arima_curve.append(arima_rmse)
     return sizes, ets_curve, arima_curve
+
+
