@@ -13,32 +13,38 @@ def _error_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
 
 
-@torch.no_grad()
-def compute_metrics(G, X, Y, batch_size: int = 1024) -> Tuple[Dict[str, float], np.ndarray]:
-    """Compute evaluation metrics for a trained generator.
+def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], np.ndarray]:
+    """Compute evaluation metrics for a trained generator with bounded memory.
 
-    The original implementation forwarded the entire evaluation set through
-    the generator in a single batch.  When tuning with large datasets this
-    caused the GPU to exhaust its memory (see the CUDA OOM in
-    ``run_experiment.py``).  To keep memory usage bounded we now process the
-    inputs in configurable mini-batches while accumulating the predictions on
-    the CPU.  This mirrors what we do during training but without gradient
-    tracking.
+    Uses mini-batches, inference mode, and mixed precision (on CUDA). If a CUDA
+    OOM occurs, automatically retries with a smaller batch size until it
+    succeeds or the batch size reaches 1.
     """
 
     G.eval()
     device = next(G.parameters()).device
-    dtype = next(G.parameters()).dtype
 
     n_samples = len(X)
-    batch_size = max(1, int(batch_size))
+    bs = max(1, int(batch_size))
     Yp = np.empty_like(Y)
 
-    for start in range(0, n_samples, batch_size):
-        end = min(start + batch_size, n_samples)
-        Xb = torch.from_numpy(X[start:end]).to(device=device, dtype=dtype)
-        Yb = G(Xb).detach().cpu().numpy()
-        Yp[start:end] = Yb
+    while True:
+        try:
+            idx = 0
+            with torch.inference_mode():
+                while idx < n_samples:
+                    end = min(idx + bs, n_samples)
+                    Xb = torch.from_numpy(X[idx:end]).to(device=device)
+                    with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                        Yb = G(Xb).detach().cpu().numpy()
+                    Yp[idx:end] = Yb
+                    idx = end
+            break
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if bs == 1:
+                raise
+            bs = max(1, bs // 2)
 
     stats = _error_stats(Y.reshape(-1), Yp.reshape(-1))
     return stats, Yp
@@ -63,6 +69,10 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     patience, bad_epochs = config["patience"], 0
     batch_size = config["batch_size"]
 
+    amp_enabled = bool(config.get("amp", True)) and (device.type == "cuda")
+    scaler_G = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler_D = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
     hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [],
             "D_loss": [], "G_loss": [], "G_adv": [], "G_reg": []}
 
@@ -81,39 +91,45 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
             # Discriminator step
             G.train(); D.train()
             optD.zero_grad()
-            Y_fake = G(Xb)
-            real_pairs = torch.cat([Xb[..., :1], Yb], dim=1)
-            fake_pairs = torch.cat([Xb[..., :1], Y_fake.detach()], dim=1)
-            D_real = D(real_pairs)
-            D_fake = D(fake_pairs)
-            y_real = torch.full_like(D_real, fill_value=config["label_smooth"])
-            y_fake = torch.zeros_like(D_fake)
-            loss_real = bce(D_real, y_real)
-            loss_fake = bce(D_fake, y_fake)
-            D_loss = 0.5 * (loss_real + loss_fake)
-            D_loss.backward()
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                Y_fake = G(Xb)
+                real_pairs = torch.cat([Xb[..., :1], Yb], dim=1)
+                fake_pairs = torch.cat([Xb[..., :1], Y_fake.detach()], dim=1)
+                D_real = D(real_pairs)
+                D_fake = D(fake_pairs)
+                y_real = torch.full_like(D_real, fill_value=config["label_smooth"])
+                y_fake = torch.zeros_like(D_fake)
+                loss_real = bce(D_real, y_real)
+                loss_fake = bce(D_fake, y_fake)
+                D_loss = 0.5 * (loss_real + loss_fake)
+            scaler_D.scale(D_loss).backward()
+            scaler_D.unscale_(optD)
             nn.utils.clip_grad_value_(D.parameters(), config["grad_clip"])
-            optD.step()
+            scaler_D.step(optD)
+            scaler_D.update()
 
             # Generator step
             optG.zero_grad()
-            Y_fake = G(Xb)
-            fake_pairs = torch.cat([Xb[..., :1], Y_fake], dim=1)
-            D_fake = D(fake_pairs)
-            y_adv = torch.ones_like(D_fake)
-            adv_loss = bce(D_fake, y_adv)
-            reg_loss = mse(Y_fake, Yb)
-            G_loss = adv_loss + config["lambda_reg"] * reg_loss
-            G_loss.backward()
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                Y_fake = G(Xb)
+                fake_pairs = torch.cat([Xb[..., :1], Y_fake], dim=1)
+                D_fake = D(fake_pairs)
+                y_adv = torch.ones_like(D_fake)
+                adv_loss = bce(D_fake, y_adv)
+                reg_loss = mse(Y_fake, Yb)
+                G_loss = adv_loss + config["lambda_reg"] * reg_loss
+            scaler_G.scale(G_loss).backward()
+            scaler_G.unscale_(optG)
             nn.utils.clip_grad_value_(G.parameters(), config["grad_clip"])
-            optG.step()
+            scaler_G.step(optG)
+            scaler_G.update()
 
             D_losses.append(float(D_loss.detach().cpu()))
             G_losses.append(float(G_loss.detach().cpu()))
             G_advs.append(float(adv_loss.detach().cpu()))
             G_regs.append(float(reg_loss.detach().cpu()))
 
-        eval_bs = config.get("eval_batch_size", config.get("batch_size", 1024))
+        eval_bs = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
         tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
         te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
         va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
@@ -142,7 +158,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     if best_state is not None:
         G.load_state_dict(best_state["G"])
 
-    eval_bs = config.get("eval_batch_size", config.get("batch_size", 1024))
+    eval_bs = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
     train_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
     test_stats, Y_pred = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
 
