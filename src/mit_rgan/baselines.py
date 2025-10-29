@@ -27,10 +27,13 @@ def naive_baseline(X, Y):
 def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
     """Gaussian Naïve Bayes baseline for multi-step forecasting.
 
-    The model treats each window as a feature vector and fits an independent
-    classifier for every forecast horizon step. By default the evaluation is
-    performed on the training data (producing in-sample metrics). Supplying
-    ``X_eval``/``Y_eval`` enables proper out-of-sample evaluation.
+    Each look-back window is flattened into a feature vector and an
+    independent Naïve Bayes classifier is trained for every forecast horizon
+    step. Continuous regression targets are discretised into adaptive quantile
+    bins; the posterior expectation over these bins provides a smooth
+    continuous forecast. By default the evaluation is performed on the
+    training data (producing in-sample metrics). Supplying ``X_eval``/``Y_eval``
+    enables proper out-of-sample evaluation.
 
     Args:
         X_train: Training windows of shape (n_samples, L, n_features).
@@ -61,9 +64,54 @@ def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
 
     for h in range(H):
         y_train_h = Y_train[:, h, 0]
+
+        # Determine a suitable number of quantisation bins based on the sample
+        # count. The square-root heuristic keeps the classification problem
+        # tractable while preserving distributional detail.
+        n_bins = int(np.clip(np.sqrt(len(y_train_h)), 5, 50))
+
+        # Compute bin edges from the empirical quantiles. ``np.unique`` ensures
+        # strictly monotonic edges even when the distribution is heavily
+        # concentrated around a few values.
+        quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+        bin_edges = np.unique(np.quantile(y_train_h, quantiles, method="nearest"))
+
+        if bin_edges.size <= 2:
+            # Degenerate case: all observations collapse to a single value. The
+            # optimal Bayesian prediction is the mean of the training targets.
+            predictions[:, h, 0] = np.mean(y_train_h, dtype=np.float64)
+            continue
+
+        # ``np.digitize`` assigns each observation to a bin index in
+        # ``[0, n_bins-1]``. The ``right=False`` setting ensures the bins are
+        # left-inclusive, right-exclusive, matching the behaviour of the
+        # quantile-derived edges.
+        bins = bin_edges[1:-1]
+        y_classes = np.digitize(y_train_h, bins, right=False)
+        n_effective_bins = int(bin_edges.size - 1)
+
+        # Compute representative values for each class. When a bin receives no
+        # samples we fall back to the mid-point of the bin edges to maintain a
+        # smooth mapping back to the continuous target space.
+        class_means = np.zeros(n_effective_bins, dtype=np.float64)
+        for cls in range(n_effective_bins):
+            mask = y_classes == cls
+            if np.any(mask):
+                class_means[cls] = float(np.mean(y_train_h[mask]))
+            else:
+                left, right = bin_edges[cls], bin_edges[cls + 1]
+                class_means[cls] = float(0.5 * (left + right))
+
         nb_model = GaussianNB()
-        nb_model.fit(X_train_flat, y_train_h)
-        predictions[:, h, 0] = nb_model.predict(X_eval_flat)
+        nb_model.fit(X_train_flat, y_classes)
+
+        # Use the posterior expectations over the discretised support to
+        # recover continuous forecasts. This yields smoother predictions than
+        # assigning a single class label.
+        proba = nb_model.predict_proba(X_eval_flat)
+        class_indices = nb_model.classes_.astype(int)
+        ordered_means = class_means[class_indices]
+        predictions[:, h, 0] = proba @ ordered_means
 
     stats = _error_stats(Y_eval.reshape(-1), predictions.reshape(-1))
     return stats, predictions
