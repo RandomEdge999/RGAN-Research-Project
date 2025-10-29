@@ -147,14 +147,14 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
             n_in=n_features,
             units=curve_config["units_g"],
             dropout=curve_config["dropout"],
-            num_layers=args.g_layers,
+            num_layers=curve_config.get("g_layers", base_config["g_layers"]),
         )
         disc_kwargs = dict(
             L=base_config["L"],
             H=base_config["H"],
             units=curve_config["units_d"],
             dropout=curve_config["dropout"],
-            num_layers=args.d_layers,
+            num_layers=curve_config.get("d_layers", base_config["d_layers"]),
         )
         if args.backend == "tf":
             gen_kwargs.update(
@@ -283,10 +283,21 @@ def main():
     Xval, Yval = Xfull_tr[-n_val:], Yfull_tr[-n_val:]
 
     base_config = dict(
-        L=args.L, H=args.H, epochs=args.epochs, batch_size=args.batch_size,
-        lambda_reg=args.lambda_reg, units_g=args.units_g, units_d=args.units_d,
-        lrG=args.lrG, lrD=args.lrD, label_smooth=args.label_smooth, grad_clip=args.grad_clip,
-        dropout=args.dropout, patience=args.patience
+        L=args.L,
+        H=args.H,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lambda_reg=args.lambda_reg,
+        units_g=args.units_g,
+        units_d=args.units_d,
+        lrG=args.lrG,
+        lrD=args.lrD,
+        label_smooth=args.label_smooth,
+        grad_clip=args.grad_clip,
+        dropout=args.dropout,
+        patience=args.patience,
+        g_layers=args.g_layers,
+        d_layers=args.d_layers,
     )
 
     used_tune = ""
@@ -321,14 +332,14 @@ def main():
         n_in=Xtr.shape[-1],
         units=base_config["units_g"],
         dropout=base_config["dropout"],
-        num_layers=args.g_layers,
+        num_layers=base_config["g_layers"],
     )
     disc_kwargs = dict(
         L=args.L,
         H=args.H,
         units=base_config["units_d"],
         dropout=base_config["dropout"],
-        num_layers=args.d_layers,
+        num_layers=base_config["d_layers"],
     )
     if args.backend == "tf":
         gen_kwargs.update(
