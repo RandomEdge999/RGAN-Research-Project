@@ -1,74 +1,111 @@
 # RGAN: Noise-Resilient Time-Series Forecasting with an LSTM Regression-GAN
 
-This package implements a **Regression-GAN (R-GAN)** for time-series forecasting using **LSTMs** in both the generator and the discriminator,
-**faithfully following the provided R code and draft paper**, and **meeting the professor’s plotting requirements**:
+This repository implements the end-to-end pipeline described in the accompanying research draft for **Regression-GAN (R-GAN)** time-series forecasting. The workflow faithfully mirrors the instructor's original R prototype while extending it with:
 
-- **Y-axis**: Accuracy or Error (we report **RMSE** for regression).
-- **X-axis**: Epochs (neural models) or **Number of Samples** (classical baselines).
-- **Single model plots**: Train and Test errors **on the same plot** (per model).
-- **Multiple model comparison**: Two separate plots — **Test error by model** and **Train error by model**.
+- ✅ **Generator/Discriminator inspection** – Experiment runs capture layer-by-layer descriptions and key hyperparameters.
+- ✅ **Expanded metrics** – RMSE, MSE, MAE, and bias for R-GAN, an LSTM baseline, and a naïve persistence model.
+- ✅ **Professor-required figures** – Matching plots for each single model, bar charts for model comparison, the original naïve baseline graphic, classical ETS/ARIMA curves, and learning curves as the sample size grows.
+- ✅ **Noise robustness** – Automatic evaluation with Gaussian noise injected into the test windows.
+- ✅ **Camera-ready paper builder** – Injects every figure, the R-GAN architecture, and an error table into the LaTeX template.
 
-The pipeline includes: robust data loading, automatic target detection, resampling and imputation, standardization, sliding-window creation,
-R-GAN training (with label smoothing, gradient clipping, early stopping), supervised LSTM baseline, classical baselines (Naive, ETS, ARIMA),
-noise-robustness tests, and a LaTeX paper builder that embeds all figures and results.
+The tooling handles data loading, resampling, interpolation, feature standardisation, sliding-window generation (with optional covariates), GAN/LSTM training with early stopping, optional hyperparameter tuning, and report generation.
+
+---
 
 ## Quick Start
 
-### Windows (PyCharm/PowerShell)
+### 1. Create an environment and install dependencies
+
+<details>
+<summary><strong>Windows (PowerShell / PyCharm)</strong></summary>
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
-
-# Run (no tuner; quick start)
-python run_experiment.py --csv ".\path\to\YourData.csv" --target auto --time_col auto --L 24 --H 12 --epochs 20 --batch_size 64 --tune false --results_dir ".\results"
-
-# Build paper
-python papers\build_paper.py --metrics .\results\metrics.json --out .\results\research_paper.tex
 ```
+</details>
 
-### macOS / Linux (bash / zsh)
+<details>
+<summary><strong>macOS / Linux (bash / zsh)</strong></summary>
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+</details>
 
-# Run (no tuner; quick start)
-python run_experiment.py --csv "./path/to/YourData.csv" --target auto --time_col auto --L 24 --H 12 --epochs 20 --batch_size 64 --tune false --results_dir "./results"
+### 2. Run an experiment
 
-# Build paper
+```bash
+python run_experiment.py \
+  --csv ./path/to/YourData.csv \
+  --target auto --time_col auto \
+  --L 24 --H 12 --epochs 40 --batch_size 64 \
+  --results_dir ./results
+```
+
+Key command-line options:
+
+| Flag | Description |
+| ---- | ----------- |
+| `--tune` | Enable the grid-search over generator/discriminator units and λ. Pair with `--tune_csv` to tune on a different dataset. |
+| `--g_layers`, `--d_layers` | Number of stacked LSTM layers in the generator/discriminator. |
+| `--g_activation`, `--g_recurrent_activation`, `--g_dense_activation` | Generator LSTM/Dense activations. |
+| `--d_activation`, `--d_recurrent_activation` | Discriminator LSTM activations. |
+| `--curve_steps`, `--curve_min_frac`, `--curve_epochs` | Control learning-curve generation across increasing sample sizes (disabled when `--curve_steps 0`). |
+| `--train_ratio`, `--resample`, `--agg` | Temporal split and optional resampling strategy. |
+| `--results_dir` | Output directory for metrics, models, and figures (default: `./results`). |
+
+Learning-curve analysis is opt-in. Specify `--curve_steps N` (e.g. `--curve_steps 4`) to train at progressively larger sample sizes.
+
+### 3. Build the paper
+
+```bash
 python papers/build_paper.py --metrics ./results/metrics.json --out ./results/research_paper.tex
 ```
 
-## Works with Any CSV
+The generated TeX document embeds every figure (naïve baseline, neural models, bar charts, classical baselines, learning curves) and summarises the R-GAN architecture plus the RMSE/MSE/Bias table requested by the professor.
 
-- **Target selection**: `--target auto` picks `index_value` if present, otherwise the **last numeric column**.
-  You can override: `--target price`.
-- **Time column**: `--time_col auto` tries common names (`date`, `datetime`, `time`, `timestamp`). If not found, the order of rows is used.
-  You can specify: `--time_col calc_time`.
-- **Resampling**: `--resample ""` (none) by default. Optionally `--resample D` (day), `--resample H` (hour), with `--agg last|mean`.
-- **Covariates**: All numeric columns besides the target become optional covariates for the generator input (target forecast remains univariate).
+---
+
+## How it works
+
+1. **Data preparation** – `src/mit_rgan/data.py` automatically locates the target, converts recognised time columns, optionally resamples, fills gaps via interpolation, and standardises numeric fields (with covariates kept for the GAN input).
+2. **Windowing** – Sliding windows are produced with or without covariates (`make_windows_univariate` / `make_windows_with_covariates`).
+3. **Model training** –
+   - `build_generator` / `build_discriminator` construct configurable LSTM stacks.
+   - `train_rgan_keras` optimises the adversarial + regression objectives with label smoothing, gradient clipping, and validation-based early stopping.
+   - `train_lstm_supervised` serves as a direct supervised baseline.
+   - `naive_baseline` provides the persistence comparison and powers the naïve figure.
+4. **Diagnostics** – `run_experiment.py` computes clean train/test statistics (RMSE, MSE, MAE, Bias) for every model, evaluates robustness on noisy inputs, plots comparison bar charts, generates learning curves, and records ETS/ARIMA baselines via `classical_curves_vs_samples` when `statsmodels` is available.
+5. **Reporting** – `metrics.json` aggregates every metric, figure path, and architecture description so the LaTeX builder can inject them directly. `papers/template.tex` references these fields to create the final paper.
+
+---
 
 ## Outputs
-- `results/metrics.json` — all metrics, histories, and file paths to figures
-- Curves (per professor):
+
+Running `run_experiment.py` populates the chosen `--results_dir` with:
+
+- `metrics.json` – central log containing dataset metadata, train/test/noisy metrics, architecture summaries, learning-curve values, and classical baseline scores.
+- `tuning_results.csv` – grid-search results (present when `--tune` is supplied).
+- Figures required by the professor:
   - `rgan_train_test_rmse_vs_epochs.png`
   - `lstm_train_test_rmse_vs_epochs.png`
-  - `models_test_error.png` and `models_train_error.png`
-  - `classical_error_vs_samples.png`
-- `tuning_results.csv` (if tuning enabled)
-- `research_paper.tex` — camera-ready LaTeX with figures embedded
+  - `naive_train_test_rmse_vs_epochs.png`
+  - `models_test_error.png` / `models_train_error.png`
+  - `classical_error_vs_samples.png` (when ETS/ARIMA fits succeed)
+  - `ml_error_vs_samples.png` (learning curves for R-GAN, LSTM, Naïve)
+- `research_paper.tex` – complete LaTeX manuscript produced by `papers/build_paper.py`.
 
-See **REPRODUCIBILITY.md** and **ETHICS.md** for best practices.
+---
 
 ## Troubleshooting
 
-- **`ModuleNotFoundError: No module named 'src'`**  
-  Add these lines at the very top of `run_experiment.py`:
-  ```python
-  import sys, pathlib
-  sys.path.insert(0, str(pathlib.Path(__file__).parent.resolve()))
-  ```
+- **`ModuleNotFoundError: No module named 'src'`** – ensure you execute `run_experiment.py` from the repository root so that `src/` is importable (or prepend the repo path to `sys.path`).
+- **Statsmodels not installed** – `classical_curves_vs_samples` silently skips ETS/ARIMA when `statsmodels` is unavailable. Install the dependency via `pip install statsmodels` to obtain the classical plots.
+- **Long pause before epochs print** – the first log appears after epoch 1. Reduce `--epochs`, shrink `--L/--H`, or disable tuning/learning curves for faster iteration.
+- **Insufficient data for windows** – ensure your CSV has at least `L + H` observations after cleaning; otherwise, adjust the window sizes.
 
-- **Long pause before epochs appear**  
-  The first progress print happens after epoch 1. For immediate feedback, reduce `--L/--H`, increase `--batch_size`, and set `--tune false`.
+For reproducibility and ethics considerations, refer to `papers/` and the notes embedded in the generated LaTeX document.
