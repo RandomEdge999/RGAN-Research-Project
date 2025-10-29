@@ -85,7 +85,6 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
     curves = {"R-GAN": [], "LSTM": [], "Naïve Baseline": [], "Naïve Bayes": []}
     used_sizes = []
     naive_test_stats, _ = naive_baseline(Xte, Yte)
-    naive_bayes_test_stats, _ = naive_bayes_forecast(Xte, Yte)
 
     for size in sizes:
         if size < 2:
@@ -142,9 +141,10 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
         lstm_curve_out = train_lstm_supervised(curve_config, data_splits, str(args.results_dir), tag="lstm_curve")
         curves["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
 
-        # Naïve baseline and Naïve Bayes don't need training, just use test stats
+        # Naïve baseline does not require training and stays constant across sizes
         curves["Naïve Baseline"].append(naive_test_stats["rmse"])
-        curves["Naïve Bayes"].append(naive_bayes_test_stats["rmse"])
+        naive_bayes_stats, _ = naive_bayes_forecast(Xtr_sub, Ytr_sub, Xte, Yte)
+        curves["Naïve Bayes"].append(naive_bayes_stats["rmse"])
         used_sizes.append(int(size))
 
     return used_sizes, curves
@@ -271,9 +271,9 @@ def main():
     plot_constant_train_test(naive_train_stats["rmse"], naive_test_stats["rmse"],
                              "Naïve Baseline: Error vs Epochs", naive_curve_path)
 
-    # Naïve Bayes implementation
-    naive_bayes_test_stats, _ = naive_bayes_forecast(Xte, Yte)
+    # Naïve Bayes implementation (train on training windows, evaluate on both)
     naive_bayes_train_stats, _ = naive_bayes_forecast(Xtr, Ytr)
+    naive_bayes_test_stats, _ = naive_bayes_forecast(Xtr, Ytr, Xte, Yte)
     naive_bayes_curve_path = results_dir/"naive_bayes_train_test_rmse_vs_epochs.png"
     plot_constant_train_test(naive_bayes_train_stats["rmse"], naive_bayes_test_stats["rmse"],
                              "Naïve Bayes: Error vs Epochs", naive_bayes_curve_path)

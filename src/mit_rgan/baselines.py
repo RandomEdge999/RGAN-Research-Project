@@ -1,7 +1,5 @@
 import numpy as np
-import pandas as pd
 from sklearn.naive_bayes import GaussianNB
-from sklearn.preprocessing import StandardScaler
 
 try:
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -26,33 +24,48 @@ def naive_baseline(X, Y):
     stats = _error_stats(Y.reshape(-1), naive_pred.reshape(-1))
     return stats, naive_pred
 
-def naive_bayes_forecast(X, Y):
+def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
+    """Gaussian Naïve Bayes baseline for multi-step forecasting.
+
+    The model treats each window as a feature vector and fits an independent
+    classifier for every forecast horizon step. By default the evaluation is
+    performed on the training data (producing in-sample metrics). Supplying
+    ``X_eval``/``Y_eval`` enables proper out-of-sample evaluation.
+
+    Args:
+        X_train: Training windows of shape (n_samples, L, n_features).
+        Y_train: Training targets of shape (n_samples, H, 1).
+        X_eval: Optional evaluation windows. When omitted the training windows
+            are re-used for evaluation.
+        Y_eval: Optional evaluation targets. Must be provided when ``X_eval``
+            is not ``None``.
+
+    Returns:
+        Tuple[Dict[str, float], np.ndarray]: error statistics (RMSE, MSE, MAE,
+        Bias) and the forecasts for the evaluation windows.
     """
-    Naive Bayes classifier for time series forecasting.
-    Treats each time step as a feature and uses Gaussian Naive Bayes.
-    """
-    H = Y.shape[1]
-    n_samples, L, n_features = X.shape
-    
-    # Flatten the input sequences for Naive Bayes
-    X_flat = X.reshape(n_samples, -1)  # Shape: (n_samples, L * n_features)
-    
-    # For multi-step forecasting, we'll predict each horizon step separately
-    predictions = np.zeros_like(Y)
-    
+
+    if X_eval is None:
+        X_eval = X_train
+        Y_eval = Y_train
+    elif Y_eval is None:
+        raise ValueError("Y_eval must be provided when X_eval is supplied.")
+
+    H = Y_train.shape[1]
+    n_train = X_train.shape[0]
+
+    X_train_flat = X_train.reshape(n_train, -1)
+    X_eval_flat = X_eval.reshape(X_eval.shape[0], -1)
+
+    predictions = np.zeros((X_eval.shape[0], H, 1), dtype=np.float32)
+
     for h in range(H):
-        # Target is the h-th step ahead
-        y_h = Y[:, h, 0]  # Shape: (n_samples,)
-        
-        # Train Naive Bayes for this horizon
+        y_train_h = Y_train[:, h, 0]
         nb_model = GaussianNB()
-        nb_model.fit(X_flat, y_h)
-        
-        # Predict for this horizon
-        pred_h = nb_model.predict(X_flat)
-        predictions[:, h, 0] = pred_h
-    
-    stats = _error_stats(Y.reshape(-1), predictions.reshape(-1))
+        nb_model.fit(X_train_flat, y_train_h)
+        predictions[:, h, 0] = nb_model.predict(X_eval_flat)
+
+    stats = _error_stats(Y_eval.reshape(-1), predictions.reshape(-1))
     return stats, predictions
 
 def classical_curves_vs_samples(train_series, test_series, min_frac=0.3, steps=6):
