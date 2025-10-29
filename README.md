@@ -72,7 +72,7 @@ The generated TeX document embeds every figure (naïve baseline, neural models, 
 
 ## How it works
 
-1. **Data preparation** – `src/mit_rgan/data.py` automatically locates the target, converts recognised time columns, optionally resamples, fills gaps via interpolation, and standardises numeric fields (with covariates kept for the GAN input).
+1. **Data preparation** – `src/rgan/data.py` automatically locates the target, converts recognised time columns, optionally resamples, fills gaps via interpolation, and standardises numeric fields (with covariates kept for the GAN input).
 2. **Windowing** – Sliding windows are produced with or without covariates (`make_windows_univariate` / `make_windows_with_covariates`).
 3. **Model training** –
    - `build_generator` / `build_discriminator` construct configurable LSTM stacks.

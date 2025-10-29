@@ -7,14 +7,14 @@ from pathlib import Path
 
 import numpy as np
 
-from src.mit_rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
-from src.mit_rgan.data import (
+from src.rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
+from src.rgan.data import (
     load_csv_series,
     interpolate_and_standardize,
     make_windows_univariate,
     make_windows_with_covariates,
 )
-from src.mit_rgan.plots import (
+from src.rgan.plots import (
     plot_single_train_test,
     plot_constant_train_test,
     plot_compare_models_bars,
@@ -23,7 +23,8 @@ from src.mit_rgan.plots import (
     create_error_metrics_table,
     plot_naive_bayes_comparison,
 )
-from src.mit_rgan.tune import tune_rgan_keras
+from src.rgan.tune import tune_rgan_keras
+from src.rgan.logging_utils import get_console, print_banner, print_kv_table
 
 
 def set_seed(seed=42, backend="tf"):
@@ -117,13 +118,13 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
     naive_test_stats, _ = naive_baseline(Xte, Yte)
 
     if args.backend == "torch":
-        from src.mit_rgan.models_torch import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
-        from src.mit_rgan.rgan_torch import train_rgan_torch as train_rgan_backend
-        from src.mit_rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
+        from src.rgan.models_torch import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
+        from src.rgan.rgan_torch import train_rgan_torch as train_rgan_backend
+        from src.rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
     else:
-        from src.mit_rgan.models_keras import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
-        from src.mit_rgan.rgan_keras import train_rgan_keras as train_rgan_backend
-        from src.mit_rgan.lstm_supervised import train_lstm_supervised as train_lstm_backend
+        from src.rgan.models_keras import build_generator as build_generator_backend, build_discriminator as build_discriminator_backend
+        from src.rgan.rgan_keras import train_rgan_keras as train_rgan_backend
+        from src.rgan.lstm_supervised import train_lstm_supervised as train_lstm_backend
 
     for size in sizes:
         if size < 2:
@@ -250,6 +251,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
+    console = get_console()
+    print_banner(console, "RGAN Research Project", "Noise-Resilient Forecasting – Experiment Runner")
+
     if args.tune_csv and not args.tune:
         args.tune = True
 
@@ -258,15 +262,15 @@ def main():
 
     if args.backend == "torch":
         try:
-            from src.mit_rgan.models_torch import (
+            from src.rgan.models_torch import (
                 build_generator as build_generator_backend,
                 build_discriminator as build_discriminator_backend,
             )
-            from src.mit_rgan.rgan_torch import (
+            from src.rgan.rgan_torch import (
                 train_rgan_torch as train_rgan_backend,
                 compute_metrics as compute_metrics_backend,
             )
-            from src.mit_rgan.lstm_supervised_torch import (
+            from src.rgan.lstm_supervised_torch import (
                 train_lstm_supervised_torch as train_lstm_backend,
             )
         except ModuleNotFoundError as exc:
@@ -279,15 +283,15 @@ def main():
         import tensorflow as tf
 
         tf.keras.backend.set_floatx("float32")
-        from src.mit_rgan.models_keras import (
+        from src.rgan.models_keras import (
             build_generator as build_generator_backend,
             build_discriminator as build_discriminator_backend,
         )
-        from src.mit_rgan.rgan_keras import (
+        from src.rgan.rgan_keras import (
             train_rgan_keras as train_rgan_backend,
             compute_metrics as compute_metrics_backend,
         )
-        from src.mit_rgan.lstm_supervised import (
+        from src.rgan.lstm_supervised import (
             train_lstm_supervised as train_lstm_backend,
         )
 
@@ -295,6 +299,14 @@ def main():
 
     df, target_col, time_used = load_csv_series(args.csv, args.target, args.time_col, args.resample, args.agg)
     prep = interpolate_and_standardize(df, target_col, train_ratio=args.train_ratio)
+
+    print_kv_table(console, "Dataset", {
+        "CSV": args.csv,
+        "Target": target_col,
+        "Time Column": time_used or "(none)",
+        "Rows": len(df),
+        "Train/Test Split": f"{args.train_ratio:.2f}/{1-args.train_ratio:.2f}",
+    })
 
     try:
         if prep["covariates"]:
@@ -345,6 +357,18 @@ def main():
         persistent_workers=args.persistent_workers,
         pin_memory=args.pin_memory,
     )
+
+    print_kv_table(console, "Configuration", {
+        "Backend": args.backend,
+        "L/H": f"{args.L}/{args.H}",
+        "Epochs": args.epochs,
+        "Batch Size": args.batch_size,
+        "Units (G/D)": f"{args.units_g}/{args.units_d}",
+        "Lambda": args.lambda_reg,
+        "Learning Rates (G/D)": f"{args.lrG}/{args.lrD}",
+        "Dropout": args.dropout,
+        "Layers (G/D)": f"{args.g_layers}/{args.d_layers}",
+    })
 
     used_tune = ""
     if args.tune:
@@ -398,6 +422,7 @@ def main():
             recurrent_activation=args.d_recurrent_activation,
         )
 
+    console.rule("Build Models")
     G = build_generator_backend(**gen_kwargs)
     D = build_discriminator_backend(**disc_kwargs)
     rgan_out = train_rgan_backend(base_config, (G,D), {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="rgan")
