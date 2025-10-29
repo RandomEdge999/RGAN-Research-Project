@@ -68,14 +68,16 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     best_val = float("inf")
     best_state = None
     patience, bad_epochs = config["patience"], 0
-    batch_size = config["batch_size"]
+    batch_size = int(config["batch_size"])
+
+    current_batch_size = max(1, batch_size)
 
     amp_enabled = bool(config.get("amp", True)) and (device.type == "cuda")
     scaler_G = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
     scaler_D = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
 
     hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [],
-            "D_loss": [], "G_loss": [], "G_adv": [], "G_reg": []}
+            "D_loss": [], "G_loss": [], "G_adv": [], "G_reg": [], "batch_size": []}
 
     # DataLoader configuration
     num_workers = int(config.get("num_workers", 2))
@@ -87,65 +89,100 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     Xtr_t = torch.from_numpy(Xtr)
     Ytr_t = torch.from_numpy(Ytr)
     train_ds = TensorDataset(Xtr_t, Ytr_t)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=persistent_workers,
-    )
+
+    def make_train_loader(bs: int) -> DataLoader:
+        return DataLoader(
+            train_ds,
+            batch_size=bs,
+            shuffle=True,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers,
+        )
+
+    train_loader = make_train_loader(current_batch_size)
 
     for epoch in range(1, config["epochs"] + 1):
-        D_losses, G_losses, G_advs, G_regs = [], [], [], []
-        for Xb, Yb in train_loader:
-            Xb = Xb.to(device, non_blocking=True)
-            Yb = Yb.to(device, non_blocking=True)
+        while True:
+            D_losses, G_losses, G_advs, G_regs = [], [], [], []
+            try:
+                for Xb, Yb in train_loader:
+                    Xb = Xb.to(device, non_blocking=True)
+                    Yb = Yb.to(device, non_blocking=True)
+                    target_series = Xb[..., :1]
 
-            # Discriminator step
-            G.train(); D.train()
-            optD.zero_grad()
-            with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                Y_fake = G(Xb)
-                real_pairs = torch.cat([Xb[..., :1], Yb], dim=1)
-                fake_pairs = torch.cat([Xb[..., :1], Y_fake.detach()], dim=1)
-                D_real = D(real_pairs)
-                D_fake = D(fake_pairs)
-                y_real = torch.full_like(D_real, fill_value=config["label_smooth"])
-                y_fake = torch.zeros_like(D_fake)
-                loss_real = bce(D_real, y_real)
-                loss_fake = bce(D_fake, y_fake)
-                D_loss = 0.5 * (loss_real + loss_fake)
-            scaler_D.scale(D_loss).backward()
-            scaler_D.unscale_(optD)
-            nn.utils.clip_grad_value_(D.parameters(), config["grad_clip"])
-            scaler_D.step(optD)
-            scaler_D.update()
+                    # Discriminator step (no_grad to avoid keeping generator activations)
+                    G.train(); D.train()
+                    optD.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                            Y_fake = G(Xb)
+                    if Y_fake.dtype != target_series.dtype:
+                        Y_fake = Y_fake.to(dtype=target_series.dtype)
+                    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                        real_pairs = torch.cat([target_series, Yb], dim=1)
+                        fake_pairs = torch.cat([target_series, Y_fake], dim=1)
+                        D_real = D(real_pairs)
+                        D_fake = D(fake_pairs)
+                        y_real = torch.full_like(D_real, fill_value=config["label_smooth"])
+                        y_fake = torch.zeros_like(D_fake)
+                        loss_real = bce(D_real, y_real)
+                        loss_fake = bce(D_fake, y_fake)
+                        D_loss = 0.5 * (loss_real + loss_fake)
+                    scaler_D.scale(D_loss).backward()
+                    scaler_D.unscale_(optD)
+                    nn.utils.clip_grad_value_(D.parameters(), config["grad_clip"])
+                    scaler_D.step(optD)
+                    scaler_D.update()
 
-            # Generator step
-            optG.zero_grad()
-            with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                Y_fake = G(Xb)
-                fake_pairs = torch.cat([Xb[..., :1], Y_fake], dim=1)
-                D_fake = D(fake_pairs)
-                y_adv = torch.ones_like(D_fake)
-                adv_loss = bce(D_fake, y_adv)
-                reg_loss = mse(Y_fake, Yb)
-                G_loss = adv_loss + config["lambda_reg"] * reg_loss
-            scaler_G.scale(G_loss).backward()
-            scaler_G.unscale_(optG)
-            nn.utils.clip_grad_value_(G.parameters(), config["grad_clip"])
-            scaler_G.step(optG)
-            scaler_G.update()
+                    del fake_pairs, D_fake, D_real, y_real, y_fake, loss_real, loss_fake, Y_fake
 
-            D_losses.append(float(D_loss.detach().cpu()))
-            G_losses.append(float(G_loss.detach().cpu()))
-            G_advs.append(float(adv_loss.detach().cpu()))
-            G_regs.append(float(reg_loss.detach().cpu()))
+                    # Generator step
+                    optG.zero_grad(set_to_none=True)
+                    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                        Y_fake = G(Xb)
+                        cat_target = target_series
+                        if cat_target.dtype != Y_fake.dtype:
+                            cat_target = cat_target.to(dtype=Y_fake.dtype)
+                        fake_pairs = torch.cat([cat_target, Y_fake], dim=1)
+                        D_fake = D(fake_pairs)
+                        y_adv = torch.ones_like(D_fake)
+                        adv_loss = bce(D_fake, y_adv)
+                        target_for_reg = Yb
+                        if target_for_reg.dtype != Y_fake.dtype:
+                            target_for_reg = target_for_reg.to(dtype=Y_fake.dtype)
+                        reg_loss = mse(Y_fake, target_for_reg)
+                        G_loss = adv_loss + config["lambda_reg"] * reg_loss
+                    scaler_G.scale(G_loss).backward()
+                    scaler_G.unscale_(optG)
+                    nn.utils.clip_grad_value_(G.parameters(), config["grad_clip"])
+                    scaler_G.step(optG)
+                    scaler_G.update()
 
-        eval_bs = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
+                    D_losses.append(float(D_loss.detach().cpu()))
+                    G_losses.append(float(G_loss.detach().cpu()))
+                    G_advs.append(float(adv_loss.detach().cpu()))
+                    G_regs.append(float(reg_loss.detach().cpu()))
+                    del D_loss, G_loss, adv_loss, reg_loss, cat_target, target_for_reg, fake_pairs, D_fake, y_adv, Y_fake
+                break
+            except torch.cuda.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                optD.zero_grad(set_to_none=True)
+                optG.zero_grad(set_to_none=True)
+                if current_batch_size == 1:
+                    raise
+                current_batch_size = max(1, current_batch_size // 2)
+                print(f"[R-GAN Torch] CUDA OOM detected. Reducing batch size to {current_batch_size}.")
+                train_loader = make_train_loader(current_batch_size)
+                continue
+
+        hist["batch_size"].append(current_batch_size)
+
+        eval_bs_cfg = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
+        eval_bs = max(1, min(eval_bs_cfg, current_batch_size))
         tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
         te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
         va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
@@ -174,7 +211,8 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     if best_state is not None:
         G.load_state_dict(best_state["G"])
 
-    eval_bs = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
+    eval_bs_cfg = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
+    eval_bs = max(1, min(eval_bs_cfg, current_batch_size))
     train_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
     test_stats, Y_pred = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
 
