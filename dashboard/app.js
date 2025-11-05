@@ -35,15 +35,37 @@
 
   const DEFAULT_METRICS_PATH = (function () {
     const params = new URLSearchParams(window.location.search);
-    return params.get('metrics') || '../results/metrics.json';
+    const override = params.get('metrics');
+    if (override) return override;
+    const preset = window.__RGAN_DASHBOARD__?.defaultMetrics;
+    if (preset) return preset;
+    return '../results/metrics.json';
   })();
 
-  const formatNumber = (value, decimals = 4) => {
+  const resolveMetricsRequestUrl = (path) => {
+    if (!path) {
+      return `/__metrics__?path=${encodeURIComponent(DEFAULT_METRICS_PATH)}`;
+    }
+    const trimmed = path.trim();
+    if (/^https?:\/\//i.test(trimmed)) {
+      return trimmed;
+    }
+    return `/__metrics__?path=${encodeURIComponent(trimmed)}`;
+  };
+
+  const formatNumber = (value, decimals = 8) => {
     if (value === null || value === undefined || Number.isNaN(value)) {
       return '–';
     }
-    const factor = 10 ** decimals;
-    return Math.round(value * factor) / factor;
+    if (!Number.isFinite(value)) {
+      return value.toString();
+    }
+    const formatter = new Intl.NumberFormat('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+      useGrouping: false,
+    });
+    return formatter.format(value);
   };
 
   const formatPercent = (value, decimals = 1) => {
@@ -71,7 +93,7 @@
       if (Number.isInteger(value)) {
         return value.toString();
       }
-      return formatNumber(value, 6);
+      return formatNumber(value, 8);
     }
     if (typeof value === 'boolean') {
       return value ? 'Enabled' : 'Disabled';
@@ -1044,16 +1066,21 @@
     );
 
   const App = () => {
-    const [metrics, setMetrics] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
+  const [metrics, setMetrics] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [metricsPath, setMetricsPath] = useState(DEFAULT_METRICS_PATH);
+  const [inputPath, setInputPath] = useState(DEFAULT_METRICS_PATH);
+  const [activeSource, setActiveSource] = useState(DEFAULT_METRICS_PATH);
 
     useEffect(() => {
       let cancelled = false;
       setLoading(true);
       setError(null);
 
-      fetch(DEFAULT_METRICS_PATH, { cache: 'no-store' })
+  const source = metricsPath || DEFAULT_METRICS_PATH;
+  const requestUrl = resolveMetricsRequestUrl(source);
+  fetch(requestUrl, { cache: 'no-store' })
         .then((response) => {
           if (!response.ok) {
             throw new Error(`Failed to load metrics (${response.status} ${response.statusText})`);
@@ -1064,6 +1091,7 @@
           if (!cancelled) {
             setMetrics(data);
             setLoading(false);
+            setActiveSource(source);
           }
         })
         .catch((err) => {
@@ -1071,13 +1099,14 @@
             console.error('Dashboard metrics load failure', err);
             setError(err.message || 'Unexpected error while loading metrics');
             setLoading(false);
+            setActiveSource(source);
           }
         });
 
       return () => {
         cancelled = true;
       };
-    }, []);
+  }, [metricsPath]);
 
     return React.createElement(
       'div',
@@ -1099,16 +1128,51 @@
             React.createElement(
               'div',
               { key: 'status', className: 'hero-status' },
-              loading
-                ? React.createElement('span', { className: 'status-pill status-loading' }, 'Loading metrics...')
-                : error
-                ? React.createElement('span', { className: 'status-pill status-error' }, `Error: ${error}`)
-                : React.createElement('span', { className: 'status-pill status-ready' }, 'Metrics loaded'),
-              React.createElement(
-                'code',
-                { key: 'path', className: 'metrics-path' },
-                `Source: ${DEFAULT_METRICS_PATH}`
-              )
+              [
+                loading
+                  ? React.createElement('span', { key: 'pill', className: 'status-pill status-loading' }, 'Loading metrics...')
+                  : error
+                  ? React.createElement('span', { key: 'pill', className: 'status-pill status-error' }, `Error: ${error}`)
+                  : React.createElement('span', { key: 'pill', className: 'status-pill status-ready' }, 'Metrics loaded'),
+                React.createElement(
+                  'p',
+                  { key: 'hint', className: 'metrics-hint' },
+                  'Load any metrics snapshot to benchmark experiments and compare outcomes.'
+                ),
+                React.createElement(
+                  'form',
+                  {
+                    key: 'form',
+                    className: 'metrics-form',
+                    onSubmit: (evt) => {
+                      evt.preventDefault();
+                      const trimmed = (inputPath || '').trim();
+                      const nextPath = trimmed || DEFAULT_METRICS_PATH;
+                      setMetricsPath(nextPath);
+                      setInputPath(nextPath);
+                    },
+                  },
+                  [
+                    React.createElement('label', { key: 'label', className: 'metrics-label', htmlFor: 'metricsPath' }, 'Metrics JSON'),
+                    React.createElement('input', {
+                      key: 'input',
+                      id: 'metricsPath',
+                      name: 'metricsPath',
+                      type: 'text',
+                      value: inputPath,
+                      placeholder: DEFAULT_METRICS_PATH,
+                      className: 'metrics-input',
+                      onChange: (event) => setInputPath(event.target.value),
+                    }),
+                    React.createElement('button', { key: 'button', type: 'submit', className: 'metrics-button' }, 'Load'),
+                  ]
+                ),
+                React.createElement(
+                  'code',
+                  { key: 'path', className: 'metrics-path' },
+                  `Active source: ${activeSource}`
+                ),
+              ]
             ),
           ]
         ),
@@ -1123,16 +1187,16 @@
               React.Fragment,
               { key: 'content' },
               [
-                React.createElement(DatasetOverview, { key: 'overview', metrics }),
-                    React.createElement(HighlightsGrid, { key: 'highlights', metrics }),
-                React.createElement(SummaryCards, { key: 'summary', metrics }),
-                    React.createElement(TrainingHistorySection, { key: 'history', metrics }),
+                  React.createElement(HighlightsGrid, { key: 'highlights', metrics }),
+                  React.createElement(SummaryCards, { key: 'summary', metrics }),
+                  React.createElement(DatasetOverview, { key: 'overview', metrics }),
+                  React.createElement(TrainingHistorySection, { key: 'history', metrics }),
                 React.createElement(ComparisonBarChart, { key: 'comparison', metrics }),
                 React.createElement(LearningCurveChart, { key: 'learning', metrics }),
                 React.createElement(NoiseRobustnessChart, { key: 'noise', metrics }),
                 React.createElement(PrecisionTable, { key: 'precision', metrics }),
-                    React.createElement(ConfigurationPanel, { key: 'config', metrics }),
-                    React.createElement(TuningSummary, { key: 'tuning', metrics }),
+                  React.createElement(ConfigurationPanel, { key: 'config', metrics }),
+                  React.createElement(TuningSummary, { key: 'tuning', metrics }),
                 React.createElement(ArchitecturePanel, { key: 'architecture', metrics }),
                 React.createElement(ArtifactLinks, { key: 'artifacts', metrics }),
               ]
