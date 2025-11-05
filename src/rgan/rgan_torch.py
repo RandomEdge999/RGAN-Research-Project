@@ -83,16 +83,17 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     train_ds = TensorDataset(Xtr_t, Ytr_t)
 
     def make_train_loader(bs: int) -> DataLoader:
-        return DataLoader(
-            train_ds,
+        loader_kwargs = dict(
             batch_size=bs,
             shuffle=True,
             drop_last=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=persistent_workers,
         )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(1, prefetch_factor)
+        return DataLoader(train_ds, **loader_kwargs)
 
     train_loader = make_train_loader(current_batch_size)
 

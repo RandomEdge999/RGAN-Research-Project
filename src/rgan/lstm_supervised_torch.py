@@ -117,7 +117,14 @@ def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag
         te = _predict_in_batches(model, Xte, device, eval_batch_size)
         train_stats = _error_stats(Ytr.reshape(-1), tr.reshape(-1))
         test_stats = _error_stats(Yte.reshape(-1), te.reshape(-1))
-        return {"model": model, "history": hist, "train_stats": train_stats, "test_stats": test_stats}
+        return {
+            "model": model,
+            "history": hist,
+            "train_stats": train_stats,
+            "test_stats": test_stats,
+            "pred_train": tr,
+            "pred_test": te,
+        }
 
     try:
         return _train_on_device(torch.device(preferred))
