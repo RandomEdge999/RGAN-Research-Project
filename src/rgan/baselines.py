@@ -68,8 +68,27 @@ def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
         n_bins = int(np.clip(np.sqrt(len(y_train_h)), 5, 50))
 
         quantiles = np.linspace(0.0, 1.0, n_bins + 1)
-        bin_edges = np.unique(np.quantile(y_train_h, quantiles, method="nearest"))
+        bin_edges = np.unique(np.quantile(y_train_h, quantiles, method="linear"))
 
+        if bin_edges.size <= 2:
+            predictions[:, h, 0] = np.mean(y_train_h, dtype=np.float64)
+            continue
+
+        while True:
+            bins = bin_edges[1:-1]
+            y_classes = np.digitize(y_train_h, bins, right=False)
+            n_effective_bins = int(bin_edges.size - 1)
+            counts = np.bincount(y_classes, minlength=n_effective_bins)
+            empty = np.where(counts == 0)[0]
+            if empty.size == 0 or n_effective_bins <= 2:
+                break
+            # Merge empty bins by dropping interior edges to maintain coverage
+            drop_indices = empty + 1
+            keep_mask = np.ones_like(bin_edges, dtype=bool)
+            keep_mask[drop_indices] = False
+            bin_edges = bin_edges[keep_mask]
+            if bin_edges.size <= 2:
+                break
         if bin_edges.size <= 2:
             predictions[:, h, 0] = np.mean(y_train_h, dtype=np.float64)
             continue
@@ -91,6 +110,10 @@ def naive_bayes_forecast(X_train, Y_train, X_eval=None, Y_eval=None):
         nb_model.fit(X_train_flat, y_classes)
 
         proba = nb_model.predict_proba(X_eval_flat)
+        # Laplace-style smoothing to guard against zero-probability bins
+        proba = (proba + 1e-6)
+        proba /= proba.sum(axis=1, keepdims=True)
+
         class_indices = nb_model.classes_.astype(int)
         ordered_means = class_means[class_indices]
         predictions[:, h, 0] = proba @ ordered_means
