@@ -88,11 +88,13 @@ Add GPU-specific flags such as `--amp false` if your accelerator lacks AMP suppo
 
 1. Ensure the previous step produced `results/metrics.json` (and corresponding figures).
 2. Serve the dashboard folder to avoid browser CORS restrictions:
-   ```bash
-   cd dashboard
-   python -m http.server 8000
-   ```
-3. Open `http://localhost:8000/` in a modern browser. The app auto-loads `../results/metrics.json`. To point at a different metrics file, append `?metrics=/absolute/or/relative/path.json` to the URL.
+  ```bash
+  cd dashboard
+  python serve.py --port 8000
+  ```
+  This binds explicitly to `127.0.0.1` and opens your default browser automatically. To skip the auto-launch, add `--no-browser`; to change the metrics file in the convenience link, pass `--metrics path/to/metrics.json`.
+3. Alternatively, use the standard module (`python -m http.server 8000 --bind 127.0.0.1`). Some terminals print `http://0.0.0.0:8000/`; replace `0.0.0.0` with `localhost` or `127.0.0.1` before clicking.
+4. Browse to `http://localhost:8000/`. The app auto-loads `../results/metrics.json`. To point at a different metrics file, append `?metrics=/absolute/or/relative/path.json` to the URL.
 
 ### 5. Build the LaTeX paper
 
@@ -138,6 +140,8 @@ All flags are documented in `run_experiment.py` (`python run_experiment.py --hel
   - Noise robustness analysis
   - Full precision table with bootstrap confidence intervals
   - Configuration & tuning summaries, architecture inventories, and artifact download links
+- **Metrics selector:** Use the form in the hero banner to point the dashboard at any `metrics.json`; the page refreshes without a reload. Query parameters (`?metrics=...`) still work for deep links.
+- **Remote metrics helper:** `serve.py` proxies the requested JSON, so relative paths that escape `dashboard/` (e.g. `../results_wsl_run/metrics.json`) resolve automatically. For headless environments (WSL, servers), pass `--no-browser` to avoid `xdg-open` warnings.
 - **Serving:** Any static file server works (`python -m http.server`, `npx serve`, nginx, etc.). Hosting behind GitHub Pages is possible by copying `results/metrics.json` into the published directory and updating the query parameter.
 
 ---
