@@ -1,21 +1,21 @@
+import copy
+from typing import Dict, Tuple, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader, TensorDataset
-from typing import Dict, Tuple
+
 from .logging_utils import get_console, epoch_progress, update_epoch
+from .metrics import error_stats
 
 
-def _error_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    diff = y_pred - y_true
-    mse = float(np.mean(diff ** 2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(diff)))
-    bias = float(np.mean(diff))
-    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
 
 
 def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], np.ndarray]:
+    """Run the generator in evaluation mode and compute error statistics."""
     G.eval()
     device = next(G.parameters()).device
 
@@ -31,59 +31,180 @@ def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], n
                     end = min(idx + bs, n_samples)
                     Xb = torch.from_numpy(X[idx:end]).to(device=device)
                     with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
-                        Yb = G(Xb).detach().cpu().numpy()
-                    Yp[idx:end] = Yb
+                        Yb = G(Xb)
+                    Yp[idx:end] = Yb.detach().cpu().numpy()
                     idx = end
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
             break
         except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             if bs == 1:
                 raise
             bs = max(1, bs // 2)
 
-    stats = _error_stats(Y.reshape(-1), Yp.reshape(-1))
+    stats = error_stats(Y.reshape(-1), Yp.reshape(-1))
     return stats, Yp
 
 
+def _gradient_penalty(D: nn.Module, real_inputs: torch.Tensor, fake_inputs: torch.Tensor, device: torch.device, gp_lambda: float) -> torch.Tensor:
+    batch_size = real_inputs.size(0)
+    epsilon = torch.rand(batch_size, 1, 1, device=device)
+    epsilon = epsilon.expand_as(real_inputs)
+    interpolated = epsilon * real_inputs + (1 - epsilon) * fake_inputs
+    interpolated.requires_grad_(True)
+
+    # Disable CuDNN for this forward pass to allow double backward (required for gradient penalty)
+    with torch.backends.cudnn.flags(enabled=False):
+        d_interpolated = D(interpolated)
+    grad_outputs = torch.ones_like(d_interpolated, device=device)
+    gradients = torch.autograd.grad(
+        outputs=d_interpolated,
+        inputs=interpolated,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradients = gradients.view(batch_size, -1)
+    penalty = ((gradients.norm(2, dim=1) - 1.0) ** 2).mean()
+    return gp_lambda * penalty
+
+
+def _apply_instance_noise(tensor: torch.Tensor, std: float) -> torch.Tensor:
+    if std <= 0:
+        return tensor
+    noise = torch.randn_like(tensor) * std
+    return tensor + noise
+
+
+def _init_ema(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {name: param.detach().clone() for name, param in model.named_parameters() if param.requires_grad}
+
+
+def _update_ema(shadow: Dict[str, torch.Tensor], model: nn.Module, decay: float) -> None:
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            shadow[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+
+
+def _swap_params_with_shadow(model: nn.Module, shadow: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    backup = {}
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in shadow:
+                backup[name] = param.detach().clone()
+                param.copy_(shadow[name])
+    return backup
+
+
 def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: str = "rgan") -> Dict:
+    """Train the R-GAN with stability improvements and detailed telemetry."""
     G, D = models
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    G.to(device); D.to(device)
+    G.to(device)
+    D.to(device)
 
     Xtr, Ytr = data_splits["Xtr"], data_splits["Ytr"]
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
-    Xte,  Yte  = data_splits["Xte"],  data_splits["Yte"]
+    Xte, Yte = data_splits["Xte"], data_splits["Yte"]
 
     optG = torch.optim.Adam(G.parameters(), lr=config["lrG"])
     optD = torch.optim.Adam(D.parameters(), lr=config["lrD"])
-    bce = nn.BCEWithLogitsLoss()
     mse = nn.MSELoss()
 
-    best_val = float("inf")
-    best_state = None
-    patience, bad_epochs = config["patience"], 0
-    batch_size = int(config["batch_size"])
+    use_logits = bool(config.get("use_logits", False))
+    bce_loss = nn.BCEWithLogitsLoss() if use_logits else nn.BCELoss()
 
-    current_batch_size = max(1, batch_size)
+    gan_variant = config.get("gan_variant", "standard").lower()
+    default_d_steps = 5 if gan_variant == "wgan-gp" else 1
+    d_steps = max(1, int(config.get("d_steps", default_d_steps)))
+    g_steps = max(1, int(config.get("g_steps", 1)))
+    warmup_epochs = max(0, int(config.get("supervised_warmup_epochs", 0)))
+    patience = config["patience"]
+    lambda_reg_start = float(config.get("lambda_reg_start", config["lambda_reg"]))
+    lambda_reg_end = float(config.get("lambda_reg_end", config["lambda_reg"]))
+    lambda_reg_warmup = max(1, int(config.get("lambda_reg_warmup_epochs", max(1, warmup_epochs if warmup_epochs else 1))))
+    adv_weight = float(config.get("adv_weight", 1.0))
+    instance_noise_std = float(config.get("instance_noise_std", 0.0))
+    instance_noise_decay = float(config.get("instance_noise_decay", 0.95))
+    gp_lambda = float(config.get("wgan_gp_lambda", 10.0))
+    ema_decay = float(config.get("ema_decay", 0.0))
+    track_logits = bool(config.get("track_discriminator_outputs", True))
 
+    disc_activation = config.get("d_activation")
+    if disc_activation is None and not use_logits:
+        disc_activation = "sigmoid"
+    disc_activation = disc_activation.lower() if isinstance(disc_activation, str) else ""
+
+    def _disc_output_to_prob(tensor: torch.Tensor) -> torch.Tensor:
+        if use_logits:
+            return tensor
+        if disc_activation == "tanh":
+            prob = 0.5 * (tensor + 1.0)
+        elif disc_activation in {"sigmoid"}:
+            prob = tensor
+        else:
+            prob = torch.sigmoid(tensor)
+        if prob.is_floating_point():
+            eps = torch.finfo(prob.dtype).eps
+        else:
+            eps = 1e-6
+        return torch.clamp(prob, eps, 1.0 - eps)
+
+    def _safe_bce(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if use_logits:
+            # Inputs already represent logits; allow AMP to manage dtype.
+            return bce_loss(inputs, targets.to(inputs.dtype))
+
+        inputs_fp32 = inputs.float()
+        targets_fp32 = targets.float()
+        if device.type == "cuda":
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                return bce_loss(inputs_fp32, targets_fp32)
+        return bce_loss(inputs_fp32, targets_fp32)
+
+    current_batch_size = max(1, int(config["batch_size"]))
     amp_enabled = bool(config.get("amp", True)) and (device.type == "cuda")
     scaler_G = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
     scaler_D = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
 
-    hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [],
-            "D_loss": [], "G_loss": [], "G_adv": [], "G_reg": [], "batch_size": []}
+    best_val = float("inf")
+    best_state = None
+    bad_epochs = 0
+
+    use_ema = 0.0 < ema_decay < 1.0
+    ema_shadow: Optional[Dict[str, torch.Tensor]] = _init_ema(G) if use_ema else None
+
+    hist = {
+        "epoch": [],
+        "train_rmse": [],
+        "test_rmse": [],
+        "val_rmse": [],
+        "D_loss": [],
+        "G_loss": [],
+        "G_adv": [],
+        "G_reg": [],
+        "grad_norm_G": [],
+        "grad_norm_D": [],
+        "batch_size": [],
+    }
+    if track_logits:
+        hist["D_real_mean"] = []
+        hist["D_fake_mean"] = []
 
     num_workers = int(config.get("num_workers", 2))
     prefetch_factor = int(config.get("prefetch_factor", 2))
     persistent_workers = bool(config.get("persistent_workers", True)) and num_workers > 0
     pin_memory = bool(config.get("pin_memory", device.type == "cuda"))
 
-    Xtr_t = torch.from_numpy(Xtr)
-    Ytr_t = torch.from_numpy(Ytr)
-    train_ds = TensorDataset(Xtr_t, Ytr_t)
+    train_ds = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(Ytr))
 
-    def make_train_loader(bs: int) -> DataLoader:
-        loader_kwargs = dict(
+    def make_loader(bs: int) -> DataLoader:
+        kwargs = dict(
             batch_size=bs,
             shuffle=True,
             drop_last=False,
@@ -92,76 +213,155 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
             persistent_workers=persistent_workers,
         )
         if num_workers > 0:
-            loader_kwargs["prefetch_factor"] = max(1, prefetch_factor)
-        return DataLoader(train_ds, **loader_kwargs)
+            kwargs["prefetch_factor"] = max(1, prefetch_factor)
+        return DataLoader(train_ds, **kwargs)
 
-    train_loader = make_train_loader(current_batch_size)
+    train_loader = make_loader(current_batch_size)
 
     console = get_console()
     with epoch_progress(config["epochs"], description="R-GAN (Torch)") as (progress, task_id):
         for epoch in range(1, config["epochs"] + 1):
+            supervised_only = epoch <= warmup_epochs
+            lambda_reg = lambda_reg_end
+            if lambda_reg_warmup > 1:
+                progress_ratio = min(1.0, max(0.0, (epoch - 1) / (lambda_reg_warmup - 1)))
+                lambda_reg = lambda_reg_start + (lambda_reg_end - lambda_reg_start) * progress_ratio
+
+            epoch_D_losses, epoch_G_losses = [], []
+            epoch_adv, epoch_reg = [], []
+            epoch_grad_G, epoch_grad_D = [], []
+            epoch_D_real, epoch_D_fake = [], []
+            noise_std_epoch = instance_noise_std * (instance_noise_decay ** max(0, epoch - 1))
+
+            G.train()
+            D.train()
+
             while True:
-                D_losses, G_losses, G_advs, G_regs = [], [], [], []
                 try:
                     for Xb, Yb in train_loader:
                         Xb = Xb.to(device, non_blocking=True)
                         Yb = Yb.to(device, non_blocking=True)
                         target_series = Xb[..., :1]
 
-                        G.train(); D.train()
-                        optD.zero_grad(set_to_none=True)
-                        with torch.no_grad():
+                        if not supervised_only:
+                            for _ in range(d_steps):
+                                optD.zero_grad(set_to_none=True)
+                                with torch.no_grad():
+                                    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                                        Y_fake_detached = G(Xb)
+                                if Y_fake_detached.dtype != target_series.dtype:
+                                    Y_fake_detached = Y_fake_detached.to(dtype=target_series.dtype)
+
+                                with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                                    real_pairs = torch.cat([target_series, Yb], dim=1)
+                                    fake_pairs = torch.cat([target_series, Y_fake_detached], dim=1)
+                                    if noise_std_epoch > 0:
+                                        real_pairs = _apply_instance_noise(real_pairs, noise_std_epoch)
+                                        fake_pairs = _apply_instance_noise(fake_pairs, noise_std_epoch)
+
+                                    D_real = D(real_pairs)
+                                    D_fake = D(fake_pairs)
+
+                                if gan_variant == "wgan-gp":
+                                    D_loss_main = -(D_real.mean() - D_fake.mean())
+                                    gp = _gradient_penalty(D, real_pairs, fake_pairs, device, gp_lambda)
+                                    D_loss = D_loss_main + gp
+                                else:
+                                    real_targets = torch.full_like(D_real, config["label_smooth"])
+                                    fake_targets = torch.zeros_like(D_fake)
+                                    D_real_prob = _disc_output_to_prob(D_real)
+                                    D_fake_prob = _disc_output_to_prob(D_fake)
+
+                                    real_targets_eval = real_targets.to(D_real.dtype) if use_logits else real_targets
+                                    fake_targets_eval = fake_targets.to(D_fake.dtype) if use_logits else fake_targets
+
+                                    D_loss_main = 0.5 * (
+                                        _safe_bce(D_real_prob, real_targets_eval)
+                                        + _safe_bce(D_fake_prob, fake_targets_eval)
+                                    )
+                                    D_loss = D_loss_main
+
+                                scaler_D.scale(D_loss).backward()
+                                scaler_D.unscale_(optD)
+                                clip_grad_value_(D.parameters(), config["grad_clip"])
+
+                                grad_sq = 0.0
+                                for p in D.parameters():
+                                    if p.grad is not None:
+                                        grad_sq += p.grad.detach().pow(2).sum().item()
+                                epoch_grad_D.append(float(np.sqrt(grad_sq)))
+
+                                scaler_D.step(optD)
+                                scaler_D.update()
+
+                                epoch_D_losses.append(float(D_loss_main.detach().cpu()))
+                                if track_logits:
+                                    if gan_variant == "wgan-gp":
+                                        epoch_D_real.append(float(D_real.mean().detach().cpu()))
+                                        epoch_D_fake.append(float(D_fake.mean().detach().cpu()))
+                                    else:
+                                        real_prob = torch.sigmoid(D_real) if use_logits else _disc_output_to_prob(D_real)
+                                        fake_prob = torch.sigmoid(D_fake) if use_logits else _disc_output_to_prob(D_fake)
+                                        epoch_D_real.append(float(real_prob.mean().detach().cpu()))
+                                        epoch_D_fake.append(float(fake_prob.mean().detach().cpu()))
+
+                        for _ in range(g_steps):
+                            optG.zero_grad(set_to_none=True)
                             with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
                                 Y_fake = G(Xb)
-                        if Y_fake.dtype != target_series.dtype:
-                            Y_fake = Y_fake.to(dtype=target_series.dtype)
-                        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                            real_pairs = torch.cat([target_series, Yb], dim=1)
-                            fake_pairs = torch.cat([target_series, Y_fake], dim=1)
-                            D_real = D(real_pairs)
-                            D_fake = D(fake_pairs)
-                            y_real = torch.full_like(D_real, fill_value=config["label_smooth"])
-                            y_fake = torch.zeros_like(D_fake)
-                            loss_real = bce(D_real, y_real)
-                            loss_fake = bce(D_fake, y_fake)
-                            D_loss = 0.5 * (loss_real + loss_fake)
-                        scaler_D.scale(D_loss).backward()
-                        scaler_D.unscale_(optD)
-                        nn.utils.clip_grad_value_(D.parameters(), config["grad_clip"])
-                        scaler_D.step(optD)
-                        scaler_D.update()
+                                cat_target = target_series
+                                if cat_target.dtype != Y_fake.dtype:
+                                    cat_target = cat_target.to(dtype=Y_fake.dtype)
+                                fake_pairs = torch.cat([cat_target, Y_fake], dim=1)
+                                if noise_std_epoch > 0 and not supervised_only:
+                                    fake_pairs = _apply_instance_noise(fake_pairs, noise_std_epoch)
 
-                        del fake_pairs, D_fake, D_real, y_real, y_fake, loss_real, loss_fake, Y_fake
+                                if supervised_only:
+                                    adv_loss = torch.tensor(0.0, device=device)
+                                elif gan_variant == "wgan-gp":
+                                    adv_loss = -D(fake_pairs).mean()
+                                else:
+                                    logits = D(fake_pairs)
+                                    labels = torch.ones_like(logits)
+                                    if use_logits:
+                                        adv_inputs = logits
+                                        labels_eval = labels
+                                    else:
+                                        adv_inputs = _disc_output_to_prob(logits)
+                                        labels_eval = labels
+                                    adv_loss = _safe_bce(adv_inputs, labels_eval)
 
-                        optG.zero_grad(set_to_none=True)
-                        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                            Y_fake = G(Xb)
-                            cat_target = target_series
-                            if cat_target.dtype != Y_fake.dtype:
-                                cat_target = cat_target.to(dtype=Y_fake.dtype)
-                            fake_pairs = torch.cat([cat_target, Y_fake], dim=1)
-                            D_fake = D(fake_pairs)
-                            y_adv = torch.ones_like(D_fake)
-                            adv_loss = bce(D_fake, y_adv)
-                            target_for_reg = Yb
-                            if target_for_reg.dtype != Y_fake.dtype:
-                                target_for_reg = target_for_reg.to(dtype=Y_fake.dtype)
-                            reg_loss = mse(Y_fake, target_for_reg)
-                            G_loss = adv_loss + config["lambda_reg"] * reg_loss
-                        scaler_G.scale(G_loss).backward()
-                        scaler_G.unscale_(optG)
-                        nn.utils.clip_grad_value_(G.parameters(), config["grad_clip"])
-                        scaler_G.step(optG)
-                        scaler_G.update()
+                                target_for_reg = Yb
+                                if target_for_reg.dtype != Y_fake.dtype:
+                                    target_for_reg = target_for_reg.to(dtype=Y_fake.dtype)
+                                reg_loss = mse(Y_fake, target_for_reg)
+                                total_loss = adv_weight * adv_loss + lambda_reg * reg_loss
 
-                        D_losses.append(float(D_loss.detach().cpu()))
-                        G_losses.append(float(G_loss.detach().cpu()))
-                        G_advs.append(float(adv_loss.detach().cpu()))
-                        G_regs.append(float(reg_loss.detach().cpu()))
-                        del D_loss, G_loss, adv_loss, reg_loss, cat_target, target_for_reg, fake_pairs, D_fake, y_adv, Y_fake
+                            scaler_G.scale(total_loss).backward()
+                            scaler_G.unscale_(optG)
+                            clip_grad_value_(G.parameters(), config["grad_clip"])
+
+                            grad_sq = 0.0
+                            for p in G.parameters():
+                                if p.grad is not None:
+                                    grad_sq += p.grad.detach().pow(2).sum().item()
+                            epoch_grad_G.append(float(np.sqrt(grad_sq)))
+
+                            scaler_G.step(optG)
+                            scaler_G.update()
+
+                            epoch_G_losses.append(float(total_loss.detach().cpu()))
+                            epoch_adv.append(float(adv_loss.detach().cpu()))
+                            epoch_reg.append(float(reg_loss.detach().cpu()))
+
+                            if use_ema and ema_shadow is not None:
+                                _update_ema(ema_shadow, G, ema_decay)
+
+                        del Xb, Yb, target_series
+
                     break
                 except torch.cuda.OutOfMemoryError:
-                    if torch.cuda.is_available():
+                    if device.type == "cuda":
                         torch.cuda.empty_cache()
                     optD.zero_grad(set_to_none=True)
                     optG.zero_grad(set_to_none=True)
@@ -169,36 +369,50 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
                         raise
                     current_batch_size = max(1, current_batch_size // 2)
                     console.log(f"[R-GAN Torch] CUDA OOM detected. Reducing batch size to {current_batch_size}.")
-                    train_loader = make_train_loader(current_batch_size)
+                    train_loader = make_loader(current_batch_size)
                     continue
 
             hist["batch_size"].append(current_batch_size)
+            hist["grad_norm_G"].append(float(np.mean(epoch_grad_G) if epoch_grad_G else 0.0))
+            hist["grad_norm_D"].append(float(np.mean(epoch_grad_D) if epoch_grad_D else 0.0))
+            hist["D_loss"].append(float(np.mean(epoch_D_losses) if epoch_D_losses else 0.0))
+            hist["G_loss"].append(float(np.mean(epoch_G_losses) if epoch_G_losses else 0.0))
+            hist["G_adv"].append(float(np.mean(epoch_adv) if epoch_adv else 0.0))
+            hist["G_reg"].append(float(np.mean(epoch_reg) if epoch_reg else 0.0))
+            if track_logits:
+                hist["D_real_mean"].append(float(np.mean(epoch_D_real) if epoch_D_real else 0.0))
+                hist["D_fake_mean"].append(float(np.mean(epoch_D_fake) if epoch_D_fake else 0.0))
 
             eval_bs_cfg = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
             eval_bs = max(1, min(eval_bs_cfg, current_batch_size))
-            tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
-            te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
-            va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
-            va_rmse = va_stats["rmse"]
+
+            if use_ema and ema_shadow is not None:
+                backup = _swap_params_with_shadow(G, ema_shadow)
+                tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
+                te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
+                va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
+                _swap_params_with_shadow(G, backup)
+            else:
+                tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
+                te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
+                va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
 
             hist["epoch"].append(epoch)
-            hist["D_loss"].append(np.mean(D_losses)); hist["G_loss"].append(np.mean(G_losses))
-            hist["G_adv"].append(np.mean(G_advs));   hist["G_reg"].append(np.mean(G_regs))
             hist["train_rmse"].append(tr_stats["rmse"])
             hist["test_rmse"].append(te_stats["rmse"])
             hist["val_rmse"].append(va_stats["rmse"])
 
             update_epoch(progress, task_id, epoch, config["epochs"], {
-                "D": float(np.mean(D_losses)),
-                "G": float(np.mean(G_losses)),
-                "Train": float(tr_stats["rmse"]),
-                "Val": float(va_rmse),
-                "Test": float(te_stats["rmse"]),
+                "D": hist["D_loss"][-1],
+                "G": hist["G_loss"][-1],
+                "Train": tr_stats["rmse"],
+                "Val": va_stats["rmse"],
+                "Test": te_stats["rmse"],
             })
 
-            if va_rmse < best_val - 1e-7:
-                best_val = va_rmse
-                best_state = {"G": G.state_dict()}
+            if va_stats["rmse"] < best_val - 1e-7:
+                best_val = va_stats["rmse"]
+                best_state = copy.deepcopy(G.state_dict())
                 bad_epochs = 0
             else:
                 bad_epochs += 1
@@ -207,18 +421,29 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
                     break
 
     if best_state is not None:
-        G.load_state_dict(best_state["G"])
+        G.load_state_dict(best_state)
+
+    if use_ema and ema_shadow is not None:
+        G_ema = copy.deepcopy(G)
+        _swap_params_with_shadow(G_ema, ema_shadow)
+    else:
+        G_ema = None
 
     eval_bs_cfg = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
     eval_bs = max(1, min(eval_bs_cfg, current_batch_size))
-    train_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
-    test_stats, Y_pred = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
+    eval_model = G_ema or G
+    train_stats, _ = compute_metrics(eval_model, Xtr, Ytr, batch_size=eval_bs)
+    test_stats, Y_pred = compute_metrics(eval_model, Xte, Yte, batch_size=eval_bs)
 
     return {
-        "G": G, "D": D, "history": hist,
+        "G": G,
+        "G_ema": G_ema,
+        "D": D,
+        "history": hist,
         "train_stats": train_stats,
         "test_stats": test_stats,
-        "pred_test": Y_pred
+        "pred_test": Y_pred,
+        "lambda_reg_final": lambda_reg,
     }
 
 

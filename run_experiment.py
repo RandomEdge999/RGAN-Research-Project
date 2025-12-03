@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import os
 import platform
 import random
 import subprocess
 import sys
+from itertools import combinations
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
 
-from src.rgan.baselines import naive_baseline, naive_bayes_forecast, classical_curves_vs_samples
+from src.rgan.baselines import (
+    naive_baseline,
+    naive_baseline,
+    arima_forecast,
+    arma_forecast,
+    tree_ensemble_forecast,
+    classical_curves_vs_samples,
+)
 from src.rgan.data import (
     load_csv_series,
     interpolate_and_standardize,
@@ -26,10 +35,21 @@ from src.rgan.plots import (
     plot_classical_curves,
     plot_learning_curves,
     create_error_metrics_table,
-    plot_naive_bayes_comparison,
+    plot_single_train_test,
+    plot_constant_train_test,
+    plot_compare_models_bars,
+    plot_classical_curves,
+    plot_learning_curves,
+    create_error_metrics_table,
 )
 from src.rgan.tune import tune_rgan
 from src.rgan.logging_utils import get_console, print_banner, print_kv_table
+from src.rgan.metrics import (
+    describe_model,
+    error_stats,
+    summarise_with_uncertainty,
+    diebold_mariano,
+)
 
 
 def set_seed(seed: int = 42) -> None:
@@ -55,26 +75,10 @@ def set_seed(seed: int = 42) -> None:
         pass
 
 
-def describe_model(model) -> list:
-    """Return a human-readable description of the model layers."""
-    description = []
-    if hasattr(model, "named_children"):
-        for name, module in model.named_children():
-            description.append(f"{name}: {module.__class__.__name__}")
-        if not description:
-            description.append(model.__class__.__name__)
-    else:
-        description.append(model.__class__.__name__)
-    return description
 
 
-def error_stats(y_true, y_pred):
-    diff = y_pred - y_true
-    mse = float(np.mean(diff ** 2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(diff)))
-    bias = float(np.mean(diff))
-    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
+
 
 
 def split_windows_for_training(
@@ -127,78 +131,7 @@ def split_windows_for_training(
     return result
 
 
-def summarise_with_uncertainty(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    *,
-    n_bootstrap: int = 300,
-    seed: Optional[int] = None,
-    original_mean: Optional[float] = None,
-    original_std: Optional[float] = None,
-) -> Dict[str, float]:
-    """Return base error statistics plus bootstrap uncertainty estimates."""
 
-    y_true_flat = y_true.reshape(-1)
-    y_pred_flat = y_pred.reshape(-1)
-    stats = error_stats(y_true_flat, y_pred_flat)
-
-    orig_enabled = original_mean is not None and original_std is not None
-    if orig_enabled:
-        y_true_orig = y_true_flat * original_std + original_mean
-        y_pred_orig = y_pred_flat * original_std + original_mean
-        orig_stats = error_stats(y_true_orig, y_pred_orig)
-        stats.update({f"{k}_orig": v for k, v in orig_stats.items()})
-
-    if n_bootstrap <= 0 or y_true_flat.size < 2:
-        return stats
-
-    rng = np.random.default_rng(seed)
-    rmse_samples = []
-    mae_samples = []
-    rmse_orig_samples = [] if orig_enabled else None
-    mae_orig_samples = [] if orig_enabled else None
-    n = y_true_flat.size
-    diff_flat = y_pred_flat - y_true_flat
-    if orig_enabled:
-        diff_orig_flat = diff_flat * original_std
-    for _ in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
-        diff = diff_flat[idx]
-        rmse_samples.append(np.sqrt(np.mean(diff ** 2)))
-        mae_samples.append(np.mean(np.abs(diff)))
-        if orig_enabled and rmse_orig_samples is not None and mae_orig_samples is not None:
-            diff_orig = diff_orig_flat[idx]
-            rmse_orig_samples.append(np.sqrt(np.mean(diff_orig ** 2)))
-            mae_orig_samples.append(np.mean(np.abs(diff_orig)))
-
-    rmse_arr = np.asarray(rmse_samples, dtype=float)
-    mae_arr = np.asarray(mae_samples, dtype=float)
-
-    stats.update(
-        {
-            "rmse_std": float(np.std(rmse_arr, ddof=1)),
-            "rmse_ci_low": float(np.percentile(rmse_arr, 2.5)),
-            "rmse_ci_high": float(np.percentile(rmse_arr, 97.5)),
-            "mae_std": float(np.std(mae_arr, ddof=1)),
-            "mae_ci_low": float(np.percentile(mae_arr, 2.5)),
-            "mae_ci_high": float(np.percentile(mae_arr, 97.5)),
-        }
-    )
-
-    if orig_enabled and rmse_orig_samples and mae_orig_samples:
-        rmse_orig_arr = np.asarray(rmse_orig_samples, dtype=float)
-        mae_orig_arr = np.asarray(mae_orig_samples, dtype=float)
-        stats.update(
-            {
-                "rmse_orig_std": float(np.std(rmse_orig_arr, ddof=1)),
-                "rmse_orig_ci_low": float(np.percentile(rmse_orig_arr, 2.5)),
-                "rmse_orig_ci_high": float(np.percentile(rmse_orig_arr, 97.5)),
-                "mae_orig_std": float(np.std(mae_orig_arr, ddof=1)),
-                "mae_orig_ci_low": float(np.percentile(mae_orig_arr, 2.5)),
-                "mae_orig_ci_high": float(np.percentile(mae_orig_arr, 97.5)),
-            }
-        )
-    return stats
 
 
 def parse_noise_levels(spec: str) -> np.ndarray:
@@ -235,7 +168,15 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
     sizes = np.clip(sizes, 2, total)
     sizes = np.unique(sizes)
 
-    curves_mean = {"R-GAN": [], "LSTM": [], "Naïve Baseline": [], "Naïve Bayes": []}
+    curves_mean = {
+        "R-GAN": [],
+        "LSTM": [],
+        "Tree Ensemble": [],
+        "Naïve Baseline": [],
+        "Naïve Baseline": [],
+        "ARIMA": [],
+        "ARMA": [],
+    }
     curves_std = {key: [] for key in curves_mean}
     used_sizes = []
 
@@ -338,10 +279,25 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
             rmse_acc["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
 
             rmse_acc["Naïve Baseline"].append(naive_test_stats["rmse"])
-            naive_bayes_stats, _ = naive_bayes_forecast(
+            rmse_acc["Naïve Baseline"].append(naive_test_stats["rmse"])
+            
+            arima_stats, _ = arima_forecast(
                 sub_split["X_train"], sub_split["Y_train"], Xte, Yte
             )
-            rmse_acc["Naïve Bayes"].append(naive_bayes_stats["rmse"])
+            rmse_acc["ARIMA"].append(arima_stats["rmse"])
+            
+            arma_stats, _ = arma_forecast(
+                sub_split["X_train"], sub_split["Y_train"], Xte, Yte
+            )
+            rmse_acc["ARMA"].append(arma_stats["rmse"])
+            tree_stats, _ = tree_ensemble_forecast(
+                sub_split["X_train"],
+                sub_split["Y_train"],
+                Xte,
+                Yte,
+                random_state=args.seed + rep,
+            )
+            rmse_acc["Tree Ensemble"].append(tree_stats["rmse"])
 
         if not any(rmse_acc[key] for key in rmse_acc):
             continue
@@ -370,6 +326,14 @@ def main():
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lambda_reg", type=float, default=0.1)
+    ap.add_argument(
+        "--gan_variant",
+        choices=["standard", "wgan-gp"],
+        default="standard",
+        help="Adversarial loss variant (standard BCE or Wasserstein with GP).",
+    )
+    ap.add_argument("--d_steps", type=int, default=1, help="Number of discriminator updates per batch.")
+    ap.add_argument("--g_steps", type=int, default=1, help="Number of generator updates per batch.")
     ap.add_argument("--units_g", type=int, default=64)
     ap.add_argument("--units_d", type=int, default=64)
     ap.add_argument("--g_layers", type=int, default=1)
@@ -382,6 +346,66 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=5.0)
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument(
+        "--supervised_warmup_epochs",
+        type=int,
+        default=0,
+        help="Train with pure supervised loss for the first N epochs before enabling GAN loss.",
+    )
+    ap.add_argument(
+        "--lambda_reg_start",
+        type=float,
+        default=None,
+        help="Initial lambda_reg value for annealing (defaults to --lambda_reg).",
+    )
+    ap.add_argument(
+        "--lambda_reg_end",
+        type=float,
+        default=None,
+        help="Final lambda_reg value for annealing (defaults to --lambda_reg).",
+    )
+    ap.add_argument(
+        "--lambda_reg_warmup_epochs",
+        type=int,
+        default=1,
+        help="Epochs over which to interpolate between lambda_reg_start and lambda_reg_end.",
+    )
+    ap.add_argument(
+        "--adv_weight",
+        type=float,
+        default=1.0,
+        help="Global weight applied to the adversarial term when combining with the supervised loss.",
+    )
+    ap.add_argument(
+        "--instance_noise_std",
+        type=float,
+        default=0.0,
+        help="Standard deviation of Gaussian instance noise added to discriminator inputs (0 to disable).",
+    )
+    ap.add_argument(
+        "--instance_noise_decay",
+        type=float,
+        default=0.95,
+        help="Multiplicative decay applied to instance-noise std each epoch.",
+    )
+    ap.add_argument(
+        "--wgan_gp_lambda",
+        type=float,
+        default=10.0,
+        help="Gradient penalty coefficient when using WGAN-GP.",
+    )
+    ap.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help="EMA decay for generator weights (0 disables EMA).",
+    )
+    ap.add_argument(
+        "--use_logits",
+        type=lambda v: str(v).lower() in ["1", "true", "yes"],
+        default=False,
+        help="Treat discriminator outputs as logits (set when d_activation is linear).",
+    )
     ap.add_argument("--train_ratio", type=float, default=0.8)
     ap.add_argument("--val_frac", type=float, default=0.1, help="Fraction of training windows reserved for validation during fitting.")
     ap.add_argument(
@@ -509,6 +533,10 @@ def main():
     Xtr, Ytr = base_splits["X_train"], base_splits["Y_train"]
     Xval, Yval = base_splits["X_val"], base_splits["Y_val"]
 
+    training_series_scaled = prep["scaled_train"][target_col].to_numpy(dtype=np.float32)
+    training_series_orig = prep["train_df"][target_col].to_numpy(dtype=np.float32)
+    horizon = int(Ytr.shape[1])
+
     base_config = dict(
         L=args.L,
         H=args.H,
@@ -534,6 +562,20 @@ def main():
         persistent_workers=args.persistent_workers,
         pin_memory=args.pin_memory,
         seed=args.seed,
+        gan_variant=args.gan_variant,
+        d_steps=args.d_steps,
+        g_steps=args.g_steps,
+        supervised_warmup_epochs=args.supervised_warmup_epochs,
+        lambda_reg_start=args.lambda_reg_start if args.lambda_reg_start is not None else args.lambda_reg,
+        lambda_reg_end=args.lambda_reg_end if args.lambda_reg_end is not None else args.lambda_reg,
+        lambda_reg_warmup_epochs=args.lambda_reg_warmup_epochs,
+        adv_weight=args.adv_weight,
+        instance_noise_std=args.instance_noise_std,
+        instance_noise_decay=args.instance_noise_decay,
+        wgan_gp_lambda=args.wgan_gp_lambda,
+        ema_decay=args.ema_decay,
+        use_logits=args.use_logits,
+        track_discriminator_outputs=True,
     )
 
     print_kv_table(console, "Configuration", {
@@ -628,6 +670,9 @@ def main():
 
     g_dense_act = base_config.get("g_dense_activation")
 
+    layer_norm = True
+    use_spectral_norm = True if base_config.get("gan_variant", "standard").lower() == "wgan-gp" else False
+
     gen_kwargs = dict(
         L=args.L,
         H=args.H,
@@ -636,6 +681,7 @@ def main():
         dropout=base_config["dropout"],
         num_layers=base_config["g_layers"],
         dense_activation=g_dense_act,
+        layer_norm=layer_norm,
     )
     disc_kwargs = dict(
         L=args.L,
@@ -644,6 +690,8 @@ def main():
         dropout=base_config["dropout"],
         num_layers=base_config["d_layers"],
         activation=base_config.get("d_activation"),
+        layer_norm=layer_norm,
+        use_spectral_norm=use_spectral_norm,
     )
 
     console.rule("Build Models")
@@ -677,6 +725,8 @@ def main():
         seed=args.seed,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
     naive_test_stats = summarise_with_uncertainty(
         Yte,
@@ -685,6 +735,8 @@ def main():
         seed=args.seed + 1,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
     naive_curve_artifacts = plot_constant_train_test(
         naive_train_stats["rmse"],
@@ -693,38 +745,110 @@ def main():
         results_dir / "naive_train_test_rmse_vs_epochs.png",
     )
 
-    # Naïve Bayes implementation (train on training windows, evaluate on both)
-    _, naive_bayes_train_pred = naive_bayes_forecast(Xtr, Ytr)
-    naive_bayes_train_stats = summarise_with_uncertainty(
+    # ARIMA implementation
+    _, arima_train_pred = arima_forecast(Xtr, Ytr)
+    arima_train_stats = summarise_with_uncertainty(
         Ytr,
-        naive_bayes_train_pred,
+        arima_train_pred,
         n_bootstrap=args.bootstrap_samples,
         seed=args.seed,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
-    _, naive_bayes_test_pred = naive_bayes_forecast(Xtr, Ytr, Xte, Yte)
-    naive_bayes_test_stats = summarise_with_uncertainty(
+    _, arima_test_pred = arima_forecast(Xtr, Ytr, Xte, Yte)
+    arima_test_stats = summarise_with_uncertainty(
         Yte,
-        naive_bayes_test_pred,
+        arima_test_pred,
         n_bootstrap=args.bootstrap_samples,
         seed=args.seed + 1,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
-    naive_bayes_curve_artifacts = plot_constant_train_test(
-        naive_bayes_train_stats["rmse"],
-        naive_bayes_test_stats["rmse"],
-        "Naïve Bayes: Error vs Epochs",
-        results_dir / "naive_bayes_train_test_rmse_vs_epochs.png",
+    arima_curve_artifacts = plot_constant_train_test(
+        arima_train_stats["rmse"],
+        arima_test_stats["rmse"],
+        "ARIMA: Error vs Epochs",
+        results_dir / "arima_train_test_rmse_vs_epochs.png",
     )
 
-    # Plot comparison between Naïve Baseline and Naïve Bayes (similar to Fig 1)
-    naive_comparison_artifacts = plot_naive_bayes_comparison(
-        naive_test_stats,
-        naive_bayes_test_stats,
-        results_dir / "naive_baseline_vs_naive_bayes.png",
+    # ARMA implementation
+    _, arma_train_pred = arma_forecast(Xtr, Ytr)
+    arma_train_stats = summarise_with_uncertainty(
+        Ytr,
+        arma_train_pred,
+        n_bootstrap=args.bootstrap_samples,
+        seed=args.seed,
+        original_mean=target_mean,
+        original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
+    _, arma_test_pred = arma_forecast(Xtr, Ytr, Xte, Yte)
+    arma_test_stats = summarise_with_uncertainty(
+        Yte,
+        arma_test_pred,
+        n_bootstrap=args.bootstrap_samples,
+        seed=args.seed + 1,
+        original_mean=target_mean,
+        original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
+    )
+    arma_curve_artifacts = plot_constant_train_test(
+        arma_train_stats["rmse"],
+        arma_test_stats["rmse"],
+        "ARMA: Error vs Epochs",
+        results_dir / "arma_train_test_rmse_vs_epochs.png",
+    )
+
+    _, tree_train_pred, tree_model = tree_ensemble_forecast(
+        Xtr,
+        Ytr,
+        random_state=args.seed,
+        return_model=True,
+    )
+    tree_train_pred = tree_train_pred.astype(np.float32, copy=False)
+    tree_train_stats = summarise_with_uncertainty(
+        Ytr,
+        tree_train_pred,
+        n_bootstrap=args.bootstrap_samples,
+        seed=args.seed + 2,
+        original_mean=target_mean,
+        original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
+    )
+    tree_test_pred = tree_model.predict(Xte.reshape(Xte.shape[0], -1)).astype(np.float32)
+    tree_test_pred = tree_test_pred.reshape(Xte.shape[0], horizon, 1)
+    tree_test_stats = summarise_with_uncertainty(
+        Yte,
+        tree_test_pred,
+        n_bootstrap=args.bootstrap_samples,
+        seed=args.seed + 3,
+        original_mean=target_mean,
+        original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
+    )
+    tree_curve_artifacts = plot_constant_train_test(
+        tree_train_stats["rmse"],
+        tree_test_stats["rmse"],
+        "Tree Ensemble: Error vs Epochs",
+        results_dir / "tree_ensemble_train_test_rmse_vs_epochs.png",
+    )
+    tree_config = {
+        "estimator": "GradientBoostingRegressor",
+        "loss": "squared_error",
+        "learning_rate": 0.05,
+        "n_estimators": 400,
+        "subsample": 0.7,
+        "max_depth": 3,
+        "random_state": args.seed,
+    }
 
     learning_sizes, learning_curve_values, learning_curve_stds = compute_learning_curves(
         args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, Xtr.shape[-1]
@@ -746,6 +870,8 @@ def main():
         seed=args.seed,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
     rgan_test_stats = summarise_with_uncertainty(
         Yte,
@@ -754,6 +880,8 @@ def main():
         seed=args.seed + 1,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
     rgan_out["train_stats"] = rgan_train_stats
     rgan_out["test_stats"] = rgan_test_stats
@@ -765,6 +893,8 @@ def main():
         seed=args.seed,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
     lstm_test_stats = summarise_with_uncertainty(
         Yte,
@@ -773,6 +903,8 @@ def main():
         seed=args.seed + 1,
         original_mean=target_mean,
         original_std=target_std,
+        training_series=training_series_scaled,
+        training_series_orig=training_series_orig,
     )
     lstm_out["train_stats"] = lstm_train_stats
     lstm_out["test_stats"] = lstm_test_stats
@@ -797,7 +929,10 @@ def main():
                     "rgan": rgan_test_stats,
                     "lstm": lstm_test_stats,
                     "naive_baseline": naive_test_stats,
-                    "naive_bayes": naive_bayes_test_stats,
+                    "naive_baseline": naive_test_stats,
+                    "arima": arima_test_stats,
+                    "arma": arma_test_stats,
+                    "tree_ensemble": tree_test_stats,
                 }
             )
             continue
@@ -813,6 +948,8 @@ def main():
             seed=args.seed + idx,
             original_mean=target_mean,
             original_std=target_std,
+            training_series=training_series_scaled,
+            training_series_orig=training_series_orig,
         )
 
         import torch
@@ -829,6 +966,8 @@ def main():
             seed=args.seed + idx,
             original_mean=target_mean,
             original_std=target_std,
+            training_series=training_series_scaled,
+            training_series_orig=training_series_orig,
         )
 
         _, naive_noisy_pred = naive_baseline(Xte_noisy, Yte)
@@ -839,16 +978,45 @@ def main():
             seed=args.seed + idx,
             original_mean=target_mean,
             original_std=target_std,
+            training_series=training_series_scaled,
+            training_series_orig=training_series_orig,
         )
 
-        _, naive_bayes_noisy_pred = naive_bayes_forecast(Xtr, Ytr, Xte_noisy, Yte)
-        naive_bayes_noise_summary = summarise_with_uncertainty(
+        _, arima_noisy_pred = arima_forecast(Xtr, Ytr, Xte_noisy, Yte)
+        arima_noise_summary = summarise_with_uncertainty(
             Yte,
-            naive_bayes_noisy_pred,
+            arima_noisy_pred,
             n_bootstrap=args.bootstrap_samples,
             seed=args.seed + idx,
             original_mean=target_mean,
             original_std=target_std,
+            training_series=training_series_scaled,
+            training_series_orig=training_series_orig,
+        )
+
+        _, arma_noisy_pred = arma_forecast(Xtr, Ytr, Xte_noisy, Yte)
+        arma_noise_summary = summarise_with_uncertainty(
+            Yte,
+            arma_noisy_pred,
+            n_bootstrap=args.bootstrap_samples,
+            seed=args.seed + idx,
+            original_mean=target_mean,
+            original_std=target_std,
+            training_series=training_series_scaled,
+            training_series_orig=training_series_orig,
+        )
+
+        tree_noisy_flat = tree_model.predict(Xte_noisy.reshape(Xte_noisy.shape[0], -1)).astype(np.float32)
+        tree_noisy_pred = tree_noisy_flat.reshape(Xte_noisy.shape[0], horizon, 1)
+        tree_noise_summary = summarise_with_uncertainty(
+            Yte,
+            tree_noisy_pred,
+            n_bootstrap=args.bootstrap_samples,
+            seed=args.seed + idx,
+            original_mean=target_mean,
+            original_std=target_std,
+            training_series=training_series_scaled,
+            training_series_orig=training_series_orig,
         )
 
         noise_results.append(
@@ -857,21 +1025,27 @@ def main():
                 "rgan": rgan_noise_summary,
                 "lstm": lstm_noise_summary,
                 "naive_baseline": naive_noise_summary,
-                "naive_bayes": naive_bayes_noise_summary,
+                "arima": arima_noise_summary,
+                "arma": arma_noise_summary,
+                "tree_ensemble": tree_noise_summary,
             }
         )
 
     test_errors = {
         "R-GAN": rgan_out["test_stats"].get("rmse_orig", rgan_out["test_stats"]["rmse"]),
         "LSTM": lstm_out["test_stats"].get("rmse_orig", lstm_out["test_stats"]["rmse"]),
+        "Tree Ensemble": tree_test_stats.get("rmse_orig", tree_test_stats["rmse"]),
         "Naïve Baseline": naive_test_stats.get("rmse_orig", naive_test_stats["rmse"]),
-        "Naïve Bayes": naive_bayes_test_stats.get("rmse_orig", naive_bayes_test_stats["rmse"]),
+        "ARIMA": arima_test_stats.get("rmse_orig", arima_test_stats["rmse"]),
+        "ARMA": arma_test_stats.get("rmse_orig", arma_test_stats["rmse"]),
     }
     train_errors = {
         "R-GAN": rgan_out["train_stats"].get("rmse_orig", rgan_out["train_stats"]["rmse"]),
         "LSTM": lstm_out["train_stats"].get("rmse_orig", lstm_out["train_stats"]["rmse"]),
+        "Tree Ensemble": tree_train_stats.get("rmse_orig", tree_train_stats["rmse"]),
         "Naïve Baseline": naive_train_stats.get("rmse_orig", naive_train_stats["rmse"]),
-        "Naïve Bayes": naive_bayes_train_stats.get("rmse_orig", naive_bayes_train_stats["rmse"]),
+        "ARIMA": arima_train_stats.get("rmse_orig", arima_train_stats["rmse"]),
+        "ARMA": arma_train_stats.get("rmse_orig", arma_train_stats["rmse"]),
     }
     model_compare_artifacts = plot_compare_models_bars(
         train_errors,
@@ -890,13 +1064,21 @@ def main():
             "train": lstm_out["train_stats"],
             "test": lstm_out["test_stats"]
         },
+        "Tree Ensemble": {
+            "train": tree_train_stats,
+            "test": tree_test_stats
+        },
         "Naïve Baseline": {
             "train": naive_train_stats,
             "test": naive_test_stats
         },
-        "Naïve Bayes": {
-            "train": naive_bayes_train_stats,
-            "test": naive_bayes_test_stats
+        "ARIMA": {
+            "train": arima_train_stats,
+            "test": arima_test_stats
+        },
+        "ARMA": {
+            "train": arma_train_stats,
+            "test": arma_test_stats
         }
     }
     
@@ -907,6 +1089,95 @@ def main():
     print("="*80)
     print(metrics_table.to_string(index=False))
     print("="*80)
+
+    def _safe_float(value):
+        if value is None:
+            return None
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(val):
+            return None
+        return val
+
+    def _fmt_metric(value):
+        val = _safe_float(value)
+        return "nan" if val is None else f"{val:.6f}"
+
+    print("\n" + "="*80)
+    print("ADVANCED METRICS (sMAPE / MAAPE / MASE)")
+    print("="*80)
+    for model_name, results in model_results.items():
+        for split_name in ("train", "test"):
+            stats = results.get(split_name)
+            if not stats:
+                continue
+            smape_val = stats.get("smape_orig", stats.get("smape"))
+            maape_val = stats.get("maape_orig", stats.get("maape"))
+            mase_val = stats.get("mase_orig", stats.get("mase"))
+            print(
+                f"{model_name:<20} {split_name.title():<5} | "
+                f"sMAPE: {_fmt_metric(smape_val)}  "
+                f"MAAPE: {_fmt_metric(maape_val)}  "
+                f"MASE: {_fmt_metric(mase_val)}"
+            )
+    print("="*80)
+
+    predictions_test = {
+        "R-GAN": rgan_out["pred_test"],
+        "LSTM": lstm_out["pred_test"],
+        "Tree Ensemble": tree_test_pred,
+        "Naïve Baseline": naive_test_pred,
+        "ARIMA": arima_test_pred,
+        "ARMA": arma_test_pred,
+    }
+    actual_test_orig_flat = (Yte.reshape(-1) * target_std) + target_mean
+    preds_orig_flat = {
+        name: (np.asarray(pred).reshape(-1) * target_std) + target_mean for name, pred in predictions_test.items()
+    }
+
+    dm_results = {}
+    for model_a, model_b in combinations(predictions_test.keys(), 2):
+        dm_stat = diebold_mariano(
+            actual_test_orig_flat,
+            preds_orig_flat[model_a],
+            preds_orig_flat[model_b],
+        )
+        dm_results[f"{model_a} vs {model_b}"] = {
+            "stat": _safe_float(dm_stat.get("stat")),
+            "pvalue": _safe_float(dm_stat.get("pvalue")),
+        }
+
+    print("\n" + "="*80)
+    print("DIEBOLD-MARIANO TESTS (ORIGINAL SCALE)")
+    print("="*80)
+    for pair, res in dm_results.items():
+        stat_str = _fmt_metric(res.get("stat"))
+        pval_str = _fmt_metric(res.get("pvalue"))
+        print(f"{pair:<40} -> stat={stat_str}  pvalue={pval_str}")
+    print("="*80)
+
+    def _capture_metrics(stats: Dict[str, float]):
+        if not stats:
+            return {}
+        return {
+            "smape": _safe_float(stats.get("smape")),
+            "maape": _safe_float(stats.get("maape")),
+            "mase": _safe_float(stats.get("mase")),
+            "smape_orig": _safe_float(stats.get("smape_orig")),
+            "maape_orig": _safe_float(stats.get("maape_orig")),
+            "mase_orig": _safe_float(stats.get("mase_orig")),
+        }
+
+    advanced_metrics_summary = {
+        model_name: {
+            split_name: _capture_metrics(stats)
+            for split_name, stats in results.items()
+            if stats
+        }
+        for model_name, results in model_results.items()
+    }
 
     rgan_architecture = {
         "generator": describe_model(G),
@@ -996,19 +1267,32 @@ def main():
             curve=naive_curve_artifacts["static"],
             curve_interactive=naive_curve_artifacts.get("interactive", ""),
         ),
-        naive_bayes=dict(
-            train=naive_bayes_train_stats,
-            test=naive_bayes_test_stats,
-            curve=naive_bayes_curve_artifacts["static"],
-            curve_interactive=naive_bayes_curve_artifacts.get("interactive", ""),
+        arima=dict(
+            train=arima_train_stats,
+            test=arima_test_stats,
+            curve=arima_curve_artifacts["static"],
+            curve_interactive=arima_curve_artifacts.get("interactive", ""),
+        ),
+        arma=dict(
+            train=arma_train_stats,
+            test=arma_test_stats,
+            curve=arma_curve_artifacts["static"],
+            curve_interactive=arma_curve_artifacts.get("interactive", ""),
+        ),
+        tree_ensemble=dict(
+            train=tree_train_stats,
+            test=tree_test_stats,
+            curve=tree_curve_artifacts["static"],
+            curve_interactive=tree_curve_artifacts.get("interactive", ""),
+            config=tree_config,
         ),
         compare_plots=dict(
             test=model_compare_artifacts["test"]["static"],
             test_interactive=model_compare_artifacts["test"].get("interactive", ""),
             train=model_compare_artifacts["train"]["static"],
             train_interactive=model_compare_artifacts["train"].get("interactive", ""),
-            naive_comparison=naive_comparison_artifacts["static"],
-            naive_comparison_interactive=naive_comparison_artifacts.get("interactive", ""),
+            naive_comparison="",
+            naive_comparison_interactive="",
         ),
         classical=dict(
             ets_rmse_full=ets_rmse_full,
@@ -1022,6 +1306,8 @@ def main():
             plot=learning_curve_artifacts["static"] if learning_curve_artifacts else "",
             plot_interactive=learning_curve_artifacts.get("interactive", "") if learning_curve_artifacts else "",
         ),
+        advanced_metrics=advanced_metrics_summary,
+        statistical_tests=dict(diebold_mariano=dm_results),
         tuning=dict(
             enabled=bool(args.tune),
             dataset=used_tune,
@@ -1034,6 +1320,46 @@ def main():
     with open(results_dir/"metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps(metrics, indent=2))
+
+    # Auto-update dashboard
+    dashboard_data_dir = pathlib.Path("web_dashboard/public/data")
+    if dashboard_data_dir.exists():
+        import shutil
+        try:
+            shutil.copy(results_dir/"metrics.json", dashboard_data_dir/"metrics.json")
+            console.print(f"[green]Successfully updated dashboard data at {dashboard_data_dir/'metrics.json'}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to update dashboard data: {e}[/red]")
+    else:
+        console.print(f"[yellow]Dashboard data directory not found at {dashboard_data_dir}. Skipping auto-update.[/yellow]")
+
+    # Auto-launch Dashboard
+    import webbrowser
+    import subprocess
+    import time
+    import socket
+
+    def is_port_in_use(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('localhost', port)) == 0
+
+    dashboard_url = "http://localhost:5173"
+    dashboard_dir = pathlib.Path("web_dashboard")
+    
+    if dashboard_dir.exists():
+        console.rule("Dashboard Auto-Launch")
+        if not is_port_in_use(5173):
+            console.print("[yellow]Dashboard server not running. Starting it now...[/yellow]")
+            try:
+                # Start npm run dev in a new process (shell=True for Windows to handle npm)
+                subprocess.Popen("npm run dev", cwd=dashboard_dir, shell=True)
+                console.print("[green]Dashboard server started.[/green]")
+                time.sleep(3) # Give it a moment to spin up
+            except Exception as e:
+                console.print(f"[red]Failed to start dashboard server: {e}[/red]")
+        
+        console.print(f"[green]Opening dashboard at {dashboard_url}[/green]")
+        webbrowser.open(dashboard_url)
 
 if __name__ == "__main__":
     # make src importable if run directly

@@ -18,7 +18,7 @@ def _get_activation(name: Optional[str]) -> nn.Module:
 
 
 class LSTMStack(nn.Module):
-    def __init__(self, input_size: int, units: int, num_layers: int, dropout: float):
+    def __init__(self, input_size: int, units: int, num_layers: int, dropout: float, layer_norm: bool = False):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -27,12 +27,13 @@ class LSTMStack(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
+        self.ln = nn.LayerNorm(units) if layer_norm else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
         if out.dim() == 3:
             out = out[:, -1, :]
-        return out
+        return self.ln(out)
 
 
 class Generator(nn.Module):
@@ -45,9 +46,10 @@ class Generator(nn.Module):
         num_layers: int,
         dropout: float,
         dense_activation: Optional[str] = None,
+        layer_norm: bool = False,
     ):
         super().__init__()
-        self.stack = LSTMStack(input_size=n_in, units=units, num_layers=num_layers, dropout=dropout)
+        self.stack = LSTMStack(input_size=n_in, units=units, num_layers=num_layers, dropout=dropout, layer_norm=layer_norm)
         self.fc = nn.Linear(units, H)
         self.out_activation = _get_activation(dense_activation)
 
@@ -66,10 +68,14 @@ class Discriminator(nn.Module):
         num_layers: int,
         dropout: float,
         activation: Optional[str] = None,
+        layer_norm: bool = False,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
-        self.stack = LSTMStack(input_size=1, units=units, num_layers=num_layers, dropout=dropout)
+        self.stack = LSTMStack(input_size=1, units=units, num_layers=num_layers, dropout=dropout, layer_norm=layer_norm)
         self.out = nn.Linear(units, 1)
+        if use_spectral_norm:
+            self.out = nn.utils.spectral_norm(self.out)
         self.out_activation = _get_activation(activation or "sigmoid")
 
     def forward(self, x_concat: torch.Tensor) -> torch.Tensor:
@@ -86,9 +92,10 @@ def build_generator(
     dropout: float = 0.0,
     num_layers: int = 1,
     dense_activation: Optional[str] = None,
+    layer_norm: bool = False,
     **kwargs,
 ) -> nn.Module:
-    return Generator(L, H, n_in, units, num_layers, dropout, dense_activation=dense_activation)
+    return Generator(L, H, n_in, units, num_layers, dropout, dense_activation=dense_activation, layer_norm=layer_norm)
 
 
 def build_discriminator(
@@ -98,8 +105,10 @@ def build_discriminator(
     dropout: float = 0.0,
     num_layers: int = 1,
     activation: Optional[str] = None,
+    layer_norm: bool = False,
+    use_spectral_norm: bool = False,
     **kwargs,
 ) -> nn.Module:
-    return Discriminator(L + H, units, num_layers, dropout, activation=activation)
+    return Discriminator(L + H, units, num_layers, dropout, activation=activation, layer_norm=layer_norm, use_spectral_norm=use_spectral_norm)
 
 

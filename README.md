@@ -7,10 +7,10 @@ Noise-resilient time-series forecasting with an LSTM Regression-GAN (R-GAN) and 
 ## Feature Highlights
 
 - **PyTorch Regression-GAN pipeline** with deterministic seeding, AMP, early stopping, gradient clipping, and configurable generator/discriminator stacks.
-- **Baseline coverage** for supervised LSTM, naïve persistence, and Gaussian naïve Bayes, plus optional ETS/ARIMA classical references.
+- **Baseline coverage** for supervised LSTM, naïve persistence, ARIMA, and ARMA, plus optional ETS/ARIMA classical references.
 - **Quantitative diagnostics** including RMSE/MSE/MAE/Bias with bootstrap confidence intervals in both scaled and original units, and automated noise-robustness sweeps.
 - **Learning-curve analysis** across increasing training-set sizes to quantify sample efficiency.
-- **Interactive dashboard** (`dashboard/`) built with React and Plotly that ingests `results/metrics.json` to deliver executive-friendly storytelling.
+- **RGAN Analytics Terminal** (`web_dashboard/`) built with React + Vite + Recharts that ingests `results/metrics.json` to deliver executive-friendly storytelling with a professional trading terminal aesthetic.
 - **Camera-ready LaTeX builder** (`papers/build_paper.py`) that injects every figure, metric table, and architecture summary into the manuscript template.
 
 ---
@@ -53,48 +53,39 @@ pip install -r requirements.txt
 
 ### 3. Run an experiment
 
-#### Fast CPU-friendly demo (recommended on laptops)
+#### One-Click Automation (PowerShell)
+The easiest way to run the full pipeline (Experiment -> Dashboard) is:
 ```powershell
-python run_experiment.py ^
-  --csv src/rgan/Binance_Data.csv ^
-  --target index_value ^
-  --time_col calc_time ^
-  --results_dir results ^
-  --epochs 5 ^
-  --curve_steps 0 ^
-  --num_workers 0 ^
-  --persistent_workers false ^
-  --pin_memory false
+.\run_pipeline.ps1
 ```
-*(Replace `^` with `\` on macOS/Linux.)*
+This script will run the experiment, copy the results, and automatically launch the dashboard in your browser.
 
-This configuration keeps training short, prevents PyTorch's DataLoader from forking extra processes, and still produces a valid `results/metrics.json` plus all dashboard artifacts.
+#### Manual Execution
+You can also run the python script directly. It will still auto-launch the dashboard upon completion.
 
-#### Full experiment (longer, more thorough)
 ```bash
 python run_experiment.py \
-  --csv ./data/your_timeseries.csv \
-  --target Close \
-  --time_col Timestamp \
-  --L 24 --H 12 \
-  --epochs 80 --batch_size 64 \
-  --curve_steps 4 --curve_epochs 40 \
-  --tune --tune_eval_frac 0.1 \
-  --results_dir ./results
+  --csv src/rgan/Binance_Data.csv \
+  --target index_value \
+  --time_col calc_time \
+  --results_dir results_auto \
+  --epochs 50 \
+  --gan_variant wgan-gp
 ```
-Add GPU-specific flags such as `--amp false` if your accelerator lacks AMP support. Supply `--tune_csv path/to/validation.csv` to run the sweep on a different dataset.
 
-### 4. Launch the interactive dashboard
+### 4. Launch the interactive dashboard manually
 
-1. Ensure the previous step produced `results/metrics.json` (and corresponding figures).
-2. Serve the dashboard folder to avoid browser CORS restrictions:
-  ```bash
-  cd dashboard
-  python serve.py --port 8000
-  ```
-  This binds explicitly to `127.0.0.1` and opens your default browser automatically. To skip the auto-launch, add `--no-browser`; to change the metrics file in the convenience link, pass `--metrics path/to/metrics.json`.
-3. Alternatively, use the standard module (`python -m http.server 8000 --bind 127.0.0.1`). Some terminals print `http://0.0.0.0:8000/`; replace `0.0.0.0` with `localhost` or `127.0.0.1` before clicking.
-4. Browse to `http://localhost:8000/`. The app auto-loads `../results/metrics.json`. To point at a different metrics file, append `?metrics=/absolute/or/relative/path.json` to the URL.
+If you want to view the dashboard without re-running the experiment:
+
+1. Navigate to the dashboard directory:
+   ```bash
+   cd web_dashboard
+   ```
+2. Start the development server:
+   ```bash
+   npm run dev
+   ```
+3. Open the URL shown in the terminal (usually `http://localhost:5173`).
 
 ### 5. Build the LaTeX paper
 
@@ -127,22 +118,19 @@ All flags are documented in `run_experiment.py` (`python run_experiment.py --hel
 
 ---
 
-## Interactive Dashboard (`dashboard/`)
+## RGAN Analytics Terminal (`web_dashboard/`)
 
-- **Stack:** React 18 via CDN, Plotly 2.27+, modern CSS with glassmorphism accents.
-- **Data Source:** Defaults to `../results/metrics.json`. Provide `?metrics=path/to/metrics.json` to override.
-- **Sections:**
-  - Experiment overview (dataset, reproducibility metadata, environment packages)
-  - Executive highlights (best performer, generalisation gap, noise resilience, classical baseline)
-  - Model snapshot cards with train/test RMSE & MAE
-  - Learning trajectories (epoch curves) and comparative bar charts
-  - Learning curves with uncertainty bands
-  - Noise robustness analysis
-  - Full precision table with bootstrap confidence intervals
-  - Configuration & tuning summaries, architecture inventories, and artifact download links
-- **Metrics selector:** Use the form in the hero banner to point the dashboard at any `metrics.json`; the page refreshes without a reload. Query parameters (`?metrics=...`) still work for deep links.
-- **Remote metrics helper:** `serve.py` proxies the requested JSON, so relative paths that escape `dashboard/` (e.g. `../results_wsl_run/metrics.json`) resolve automatically. For headless environments (WSL, servers), pass `--no-browser` to avoid `xdg-open` warnings.
-- **Serving:** Any static file server works (`python -m http.server`, `npx serve`, nginx, etc.). Hosting behind GitHub Pages is possible by copying `results/metrics.json` into the published directory and updating the query parameter.
+- **Stack:** React 18, Vite, Recharts, Vanilla CSS (Premium "Trading Terminal" Theme).
+- **Data Source:** `web_dashboard/public/data/metrics.json`. The `run_experiment.py` script automatically copies results here.
+- **Features:**
+  - **Professional Aesthetic:** High-density, dark-mode interface designed for financial analysis.
+  - **Precision Data:** All metrics displayed with 8 decimal places.
+  - **Comprehensive Analysis:**
+    - **Performance Summary:** Key KPIs and improvement metrics.
+    - **Detailed Metrics Table:** RMSE, MAE, sMAPE, MASE for all models (RGAN, LSTM, ARIMA, ARMA, Naive).
+    - **Confidence Intervals:** 95% CI bounds for robust statistical comparison.
+    - **Interactive Charts:** Zoomable training dynamics and noise robustness curves.
+  - **Auto-Launch:** The dashboard automatically opens in your browser after an experiment completes.
 
 ---
 
@@ -160,7 +148,8 @@ Key static figures (PNG):
 - `rgan_train_test_rmse_vs_epochs.png`
 - `lstm_train_test_rmse_vs_epochs.png`
 - `naive_train_test_rmse_vs_epochs.png`
-- `naive_bayes_train_test_rmse_vs_epochs.png`
+- `arima_train_test_rmse_vs_epochs.png`
+- `arma_train_test_rmse_vs_epochs.png`
 - `models_test_error.png` and `models_train_error.png`
 - `naive_baseline_vs_naive_bayes.png`
 - `classical_error_vs_samples.png` (when ETS/ARIMA available)
