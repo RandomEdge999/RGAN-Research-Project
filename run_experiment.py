@@ -428,8 +428,8 @@ def main():
                     help="Enable automatic mixed precision for PyTorch training")
     ap.add_argument("--eval_batch_size", type=int, default=512,
                     help="Evaluation batch size for PyTorch inference")
-    ap.add_argument("--num_workers", type=int, default=2,
-                    help="Number of workers for PyTorch DataLoader")
+    ap.add_argument("--num_workers", type=int, default=0,
+                    help="Number of workers for PyTorch DataLoader (0 = main process, safest)")
     ap.add_argument("--prefetch_factor", type=int, default=2,
                     help="Prefetch factor for the PyTorch DataLoader")
     ap.add_argument("--persistent_workers", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
@@ -469,6 +469,12 @@ def main():
     else:
         console.print("[bold yellow]! No GPU detected.[/bold yellow] Falling back to CPU.")
         console.print("[dim]Training will be significantly slower.[/dim]")
+
+    # Windows-specific fix: Force num_workers=0 to prevent DataLoader hang
+    if platform.system() == "Windows" and args.num_workers > 0:
+        console.print(f"[yellow]Windows detected: Overriding num_workers from {args.num_workers} to 0 to prevent deadlocks.[/yellow]")
+        args.num_workers = 0
+        args.persistent_workers = False
 
     if args.tune_csv and not args.tune:
         args.tune = True
