@@ -12,8 +12,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
-import torch
 import numpy as np
+
+from numpy.lib import NumpyVersion
+
+
+def _ensure_numpy_compat() -> None:
+    """Abort early when running with an incompatible NumPy major version."""
+
+    if NumpyVersion(np.__version__) >= NumpyVersion("2.0.0"):
+        raise RuntimeError(
+            "Detected NumPy %s, but this project requires NumPy < 2. "
+            "Install a 1.x release (e.g., pip install 'numpy<2')." % np.__version__
+        )
+
+
+_ensure_numpy_compat()
+
+import torch
 
 from src.rgan.baselines import (
     naive_baseline,
