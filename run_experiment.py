@@ -452,6 +452,11 @@ def main():
         action="store_true",
         help="Run the R-GAN hyperparameter sweep (disabled by default).",
     )
+    ap.add_argument(
+        "--require_cuda",
+        action="store_true",
+        help="Exit immediately if CUDA is unavailable (helpful when you expect to use a GPU).",
+    )
     ap.add_argument("--tune_csv", default="")
     ap.add_argument("--results_dir", default="./results")
     ap.add_argument("--seed", type=int, default=42)
@@ -462,13 +467,24 @@ def main():
 
     # Device Check & Announcement
     import torch
+
+    def _cuda_build_hint() -> str:
+        cuda_version = getattr(torch.version, "cuda", None)
+        if cuda_version:
+            return f"PyTorch CUDA build detected (CUDA {cuda_version})."
+        return "PyTorch was installed without CUDA support. Install a CUDA wheel (e.g., torch==2.2.2+cu121)."
+
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(0)
         console.print(f"[bold green]✓ GPU Detected:[/bold green] {device_name}")
         console.print(f"[dim]Using CUDA for training. Fallback to CPU enabled if CUDA fails.[/dim]")
+        console.print(f"[dim]{_cuda_build_hint()}[/dim]")
     else:
         console.print("[bold yellow]! No GPU detected.[/bold yellow] Falling back to CPU.")
         console.print("[dim]Training will be significantly slower.[/dim]")
+        console.print(f"[dim]{_cuda_build_hint()}[/dim]")
+        if args.require_cuda:
+            raise SystemExit("--require_cuda was set but CUDA is unavailable; aborting.")
 
     # Windows-specific fix: Force num_workers=0 to prevent DataLoader hang
     if platform.system() == "Windows" and args.num_workers > 0:
