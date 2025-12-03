@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
 
 import numpy as np
@@ -6,6 +7,60 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader, TensorDataset
+
+
+class _IdentityScaler:
+    """No-op GradScaler replacement when AMP is unavailable."""
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+
+    def scale(self, outputs):  # type: ignore[override]
+        return outputs
+
+    def unscale_(self, optimizer):  # type: ignore[override]
+        return optimizer
+
+    def step(self, optimizer):  # type: ignore[override]
+        optimizer.step()
+
+    def update(self):  # type: ignore[override]
+        return None
+
+
+class _AmpAdapters:
+    """Resolve the best available AMP APIs with graceful fallback handling."""
+
+    def __init__(self) -> None:
+        self._autocast_impl = None
+        self._grad_scaler_cls = None
+        self._resolve()
+
+    def _resolve(self) -> None:
+        torch_amp = getattr(torch, "amp", None)
+        cuda_amp = getattr(torch.cuda, "amp", None)
+        self._autocast_impl = getattr(torch_amp, "autocast", None) or getattr(cuda_amp, "autocast", None)
+        self._grad_scaler_cls = getattr(torch_amp, "GradScaler", None) or getattr(cuda_amp, "GradScaler", None)
+
+    @property
+    def available(self) -> bool:
+        return self._autocast_impl is not None and self._grad_scaler_cls is not None
+
+    def autocast(self, device_type: str, enabled: bool = True):
+        if not enabled or self._autocast_impl is None:
+            return nullcontext()
+        try:
+            return self._autocast_impl(device_type=device_type, enabled=True)
+        except TypeError:  # Older torch.cuda.amp.autocast lacks device_type
+            return self._autocast_impl(enabled=True)
+
+    def make_scaler(self, enabled: bool = True):
+        if self._grad_scaler_cls is None:
+            return _IdentityScaler(enabled=False)
+        return self._grad_scaler_cls(enabled=enabled)
+
+
+AMP = _AmpAdapters()
 
 from .logging_utils import get_console, epoch_progress, update_epoch
 from .metrics import error_stats
@@ -30,7 +85,7 @@ def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], n
                 while idx < n_samples:
                     end = min(idx + bs, n_samples)
                     Xb = torch.from_numpy(X[idx:end]).to(device=device)
-                    with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                    with AMP.autocast(device.type, enabled=(device.type == "cuda" and AMP.available)):
                         Yb = G(Xb)
                     Yp[idx:end] = Yb.detach().cpu().numpy()
                     idx = end
@@ -163,14 +218,26 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
         inputs_fp32 = inputs.float()
         targets_fp32 = targets.float()
         if device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda", enabled=False):
+            with AMP.autocast("cuda", enabled=False):
                 return bce_loss(inputs_fp32, targets_fp32)
         return bce_loss(inputs_fp32, targets_fp32)
 
     current_batch_size = max(1, int(config["batch_size"]))
-    amp_enabled = bool(config.get("amp", True)) and (device.type == "cuda")
-    scaler_G = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
-    scaler_D = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
+    amp_requested = bool(config.get("amp", True))
+    amp_available = AMP.available
+    amp_enabled = amp_requested and (device.type == "cuda") and amp_available
+    if amp_requested and not amp_enabled:
+        if device.type != "cuda":
+            get_console().print(
+                "[yellow]AMP requested but no CUDA device is active; running in full precision.[/yellow]"
+            )
+        elif not amp_available:
+            get_console().print(
+                "[yellow]AMP requested but unsupported by this PyTorch build; running in full precision.[/yellow]"
+            )
+
+    scaler_G = AMP.make_scaler(enabled=amp_enabled)
+    scaler_D = AMP.make_scaler(enabled=amp_enabled)
 
     best_val = float("inf")
     best_state = None
@@ -247,12 +314,12 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
                             for _ in range(d_steps):
                                 optD.zero_grad(set_to_none=True)
                                 with torch.no_grad():
-                                    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                                    with AMP.autocast("cuda", enabled=amp_enabled):
                                         Y_fake_detached = G(Xb)
                                 if Y_fake_detached.dtype != target_series.dtype:
                                     Y_fake_detached = Y_fake_detached.to(dtype=target_series.dtype)
 
-                                with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                                with AMP.autocast("cuda", enabled=amp_enabled):
                                     real_pairs = torch.cat([target_series, Yb], dim=1)
                                     fake_pairs = torch.cat([target_series, Y_fake_detached], dim=1)
                                     if noise_std_epoch > 0:
@@ -307,7 +374,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
 
                         for _ in range(g_steps):
                             optG.zero_grad(set_to_none=True)
-                            with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                            with AMP.autocast("cuda", enabled=amp_enabled):
                                 Y_fake = G(Xb)
                                 cat_target = target_series
                                 if cat_target.dtype != Y_fake.dtype:
