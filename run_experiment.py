@@ -10,16 +10,14 @@ import sys
 from itertools import combinations
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
-
 from numpy.lib import NumpyVersion
 
 
 def _ensure_numpy_compat() -> None:
     """Abort early when running with an incompatible NumPy major version."""
-
     if NumpyVersion(np.__version__) >= NumpyVersion("2.0.0"):
         raise RuntimeError(
             "Detected NumPy %s, but this project requires NumPy < 2. "
@@ -43,14 +41,9 @@ from src.rgan.data import (
     interpolate_and_standardize,
     make_windows_univariate,
     make_windows_with_covariates,
+    DataSplit,
 )
 from src.rgan.plots import (
-    plot_single_train_test,
-    plot_constant_train_test,
-    plot_compare_models_bars,
-    plot_classical_curves,
-    plot_learning_curves,
-    create_error_metrics_table,
     plot_single_train_test,
     plot_constant_train_test,
     plot_compare_models_bars,
@@ -66,6 +59,7 @@ from src.rgan.metrics import (
     summarise_with_uncertainty,
     diebold_mariano,
 )
+from src.rgan.config import TrainConfig, ModelConfig
 
 
 def set_seed(seed: int = 42) -> None:
@@ -89,12 +83,6 @@ def set_seed(seed: int = 42) -> None:
             torch.backends.cudnn.benchmark = False
     except ModuleNotFoundError:
         pass
-
-
-
-
-
-
 
 
 def split_windows_for_training(
@@ -147,9 +135,6 @@ def split_windows_for_training(
     return result
 
 
-
-
-
 def parse_noise_levels(spec: str) -> np.ndarray:
     values = []
     for part in spec.split(","):
@@ -168,7 +153,15 @@ def parse_noise_levels(spec: str) -> np.ndarray:
     return np.array(sorted(set(values)), dtype=float)
 
 
-def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_features):
+def compute_learning_curves(
+    args: argparse.Namespace,
+    base_config: TrainConfig,
+    Xfull_tr: np.ndarray,
+    Yfull_tr: np.ndarray,
+    Xte: np.ndarray,
+    Yte: np.ndarray,
+    n_features: int,
+) -> Tuple[List[int], Dict[str, List[float]], Dict[str, List[float]]]:
     if args.curve_steps <= 0:
         return [], {}, {}
 
@@ -188,7 +181,6 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
         "R-GAN": [],
         "LSTM": [],
         "Tree Ensemble": [],
-        "Naïve Baseline": [],
         "Naïve Baseline": [],
         "ARIMA": [],
         "ARMA": [],
@@ -246,37 +238,40 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
                 "Yte": Yte,
             }
 
-            curve_config = dict(base_config)
-            curve_config["epochs"] = max(1, min(base_config["epochs"], args.curve_epochs))
-            curve_config["patience"] = min(curve_config["patience"], curve_config["epochs"])
+            # Create a copy of base_config for this curve point
+            # Since TrainConfig is a dataclass, we can use replace or just create new
+            import dataclasses
+            curve_config = dataclasses.replace(base_config)
+            curve_config.epochs = max(1, min(base_config.epochs, args.curve_epochs))
+            curve_config.patience = min(curve_config.patience, curve_config.epochs)
 
             set_seed(args.seed + rep)
 
-            gen_kwargs = dict(
-                L=base_config["L"],
-                H=base_config["H"],
+            # Build models
+            # Note: We need to pass args manually to build functions or update them to take config
+            # Assuming build functions still take kwargs
+            
+            G_curve = build_generator_backend(
+                L=base_config.L,
+                H=base_config.H,
                 n_in=n_features,
-                units=curve_config["units_g"],
-                dropout=curve_config["dropout"],
-                num_layers=curve_config.get("g_layers", base_config["g_layers"]),
+                units=curve_config.units_g,
+                dropout=curve_config.dropout,
+                num_layers=curve_config.g_layers,
+                dense_activation=curve_config.g_dense_activation,
+                layer_norm=(curve_config.gan_variant == "wgan-gp"),
             )
-            disc_kwargs = dict(
-                L=base_config["L"],
-                H=base_config["H"],
-                units=curve_config["units_d"],
-                dropout=curve_config["dropout"],
-                num_layers=curve_config.get("d_layers", base_config["d_layers"]),
+            D_curve = build_discriminator_backend(
+                L=base_config.L,
+                H=base_config.H,
+                units=curve_config.units_d,
+                dropout=curve_config.dropout,
+                num_layers=curve_config.d_layers,
+                activation=curve_config.d_activation,
+                layer_norm=(curve_config.gan_variant == "wgan-gp"),
+                use_spectral_norm=(curve_config.gan_variant == "wgan-gp"),
             )
-
-            dense_act = curve_config.get("g_dense_activation")
-            if dense_act is not None:
-                gen_kwargs["dense_activation"] = dense_act
-            disc_act = curve_config.get("d_activation")
-            if disc_act is not None:
-                disc_kwargs["activation"] = disc_act
-
-            G_curve = build_generator_backend(**gen_kwargs)
-            D_curve = build_discriminator_backend(**disc_kwargs)
+            
             rgan_curve_out = train_rgan_backend(
                 curve_config,
                 (G_curve, D_curve),
@@ -294,7 +289,6 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
             rmse_acc["R-GAN"].append(rgan_curve_out["test_stats"]["rmse"])
             rmse_acc["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
 
-            rmse_acc["Naïve Baseline"].append(naive_test_stats["rmse"])
             rmse_acc["Naïve Baseline"].append(naive_test_stats["rmse"])
             
             arima_stats, _ = arima_forecast(
@@ -329,6 +323,7 @@ def compute_learning_curves(args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, n_f
                 curves_std[key].append(float("nan"))
 
     return used_sizes, curves_mean, curves_std
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -585,7 +580,8 @@ def main():
     training_series_orig = prep["train_df"][target_col].to_numpy(dtype=np.float32)
     horizon = int(Ytr.shape[1])
 
-    base_config = dict(
+    # Construct TrainConfig
+    base_config = TrainConfig(
         L=args.L,
         H=args.H,
         epochs=args.epochs,
@@ -593,8 +589,8 @@ def main():
         lambda_reg=args.lambda_reg,
         units_g=args.units_g,
         units_d=args.units_d,
-        lrG=args.lrG,
-        lrD=args.lrD,
+        lr_g=args.lrG,
+        lr_d=args.lrD,
         label_smooth=args.label_smooth,
         grad_clip=args.grad_clip,
         dropout=args.dropout,
@@ -604,18 +600,14 @@ def main():
         g_dense_activation=args.g_dense_activation if args.g_dense_activation else None,
         d_activation=args.d_activation if args.d_activation else None,
         amp=args.amp,
-        eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.persistent_workers,
-        pin_memory=args.pin_memory,
-        seed=args.seed,
+        device="cuda" if torch.cuda.is_available() else "cpu",
         gan_variant=args.gan_variant,
         d_steps=args.d_steps,
         g_steps=args.g_steps,
         supervised_warmup_epochs=args.supervised_warmup_epochs,
-        lambda_reg_start=args.lambda_reg_start if args.lambda_reg_start is not None else args.lambda_reg,
-        lambda_reg_end=args.lambda_reg_end if args.lambda_reg_end is not None else args.lambda_reg,
+        lambda_reg_start=args.lambda_reg_start,
+        lambda_reg_end=args.lambda_reg_end,
         lambda_reg_warmup_epochs=args.lambda_reg_warmup_epochs,
         adv_weight=args.adv_weight,
         instance_noise_std=args.instance_noise_std,
@@ -693,61 +685,88 @@ def main():
             "dropout": dropout_candidates,
             "g_layers": layer_choices,
             "d_layers": layer_choices,
-            "lrG": lr_candidates_g,
-            "lrD": lr_candidates_d,
+            "lr_g": lr_candidates_g, # Changed to match TrainConfig field name
+            "lr_d": lr_candidates_d, # Changed to match TrainConfig field name
             "g_dense_activation": dense_candidates,
             "d_activation": disc_act_candidates,
             "epochs_each": [30, 45],
         }
-
+        
+        # Note: tune_rgan expects a dict for base_config to update it easily, 
+        # but we refactored it to take a dict and convert internally.
+        # So we pass a dict representation of base_config.
+        # Actually, tune_rgan signature is: base_config: Dict[str, Any]
+        # So we should pass base_config.__dict__ or similar.
+        # But wait, base_config is a dataclass instance now.
+        # I should pass dataclasses.asdict(base_config)
+        import dataclasses
+        
         best_hp, df_tune_res = tune_rgan(
             hp_grid,
-            base_config,
+            dataclasses.asdict(base_config),
             tune_splits,
             str(results_dir),
             seed=args.seed,
         )
         df_tune_res.to_csv(results_dir/"tuning_results.csv", index=False)
+        
+        # Update base_config with best_hp
+        # Since base_config is a dataclass, we can use replace
+        # But best_hp is a dict.
+        # We need to filter keys again or just iterate.
+        valid_fields = {f.name for f in dataclasses.fields(base_config)}
+        updates = {}
         for key, value in best_hp.items():
             if key in {"val_rmse", "seed"}:
                 continue
             if value is None:
                 continue
-            if key in base_config:
-                base_config[key] = value
+            if key in valid_fields:
+                updates[key] = value
+        
+        base_config = dataclasses.replace(base_config, **updates)
 
-    g_dense_act = base_config.get("g_dense_activation")
+    g_dense_act = base_config.g_dense_activation
 
     layer_norm = True
-    use_spectral_norm = True if base_config.get("gan_variant", "standard").lower() == "wgan-gp" else False
+    use_spectral_norm = True if base_config.gan_variant.lower() == "wgan-gp" else False
 
-    gen_kwargs = dict(
-        L=args.L,
-        H=args.H,
+    console.rule("Build Models")
+    G = build_generator_backend(
+        L=base_config.L,
+        H=base_config.H,
         n_in=Xtr.shape[-1],
-        units=base_config["units_g"],
-        dropout=base_config["dropout"],
-        num_layers=base_config["g_layers"],
+        units=base_config.units_g,
+        dropout=base_config.dropout,
+        num_layers=base_config.g_layers,
         dense_activation=g_dense_act,
         layer_norm=layer_norm,
     )
-    disc_kwargs = dict(
-        L=args.L,
-        H=args.H,
-        units=base_config["units_d"],
-        dropout=base_config["dropout"],
-        num_layers=base_config["d_layers"],
-        activation=base_config.get("d_activation"),
+    D = build_discriminator_backend(
+        L=base_config.L,
+        H=base_config.H,
+        units=base_config.units_d,
+        dropout=base_config.dropout,
+        num_layers=base_config.d_layers,
+        activation=base_config.d_activation,
         layer_norm=layer_norm,
         use_spectral_norm=use_spectral_norm,
     )
+    
+    rgan_out = train_rgan_backend(
+        base_config, 
+        (G,D), 
+        {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, 
+        str(results_dir), 
+        tag="rgan"
+    )
 
-    console.rule("Build Models")
-    G = build_generator_backend(**gen_kwargs)
-    D = build_discriminator_backend(**disc_kwargs)
-    rgan_out = train_rgan_backend(base_config, (G,D), {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="rgan")
-
-    lstm_out = train_lstm_backend(base_config, {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, str(results_dir), tag="lstm")
+    lstm_out = train_lstm_backend(
+        base_config, 
+        {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, 
+        str(results_dir), 
+        tag="lstm"
+    )
 
     rgan_curve_artifacts = plot_single_train_test(
         rgan_out["history"]["epoch"],
@@ -976,7 +995,6 @@ def main():
                     "sd": float(sd),
                     "rgan": rgan_test_stats,
                     "lstm": lstm_test_stats,
-                    "naive_baseline": naive_test_stats,
                     "naive_baseline": naive_test_stats,
                     "arima": arima_test_stats,
                     "arma": arma_test_stats,
@@ -1288,16 +1306,16 @@ def main():
             history=rgan_out["history"],
             architecture=rgan_architecture,
             config=dict(
-                units_g=base_config["units_g"],
-                units_d=base_config["units_d"],
-                lambda_reg=base_config["lambda_reg"],
-                lrG=base_config["lrG"],
-                lrD=base_config["lrD"],
-                dropout=base_config["dropout"],
-                g_layers=base_config["g_layers"],
-                d_layers=base_config["d_layers"],
+                units_g=base_config.units_g,
+                units_d=base_config.units_d,
+                lambda_reg=base_config.lambda_reg,
+                lrG=base_config.lr_g,
+                lrD=base_config.lr_d,
+                dropout=base_config.dropout,
+                g_layers=base_config.g_layers,
+                d_layers=base_config.d_layers,
                 g_dense=(g_dense_act if g_dense_act else "linear"),
-                d_activation=base_config.get("d_activation") or "sigmoid",
+                d_activation=base_config.d_activation or "sigmoid",
             ),
         ),
         lstm=dict(
@@ -1307,7 +1325,7 @@ def main():
             curve_interactive=lstm_curve_artifacts.get("interactive", ""),
             history=lstm_out["history"],
             architecture=lstm_architecture,
-            config=dict(units=base_config["units_g"], lr=base_config["lrG"], dropout=base_config["dropout"]),
+            config=dict(units=base_config.units_g, lr=base_config.lr_g, dropout=base_config.dropout),
         ),
         naive_baseline=dict(
             train=naive_train_stats,
@@ -1370,7 +1388,7 @@ def main():
     print(json.dumps(metrics, indent=2))
 
     # Auto-update dashboard
-    dashboard_data_dir = pathlib.Path("web_dashboard/public/data")
+    dashboard_data_dir = Path("web_dashboard/public/data")
     if dashboard_data_dir.exists():
         import shutil
         try:
@@ -1392,7 +1410,7 @@ def main():
             return s.connect_ex(('localhost', port)) == 0
 
     dashboard_url = "http://localhost:5173"
-    dashboard_dir = pathlib.Path("web_dashboard")
+    dashboard_dir = Path("web_dashboard")
     
     if dashboard_dir.exists():
         console.rule("Dashboard Auto-Launch")

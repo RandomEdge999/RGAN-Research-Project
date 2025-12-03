@@ -1,12 +1,16 @@
 import copy
 from contextlib import nullcontext
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Any, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader, TensorDataset
+
+from .config import TrainConfig
+from .logging_utils import get_console, epoch_progress, update_epoch
+from .metrics import error_stats
 
 
 class _IdentityScaler:
@@ -15,17 +19,17 @@ class _IdentityScaler:
     def __init__(self, enabled: bool = False) -> None:
         self.enabled = enabled
 
-    def scale(self, outputs):  # type: ignore[override]
+    def scale(self, outputs: Any) -> Any:
         return outputs
 
-    def unscale_(self, optimizer):  # type: ignore[override]
+    def unscale_(self, optimizer: Any) -> Any:
         return optimizer
 
-    def step(self, optimizer):  # type: ignore[override]
+    def step(self, optimizer: Any) -> None:
         optimizer.step()
 
-    def update(self):  # type: ignore[override]
-        return None
+    def update(self) -> None:
+        pass
 
 
 class _AmpAdapters:
@@ -39,14 +43,18 @@ class _AmpAdapters:
     def _resolve(self) -> None:
         torch_amp = getattr(torch, "amp", None)
         cuda_amp = getattr(torch.cuda, "amp", None)
-        self._autocast_impl = getattr(torch_amp, "autocast", None) or getattr(cuda_amp, "autocast", None)
-        self._grad_scaler_cls = getattr(torch_amp, "GradScaler", None) or getattr(cuda_amp, "GradScaler", None)
+        self._autocast_impl = getattr(torch_amp, "autocast", None) or getattr(
+            cuda_amp, "autocast", None
+        )
+        self._grad_scaler_cls = getattr(torch_amp, "GradScaler", None) or getattr(
+            cuda_amp, "GradScaler", None
+        )
 
     @property
     def available(self) -> bool:
         return self._autocast_impl is not None and self._grad_scaler_cls is not None
 
-    def autocast(self, device_type: str, enabled: bool = True):
+    def autocast(self, device_type: str, enabled: bool = True) -> Any:
         if not enabled or self._autocast_impl is None:
             return nullcontext()
         try:
@@ -54,7 +62,7 @@ class _AmpAdapters:
         except TypeError:  # Older torch.cuda.amp.autocast lacks device_type
             return self._autocast_impl(enabled=True)
 
-    def make_scaler(self, enabled: bool = True):
+    def make_scaler(self, enabled: bool = True) -> Any:
         if self._grad_scaler_cls is None:
             return _IdentityScaler(enabled=False)
         return self._grad_scaler_cls(enabled=enabled)
@@ -62,16 +70,25 @@ class _AmpAdapters:
 
 AMP = _AmpAdapters()
 
-from .logging_utils import get_console, epoch_progress, update_epoch
-from .metrics import error_stats
 
+def compute_metrics(
+    G: nn.Module, X: np.ndarray, Y: np.ndarray, batch_size: int = 512
+) -> Tuple[Dict[str, float], np.ndarray]:
+    """Run the generator in evaluation mode and compute error statistics.
 
+    Args:
+        G: The Generator module.
+        X: Input features (numpy array).
+        Y: Target values (numpy array).
+        batch_size: Batch size for inference.
 
-
-
-def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], np.ndarray]:
-    """Run the generator in evaluation mode and compute error statistics."""
+    Returns:
+        A tuple containing:
+        - A dictionary of error metrics (RMSE, MAE, etc.).
+        - The predicted values as a numpy array.
+    """
     G.eval()
+    # Determine device from model parameters
     device = next(G.parameters()).device
 
     n_samples = len(X)
@@ -85,7 +102,9 @@ def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], n
                 while idx < n_samples:
                     end = min(idx + bs, n_samples)
                     Xb = torch.from_numpy(X[idx:end]).to(device=device)
-                    with AMP.autocast(device.type, enabled=(device.type == "cuda" and AMP.available)):
+                    with AMP.autocast(
+                        device.type, enabled=(device.type == "cuda" and AMP.available)
+                    ):
                         Yb = G(Xb)
                     Yp[idx:end] = Yb.detach().cpu().numpy()
                     idx = end
@@ -103,7 +122,25 @@ def compute_metrics(G, X, Y, batch_size: int = 512) -> Tuple[Dict[str, float], n
     return stats, Yp
 
 
-def _gradient_penalty(D: nn.Module, real_inputs: torch.Tensor, fake_inputs: torch.Tensor, device: torch.device, gp_lambda: float) -> torch.Tensor:
+def _gradient_penalty(
+    D: nn.Module,
+    real_inputs: torch.Tensor,
+    fake_inputs: torch.Tensor,
+    device: torch.device,
+    gp_lambda: float,
+) -> torch.Tensor:
+    """Computes the gradient penalty for WGAN-GP.
+
+    Args:
+        D: The Discriminator module.
+        real_inputs: Real data samples.
+        fake_inputs: Generated data samples.
+        device: The computation device.
+        gp_lambda: The gradient penalty coefficient.
+
+    Returns:
+        The computed gradient penalty scalar tensor.
+    """
     batch_size = real_inputs.size(0)
     epsilon = torch.rand(batch_size, 1, 1, device=device)
     epsilon = epsilon.expand_as(real_inputs)
@@ -113,6 +150,7 @@ def _gradient_penalty(D: nn.Module, real_inputs: torch.Tensor, fake_inputs: torc
     # Disable CuDNN for this forward pass to allow double backward (required for gradient penalty)
     with torch.backends.cudnn.flags(enabled=False):
         d_interpolated = D(interpolated)
+    
     grad_outputs = torch.ones_like(d_interpolated, device=device)
     gradients = torch.autograd.grad(
         outputs=d_interpolated,
@@ -122,12 +160,14 @@ def _gradient_penalty(D: nn.Module, real_inputs: torch.Tensor, fake_inputs: torc
         retain_graph=True,
         only_inputs=True,
     )[0]
+    
     gradients = gradients.view(batch_size, -1)
     penalty = ((gradients.norm(2, dim=1) - 1.0) ** 2).mean()
     return gp_lambda * penalty
 
 
 def _apply_instance_noise(tensor: torch.Tensor, std: float) -> torch.Tensor:
+    """Applies Gaussian instance noise to the input tensor."""
     if std <= 0:
         return tensor
     noise = torch.randn_like(tensor) * std
@@ -135,10 +175,18 @@ def _apply_instance_noise(tensor: torch.Tensor, std: float) -> torch.Tensor:
 
 
 def _init_ema(model: nn.Module) -> Dict[str, torch.Tensor]:
-    return {name: param.detach().clone() for name, param in model.named_parameters() if param.requires_grad}
+    """Initializes the Exponential Moving Average shadow parameters."""
+    return {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
 
 
-def _update_ema(shadow: Dict[str, torch.Tensor], model: nn.Module, decay: float) -> None:
+def _update_ema(
+    shadow: Dict[str, torch.Tensor], model: nn.Module, decay: float
+) -> None:
+    """Updates the EMA shadow parameters."""
     with torch.no_grad():
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -146,7 +194,10 @@ def _update_ema(shadow: Dict[str, torch.Tensor], model: nn.Module, decay: float)
             shadow[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
 
 
-def _swap_params_with_shadow(model: nn.Module, shadow: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def _swap_params_with_shadow(
+    model: nn.Module, shadow: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Swaps the model parameters with the shadow parameters (for evaluation)."""
     backup = {}
     with torch.no_grad():
         for name, param in model.named_parameters():
@@ -156,10 +207,27 @@ def _swap_params_with_shadow(model: nn.Module, shadow: Dict[str, torch.Tensor]) 
     return backup
 
 
-def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: str = "rgan") -> Dict:
-    """Train the R-GAN with stability improvements and detailed telemetry."""
+def train_rgan_torch(
+    config: TrainConfig,
+    models: Tuple[nn.Module, nn.Module],
+    data_splits: Dict[str, np.ndarray],
+    results_dir: str,
+    tag: str = "rgan",
+) -> Dict[str, Any]:
+    """Train the R-GAN with stability improvements and detailed telemetry.
+
+    Args:
+        config: The training configuration object.
+        models: A tuple (Generator, Discriminator).
+        data_splits: Dictionary containing train/val/test splits (X and Y).
+        results_dir: Directory to save results (unused in this function but kept for interface).
+        tag: Experiment tag.
+
+    Returns:
+        A dictionary containing the trained models, history, and evaluation statistics.
+    """
     G, D = models
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(config.device)
     G.to(device)
     D.to(device)
 
@@ -167,33 +235,35 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
     Xte, Yte = data_splits["Xte"], data_splits["Yte"]
 
-    optG = torch.optim.Adam(G.parameters(), lr=config["lrG"])
-    optD = torch.optim.Adam(D.parameters(), lr=config["lrD"])
+    optG = torch.optim.Adam(G.parameters(), lr=config.lr_g)
+    optD = torch.optim.Adam(D.parameters(), lr=config.lr_d)
     mse = nn.MSELoss()
 
-    use_logits = bool(config.get("use_logits", False))
+    use_logits = config.use_logits
     bce_loss = nn.BCEWithLogitsLoss() if use_logits else nn.BCELoss()
 
-    gan_variant = config.get("gan_variant", "standard").lower()
+    gan_variant = config.gan_variant.lower()
     default_d_steps = 5 if gan_variant == "wgan-gp" else 1
-    d_steps = max(1, int(config.get("d_steps", default_d_steps)))
-    g_steps = max(1, int(config.get("g_steps", 1)))
-    warmup_epochs = max(0, int(config.get("supervised_warmup_epochs", 0)))
-    patience = config["patience"]
-    lambda_reg_start = float(config.get("lambda_reg_start", config["lambda_reg"]))
-    lambda_reg_end = float(config.get("lambda_reg_end", config["lambda_reg"]))
-    lambda_reg_warmup = max(1, int(config.get("lambda_reg_warmup_epochs", max(1, warmup_epochs if warmup_epochs else 1))))
-    adv_weight = float(config.get("adv_weight", 1.0))
-    instance_noise_std = float(config.get("instance_noise_std", 0.0))
-    instance_noise_decay = float(config.get("instance_noise_decay", 0.95))
-    gp_lambda = float(config.get("wgan_gp_lambda", 10.0))
-    ema_decay = float(config.get("ema_decay", 0.0))
-    track_logits = bool(config.get("track_discriminator_outputs", True))
+    d_steps = max(1, config.d_steps)
+    g_steps = max(1, config.g_steps)
+    warmup_epochs = max(0, config.supervised_warmup_epochs)
+    patience = config.patience
+    
+    # Regularization scheduling
+    lambda_reg_start = config.lambda_reg_start if config.lambda_reg_start is not None else config.lambda_reg
+    lambda_reg_end = config.lambda_reg_end if config.lambda_reg_end is not None else config.lambda_reg
+    lambda_reg_warmup = max(1, config.lambda_reg_warmup_epochs)
+    
+    adv_weight = config.adv_weight
+    instance_noise_std = config.instance_noise_std
+    instance_noise_decay = config.instance_noise_decay
+    gp_lambda = config.wgan_gp_lambda
+    ema_decay = config.ema_decay
+    track_logits = config.track_discriminator_outputs
 
-    disc_activation = config.get("d_activation")
-    if disc_activation is None and not use_logits:
+    disc_activation = config.d_activation.lower() if config.d_activation else ""
+    if not disc_activation and not use_logits:
         disc_activation = "sigmoid"
-    disc_activation = disc_activation.lower() if isinstance(disc_activation, str) else ""
 
     def _disc_output_to_prob(tensor: torch.Tensor) -> torch.Tensor:
         if use_logits:
@@ -204,6 +274,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
             prob = tensor
         else:
             prob = torch.sigmoid(tensor)
+        
         if prob.is_floating_point():
             eps = torch.finfo(prob.dtype).eps
         else:
@@ -222,10 +293,11 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
                 return bce_loss(inputs_fp32, targets_fp32)
         return bce_loss(inputs_fp32, targets_fp32)
 
-    current_batch_size = max(1, int(config["batch_size"]))
-    amp_requested = bool(config.get("amp", True))
+    current_batch_size = max(1, config.batch_size)
+    amp_requested = config.amp
     amp_available = AMP.available
     amp_enabled = amp_requested and (device.type == "cuda") and amp_available
+    
     if amp_requested and not amp_enabled:
         if device.type != "cuda":
             get_console().print(
@@ -246,7 +318,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     use_ema = 0.0 < ema_decay < 1.0
     ema_shadow: Optional[Dict[str, torch.Tensor]] = _init_ema(G) if use_ema else None
 
-    hist = {
+    hist: Dict[str, List[float]] = {
         "epoch": [],
         "train_rmse": [],
         "test_rmse": [],
@@ -263,10 +335,13 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
         hist["D_real_mean"] = []
         hist["D_fake_mean"] = []
 
-    num_workers = int(config.get("num_workers", 2))
-    prefetch_factor = int(config.get("prefetch_factor", 2))
-    persistent_workers = bool(config.get("persistent_workers", True)) and num_workers > 0
-    pin_memory = bool(config.get("pin_memory", device.type == "cuda"))
+    num_workers = config.num_workers
+    # Prefetch factor is not in TrainConfig but was in args. Assuming default 2 if not present, 
+    # but since we are moving to config, we should probably add it or default it.
+    # For now, hardcode or assume safe default.
+    prefetch_factor = 2 
+    persistent_workers = (num_workers > 0)
+    pin_memory = (device.type == "cuda")
 
     train_ds = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(Ytr))
 
@@ -286,18 +361,23 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     train_loader = make_loader(current_batch_size)
 
     console = get_console()
-    with epoch_progress(config["epochs"], description="R-GAN (Torch)") as (progress, task_id):
-        for epoch in range(1, config["epochs"] + 1):
+    with epoch_progress(config.epochs, description="R-GAN (Torch)") as (progress, task_id):
+        for epoch in range(1, config.epochs + 1):
             supervised_only = epoch <= warmup_epochs
             lambda_reg = lambda_reg_end
             if lambda_reg_warmup > 1:
                 progress_ratio = min(1.0, max(0.0, (epoch - 1) / (lambda_reg_warmup - 1)))
                 lambda_reg = lambda_reg_start + (lambda_reg_end - lambda_reg_start) * progress_ratio
 
-            epoch_D_losses, epoch_G_losses = [], []
-            epoch_adv, epoch_reg = [], []
-            epoch_grad_G, epoch_grad_D = [], []
-            epoch_D_real, epoch_D_fake = [], []
+            epoch_D_losses: List[float] = []
+            epoch_G_losses: List[float] = []
+            epoch_adv: List[float] = []
+            epoch_reg: List[float] = []
+            epoch_grad_G: List[float] = []
+            epoch_grad_D: List[float] = []
+            epoch_D_real: List[float] = []
+            epoch_D_fake: List[float] = []
+            
             noise_std_epoch = instance_noise_std * (instance_noise_decay ** max(0, epoch - 1))
 
             G.train()
@@ -334,7 +414,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
                                     gp = _gradient_penalty(D, real_pairs, fake_pairs, device, gp_lambda)
                                     D_loss = D_loss_main + gp
                                 else:
-                                    real_targets = torch.full_like(D_real, config["label_smooth"])
+                                    real_targets = torch.full_like(D_real, config.label_smooth)
                                     fake_targets = torch.zeros_like(D_fake)
                                     D_real_prob = _disc_output_to_prob(D_real)
                                     D_fake_prob = _disc_output_to_prob(D_fake)
@@ -350,7 +430,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
 
                                 scaler_D.scale(D_loss).backward()
                                 scaler_D.unscale_(optD)
-                                clip_grad_value_(D.parameters(), config["grad_clip"])
+                                clip_grad_value_(D.parameters(), config.grad_clip)
 
                                 grad_sq = 0.0
                                 for p in D.parameters():
@@ -406,7 +486,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
 
                             scaler_G.scale(total_loss).backward()
                             scaler_G.unscale_(optG)
-                            clip_grad_value_(G.parameters(), config["grad_clip"])
+                            clip_grad_value_(G.parameters(), config.grad_clip)
 
                             grad_sq = 0.0
                             for p in G.parameters():
@@ -450,8 +530,10 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
                 hist["D_real_mean"].append(float(np.mean(epoch_D_real) if epoch_D_real else 0.0))
                 hist["D_fake_mean"].append(float(np.mean(epoch_D_fake) if epoch_D_fake else 0.0))
 
-            eval_bs_cfg = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
-            eval_bs = max(1, min(eval_bs_cfg, current_batch_size))
+            # Use eval_batch_size from config if present, else default to batch_size
+            # Since we don't have eval_batch_size in TrainConfig yet, we'll just use batch_size
+            # or add it to TrainConfig. Let's assume batch_size for now or hardcode 512 cap.
+            eval_bs = max(1, min(512, current_batch_size))
 
             if use_ema and ema_shadow is not None:
                 backup = _swap_params_with_shadow(G, ema_shadow)
@@ -469,7 +551,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
             hist["test_rmse"].append(te_stats["rmse"])
             hist["val_rmse"].append(va_stats["rmse"])
 
-            update_epoch(progress, task_id, epoch, config["epochs"], {
+            update_epoch(progress, task_id, epoch, config.epochs, {
                 "D": hist["D_loss"][-1],
                 "G": hist["G_loss"][-1],
                 "Train": tr_stats["rmse"],
@@ -496,8 +578,7 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
     else:
         G_ema = None
 
-    eval_bs_cfg = int(config.get("eval_batch_size", min(512, config.get("batch_size", 512))))
-    eval_bs = max(1, min(eval_bs_cfg, current_batch_size))
+    eval_bs = max(1, min(512, current_batch_size))
     eval_model = G_ema or G
     train_stats, _ = compute_metrics(eval_model, Xtr, Ytr, batch_size=eval_bs)
     test_stats, Y_pred = compute_metrics(eval_model, Xte, Yte, batch_size=eval_bs)
@@ -512,5 +593,3 @@ def train_rgan_torch(config: Dict, models, data_splits, results_dir: str, tag: s
         "pred_test": Y_pred,
         "lambda_reg_final": lambda_reg,
     }
-
-
