@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Dict
 from .logging_utils import get_console, epoch_progress, update_epoch
+from .metrics import error_stats
 
 
 def _is_cuda_launch_failure(err: RuntimeError) -> bool:
@@ -10,13 +11,7 @@ def _is_cuda_launch_failure(err: RuntimeError) -> bool:
     return "cuda" in msg.lower() and "unspecified launch failure" in msg.lower()
 
 
-def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
-    diff = y_pred - y_true
-    mse = float(np.mean(diff ** 2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(diff)))
-    bias = float(np.mean(diff))
-    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
+
 
 
 class LSTMSupervised(nn.Module):
@@ -115,8 +110,8 @@ def train_lstm_supervised_torch(config: Dict, data_splits, results_dir: str, tag
         eval_batch_size = max(1, min(config["batch_size"], 1024))
         tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
         te = _predict_in_batches(model, Xte, device, eval_batch_size)
-        train_stats = _error_stats(Ytr.reshape(-1), tr.reshape(-1))
-        test_stats = _error_stats(Yte.reshape(-1), te.reshape(-1))
+        train_stats = error_stats(Ytr.reshape(-1), tr.reshape(-1))
+        test_stats = error_stats(Yte.reshape(-1), te.reshape(-1))
         return {
             "model": model,
             "history": hist,

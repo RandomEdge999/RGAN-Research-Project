@@ -394,57 +394,6 @@ def create_error_metrics_table(model_results: dict, out_path: str = None):
     return df
 
 
-def plot_naive_bayes_comparison(naive_baseline_stats, naive_bayes_stats, out_path) -> Dict[str, str]:
-    out_path = _ensure_path(out_path)
-    models = ["Naïve Baseline", "Naïve Bayes"]
-    rmse_values = [naive_baseline_stats["rmse"], naive_bayes_stats["rmse"]]
-    mse_values = [naive_baseline_stats["mse"], naive_bayes_stats["mse"]]
-    bias_values = [naive_baseline_stats["bias"], naive_bayes_stats["bias"]]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    metrics = [(axes[0], "RMSE Comparison", rmse_values, "RMSE"),
-               (axes[1], "MSE Comparison", mse_values, "MSE"),
-               (axes[2], "BIAS Comparison", bias_values, "BIAS")]
-    for ax, title, values, ylabel in metrics:
-        bars = ax.bar(models, values, color=_PALETTE[: len(models)])
-        ax.set_title(title)
-        ax.set_ylabel(ylabel)
-        for bar, value in zip(bars, values):
-            ax.annotate(f"{value:.6f}", xy=(bar.get_x() + bar.get_width() / 2, value), xytext=(0, 6),
-                        textcoords="offset points", ha="center", fontsize=9, color="#1f2937")
-        ax.tick_params(axis="x", rotation=0)
-        _style_axes(ax)
-    static_path = _finalise_static(fig, out_path)
-
-    html_path = ""
-    if _HAS_PLOTLY:
-        fig_i = make_subplots(rows=1, cols=3, subplot_titles=("RMSE", "MSE", "BIAS"))
-        fig_i.add_trace(
-            go.Bar(x=models, y=rmse_values, marker_color=_PALETTE[: len(models)], name="RMSE"),
-            row=1,
-            col=1,
-        )
-        fig_i.add_trace(
-            go.Bar(x=models, y=mse_values, marker_color=_PALETTE[: len(models)], name="MSE"),
-            row=1,
-            col=2,
-        )
-        fig_i.add_trace(
-            go.Bar(x=models, y=bias_values, marker_color=_PALETTE[: len(models)], name="BIAS"),
-            row=1,
-            col=3,
-        )
-        fig_i.update_layout(
-            title="Naïve Baseline vs Naïve Bayes",
-            template="plotly_white",
-            showlegend=False,
-            margin=dict(l=60, r=30, t=70, b=60),
-        )
-        fig_i.update_yaxes(title_text="RMSE", row=1, col=1)
-        fig_i.update_yaxes(title_text="MSE", row=1, col=2)
-        fig_i.update_yaxes(title_text="BIAS", row=1, col=3)
-        html_path = _write_interactive(fig_i, out_path)
-
-    return {"static": static_path, "interactive": html_path}
 
 
