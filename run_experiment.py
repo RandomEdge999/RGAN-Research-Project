@@ -12,10 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
+import torch
 import numpy as np
 
 from src.rgan.baselines import (
-    naive_baseline,
     naive_baseline,
     arima_forecast,
     arma_forecast,
@@ -459,6 +459,16 @@ def main():
 
     console = get_console()
     print_banner(console, "RGAN Research Project", "Noise-Resilient Forecasting – Experiment Runner")
+
+    # Device Check & Announcement
+    import torch
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+        console.print(f"[bold green]✓ GPU Detected:[/bold green] {device_name}")
+        console.print(f"[dim]Using CUDA for training. Fallback to CPU enabled if CUDA fails.[/dim]")
+    else:
+        console.print("[bold yellow]! No GPU detected.[/bold yellow] Falling back to CPU.")
+        console.print("[dim]Training will be significantly slower.[/dim]")
 
     if args.tune_csv and not args.tune:
         args.tune = True

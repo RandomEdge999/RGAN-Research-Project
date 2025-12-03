@@ -581,7 +581,7 @@
       "mae_orig_ci_low": 0.0016886904690181837,
       "mae_orig_ci_high": 0.002587130753090605
     },
-    "curve": "results_verify_small\\rgan_train_test_rmse_vs_epochs.png",
+    "curve": "results_verify_ui\\rgan_train_test_rmse_vs_epochs.png",
     "curve_interactive": "",
     "history": {
       "epoch": [
@@ -706,7 +706,7 @@
       "mae_orig_ci_low": 0.0011414868786232546,
       "mae_orig_ci_high": 0.001802311599021777
     },
-    "curve": "results_verify_small\\lstm_train_test_rmse_vs_epochs.png",
+    "curve": "results_verify_ui\\lstm_train_test_rmse_vs_epochs.png",
     "curve_interactive": "",
     "history": {
       "epoch": [
@@ -789,7 +789,7 @@
       "mae_orig_ci_low": 0.0016015833418350667,
       "mae_orig_ci_high": 0.0023542915878351778
     },
-    "curve": "results_verify_small\\naive_train_test_rmse_vs_epochs.png",
+    "curve": "results_verify_ui\\naive_train_test_rmse_vs_epochs.png",
     "curve_interactive": ""
   },
   "arima": {
@@ -849,7 +849,7 @@
       "mae_orig_ci_low": 0.0015188950497882746,
       "mae_orig_ci_high": 0.0022509286643661373
     },
-    "curve": "results_verify_small\\arima_train_test_rmse_vs_epochs.png",
+    "curve": "results_verify_ui\\arima_train_test_rmse_vs_epochs.png",
     "curve_interactive": ""
   },
   "arma": {
@@ -909,7 +909,7 @@
       "mae_orig_ci_low": 0.0015685279600105185,
       "mae_orig_ci_high": 0.002322153084093092
     },
-    "curve": "results_verify_small\\arma_train_test_rmse_vs_epochs.png",
+    "curve": "results_verify_ui\\arma_train_test_rmse_vs_epochs.png",
     "curve_interactive": ""
   },
   "tree_ensemble": {
@@ -969,7 +969,7 @@
       "mae_orig_ci_low": 0.004938251315616071,
       "mae_orig_ci_high": 0.005595114361494779
     },
-    "curve": "results_verify_small\\tree_ensemble_train_test_rmse_vs_epochs.png",
+    "curve": "results_verify_ui\\tree_ensemble_train_test_rmse_vs_epochs.png",
     "curve_interactive": "",
     "config": {
       "estimator": "GradientBoostingRegressor",
@@ -982,9 +982,9 @@
     }
   },
   "compare_plots": {
-    "test": "results_verify_small\\models_test_error.png",
+    "test": "results_verify_ui\\models_test_error.png",
     "test_interactive": "",
-    "train": "results_verify_small\\models_train_error.png",
+    "train": "results_verify_ui\\models_train_error.png",
     "train_interactive": "",
     "naive_comparison": "",
     "naive_comparison_interactive": ""
@@ -992,7 +992,7 @@
   "classical": {
     "ets_rmse_full": 0.0031635818319222624,
     "arima_rmse_full": 0.0025601864819499356,
-    "curves": "results_verify_small\\classical_error_vs_samples.png",
+    "curves": "results_verify_ui\\classical_error_vs_samples.png",
     "curves_interactive": ""
   },
   "learning_curves": {
@@ -1198,5 +1198,5 @@
     "target_mean": 39.02156918238994,
     "target_std": 0.0030347345656984593
   },
-  "created": "2025-12-03T08:23:04.157505"
+  "created": "2025-12-03T09:52:37.528211"
 }
