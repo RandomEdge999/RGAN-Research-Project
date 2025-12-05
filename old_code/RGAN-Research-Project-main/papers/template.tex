@@ -1,0 +1,122 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, graphicx, booktabs, geometry}
+\geometry{margin=1in}
+\title{Noise-Resilient Time-Series Forecasting with an LSTM Regression-GAN}
+\author{Anonymous}
+\date{\today}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present an LSTM-based Regression-GAN (R-GAN) for multi-step forecasting, adhering to a hybrid objective that combines an adversarial loss with a regression loss for numerical fidelity. For single models we show training and test errors on the same plot (Y-axis: RMSE, X-axis: epochs). For multiple models, we provide separate plots for test and train errors. Classical baselines are summarized with error vs number of samples.
+\end{abstract}
+
+\section{Introduction}
+GANs can promote realism in generated trajectories, while a regression penalty preserves accuracy. We adopt an LSTM generator and an LSTM discriminator over the concatenated past and future target sequences. We emphasize reproducibility and robustness.
+
+\section{Method}
+Let $x_{t-L+1:t}$ denote the context window and $x_{t+1:t+H}$ the forecast horizon. The generator $G$ (LSTM $\rightarrow$ Dense$(H)$) predicts $\hat{x}_{t+1:t+H}$, and the discriminator $D$ (LSTM over $[x_{t-L+1:t}; \tilde{x}_{t+1:t+H}]$) outputs a realism probability. We optimize
+\begin{align}
+\mathcal{L}_D &= \tfrac{1}{2}\Big(\mathrm{BCE}(D([x;y]),1) + \mathrm{BCE}(D([x;G(x)]),0)\Big),\\
+\mathcal{L}_G &= \mathrm{BCE}(D([x;G(x)]),1) + \lambda\,\mathrm{MSE}\!\left(G(x), y\right),
+\end{align}
+with label smoothing and gradient clipping, and select the model by validation RMSE.
+
+\section{Data and Setup}
+We window the standardized series with lengths $L$ and $H$; splits are temporal and validation is carved from the training tail.
+
+\section{Performance Graphs}
+\subsection{Single Model: R-GAN Train/Test Error vs Epochs}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(rgan_curve)s}
+\caption{R-GAN: Train and test RMSE vs epochs.}
+\end{figure}
+
+\subsection{Single Model: Supervised LSTM Train/Test Error vs Epochs}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(lstm_curve)s}
+\caption{LSTM: Train and test RMSE vs epochs.}
+\end{figure}
+
+\subsection{Single Model: Naïve Baseline Train/Test Error vs Epochs}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(naive_curve)s}
+\caption{Naïve baseline: Train and test RMSE vs pseudo-epochs.}
+\end{figure}
+
+\subsection{Single Model: Naïve Bayes Train/Test Error vs Epochs}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(naive_bayes_curve)s}
+\caption{Naïve Bayes: Train and test RMSE vs pseudo-epochs.}
+\end{figure}
+
+\subsection{Naïve Baseline vs Naïve Bayes}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(naive_comparison)s}
+\caption{Comparison of RMSE, MSE, and bias for Naïve Baseline and Naïve Bayes.}
+\end{figure}
+
+\subsection{Multiple Models: Test Error by Model}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\linewidth]{%(compare_test)s}
+\caption{Test RMSE across models.}
+\end{figure}
+
+\subsection{Multiple Models: Train Error by Model}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\linewidth]{%(compare_train)s}
+\caption{Train RMSE across models.}
+\end{figure}
+
+\subsection{Classical Models: Error vs Number of Samples}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(classical_curve)s}
+\caption{ETS/ARIMA: RMSE vs number of training samples.}
+\end{figure}
+
+\subsection{Learning Curves: ML Models vs Sample Size}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{%(learning_curve)s}
+\caption{R-GAN, LSTM, and Naïve RMSE as training windows increase.}
+\end{figure}
+
+\section{R-GAN Architecture}
+The generator and discriminator instantiated for this experiment are summarised below.
+
+\subsection{Generator}
+\begin{itemize}
+%(generator_arch)s
+\end{itemize}
+
+\subsection{Discriminator}
+\begin{itemize}
+%(discriminator_arch)s
+\end{itemize}
+
+Key hyperparameters: %(rgan_hparams)s.
+
+\section{Results}
+Key metrics are injected from the experiment results file.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Train RMSE & Test RMSE & Train MSE & Test MSE & Train Bias & Test Bias \\
+\midrule
+%(error_table_rows)s
+\bottomrule
+\end{tabular}
+\caption{Forecast error summary across models. Lower values are better.}
+\end{table}
+
+\end{document}
