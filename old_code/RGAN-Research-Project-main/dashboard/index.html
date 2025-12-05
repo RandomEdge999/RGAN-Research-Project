@@ -1,0 +1,30 @@
+ <!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RGAN Research Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js" defer></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" defer></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" defer></script>
+  </head>
+  <body>
+    <div id="root" class="app-root">
+      <noscript>
+        This dashboard requires JavaScript and a modern browser. Please enable JavaScript to continue.
+      </noscript>
+    </div>
+    <script>
+      window.__RGAN_DASHBOARD__ = window.__RGAN_DASHBOARD__ || {};
+      window.__RGAN_DASHBOARD__.defaultMetrics = '../results/metrics.json';
+    </script>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
