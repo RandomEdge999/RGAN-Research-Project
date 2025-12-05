@@ -497,11 +497,11 @@ def main():
         if args.require_cuda:
             raise SystemExit("--require_cuda was set but CUDA is unavailable; aborting.")
 
-    # Windows-specific fix: Force num_workers=0 to prevent DataLoader hang
-    if platform.system() == "Windows" and args.num_workers > 0:
-        console.print(f"[yellow]Windows detected: Overriding num_workers from {args.num_workers} to 0 to prevent deadlocks.[/yellow]")
-        args.num_workers = 0
-        args.persistent_workers = False
+    # Windows-specific fix: REMOVED as per user request (running on Linux/Mac)
+    # if platform.system() == "Windows" and args.num_workers > 0:
+    #     console.print(f"[yellow]Windows detected: Overriding num_workers from {args.num_workers} to 0 to prevent deadlocks.[/yellow]")
+    #     args.num_workers = 0
+    #     args.persistent_workers = False
 
     if args.tune_csv and not args.tune:
         args.tune = True
@@ -1383,49 +1383,29 @@ def main():
         scaling={"target_mean": float(target_mean), "target_std": float(target_std)},
         created=datetime.utcnow().isoformat(),
     )
+    # Sanitize metrics to ensure valid JSON (replace NaN/Infinity with None)
+    def sanitize_for_json(obj):
+        import math
+        if isinstance(obj, dict):
+            return {k: sanitize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [sanitize_for_json(v) for v in obj]
+        elif isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+            return obj
+        return obj
+
+    metrics = sanitize_for_json(metrics)
+
     with open(results_dir/"metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps(metrics, indent=2))
 
-    # Auto-update dashboard
-    dashboard_data_dir = Path("web_dashboard/public/data")
-    if dashboard_data_dir.exists():
-        import shutil
-        try:
-            shutil.copy(results_dir/"metrics.json", dashboard_data_dir/"metrics.json")
-            console.print(f"[green]Successfully updated dashboard data at {dashboard_data_dir/'metrics.json'}[/green]")
-        except Exception as e:
-            console.print(f"[red]Failed to update dashboard data: {e}[/red]")
-    else:
-        console.print(f"[yellow]Dashboard data directory not found at {dashboard_data_dir}. Skipping auto-update.[/yellow]")
-
-    # Auto-launch Dashboard
-    import webbrowser
-    import subprocess
-    import time
-    import socket
-
-    def is_port_in_use(port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            return s.connect_ex(('localhost', port)) == 0
-
-    dashboard_url = "http://localhost:5173"
-    dashboard_dir = Path("web_dashboard")
-    
-    if dashboard_dir.exists():
-        console.rule("Dashboard Auto-Launch")
-        if not is_port_in_use(5173):
-            console.print("[yellow]Dashboard server not running. Starting it now...[/yellow]")
-            try:
-                # Start npm run dev in a new process (shell=True for Windows to handle npm)
-                subprocess.Popen("npm run dev", cwd=dashboard_dir, shell=True)
-                console.print("[green]Dashboard server started.[/green]")
-                time.sleep(3) # Give it a moment to spin up
-            except Exception as e:
-                console.print(f"[red]Failed to start dashboard server: {e}[/red]")
-        
-        console.print(f"[green]Opening dashboard at {dashboard_url}[/green]")
-        webbrowser.open(dashboard_url)
+    # Auto-update dashboard - REMOVED (Decoupled)
+    # The dashboard is now a standalone viewer that loads metrics.json manually.
+    console.print(f"[green]Training complete. Results saved to {results_dir}[/green]")
+    console.print(f"[dim]To view results, open the dashboard and load: {results_dir/'metrics.json'}[/dim]")
 
 if __name__ == "__main__":
     # make src importable if run directly

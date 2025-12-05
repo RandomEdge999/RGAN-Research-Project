@@ -284,10 +284,12 @@ def train_rgan_torch(
     def _safe_bce(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if use_logits:
             # Inputs already represent logits; allow AMP to manage dtype.
-            return bce_loss(inputs, targets.to(inputs.dtype))
+            return bce_loss(inputs, targets if targets.dtype == inputs.dtype else targets.to(inputs.dtype))
 
-        inputs_fp32 = inputs.float()
-        targets_fp32 = targets.float()
+        # Avoid unnecessary casting if already float32
+        inputs_fp32 = inputs if inputs.dtype == torch.float32 else inputs.float()
+        targets_fp32 = targets if targets.dtype == torch.float32 else targets.float()
+        
         if device.type == "cuda":
             with AMP.autocast("cuda", enabled=False):
                 return bce_loss(inputs_fp32, targets_fp32)
@@ -336,10 +338,8 @@ def train_rgan_torch(
         hist["D_fake_mean"] = []
 
     num_workers = config.num_workers
-    # Prefetch factor is not in TrainConfig but was in args. Assuming default 2 if not present, 
-    # but since we are moving to config, we should probably add it or default it.
-    # For now, hardcode or assume safe default.
-    prefetch_factor = 2 
+    # Optimization: Increase prefetch factor for high-end GPUs
+    prefetch_factor = 4 
     persistent_workers = (num_workers > 0)
     pin_memory = (device.type == "cuda")
 

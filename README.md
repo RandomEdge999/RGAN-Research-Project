@@ -7,7 +7,7 @@ Noise-resilient time-series forecasting with an LSTM Regression-GAN (R-GAN) and 
 ## Feature Highlights
 
 - **PyTorch Regression-GAN pipeline** with deterministic seeding, AMP, early stopping, gradient clipping, and configurable generator/discriminator stacks.
-- **Baseline coverage** for supervised LSTM, naïve persistence, ARIMA, and ARMA, plus optional ETS/ARIMA classical references.
+- **Baseline coverage** for supervised LSTM, naive persistence, ARIMA, and ARMA, plus optional ETS/ARIMA classical references.
 - **Quantitative diagnostics** including RMSE/MSE/MAE/Bias with bootstrap confidence intervals in both scaled and original units, and automated noise-robustness sweeps.
 - **Learning-curve analysis** across increasing training-set sizes to quantify sample efficiency.
 - **RGAN Analytics Terminal** (`web_dashboard/`) built with React + Vite + Recharts that ingests `results/metrics.json` to deliver executive-friendly storytelling with a professional trading terminal aesthetic.
@@ -21,26 +21,21 @@ Noise-resilient time-series forecasting with an LSTM Regression-GAN (R-GAN) and 
 - Python 3.10+ (project tested with Python 3.11.4)
 - pip
 - (Optional) CUDA-capable GPU + PyTorch build with CUDA for faster training
+- Node.js and npm (for the dashboard)
 
 ### 1. Create and activate a virtual environment
 
-<details>
-<summary><strong>Windows (PowerShell)</strong></summary>
-
+**Windows (PowerShell)**
 ```powershell
 python -m venv .venv
 \.venv\Scripts\Activate.ps1
 ```
-</details>
 
-<details>
-<summary><strong>macOS / Linux (bash or zsh)</strong></summary>
-
+**macOS / Linux (bash or zsh)**
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
-</details>
 
 ### 2. Install dependencies
 
@@ -53,15 +48,7 @@ pip install -r requirements.txt
 
 ### 3. Run an experiment
 
-#### One-Click Automation (PowerShell)
-The easiest way to run the full pipeline (Experiment -> Dashboard) is:
-```powershell
-.\run_pipeline.ps1
-```
-This script will run the experiment, copy the results, and automatically launch the dashboard in your browser.
-
-#### Manual Execution
-You can also run the python script directly. It will still auto-launch the dashboard upon completion.
+Run the training script to generate results. This will create a `metrics.json` file in your specified results directory.
 
 ```bash
 python run_experiment.py \
@@ -70,22 +57,29 @@ python run_experiment.py \
   --time_col calc_time \
   --results_dir results_auto \
   --epochs 50 \
-  --gan_variant wgan-gp
+  --gan_variant wgan-gp \
+  --use_logits True \
+  --d_activation linear
 ```
 
-### 4. Launch the interactive dashboard manually
+### 4. View Results in Dashboard
 
-If you want to view the dashboard without re-running the experiment:
+The dashboard is a standalone application. You can run it once and use it to view results from any experiment by uploading the generated `metrics.json` file.
 
 1. Navigate to the dashboard directory:
    ```bash
    cd web_dashboard
    ```
-2. Start the development server:
+2. Install dependencies (first time only):
+   ```bash
+   npm install
+   ```
+3. Start the development server:
    ```bash
    npm run dev
    ```
-3. Open the URL shown in the terminal (usually `http://localhost:5173`).
+4. Open the URL shown in the terminal (usually `http://localhost:5173`).
+5. Drag and drop the `metrics.json` file from your results directory (e.g., `results_auto/metrics.json`) into the dashboard.
 
 ### 5. Build the LaTeX paper
 
@@ -108,7 +102,7 @@ Compile the resulting `.tex` file with your LaTeX toolchain (e.g., `pdflatex` or
 | `--epochs`, `--batch_size` | Training schedule knobs for both GAN and LSTM. |
 | `--units_g`, `--units_d`, `--g_layers`, `--d_layers` | Generator/discriminator architecture. |
 | `--lambda_reg`, `--dropout`, `--label_smooth`, `--grad_clip` | Regularisation controls. |
-| `--amp`, `--eval_batch_size`, `--num_workers`, `--persistent_workers`, `--pin_memory` | PyTorch runtime tuning. Set `--num_workers 0 --persistent_workers false --pin_memory false` for constrained CPU environments. |
+| `--amp`, `--eval_batch_size`, `--num_workers`, `--persistent_workers`, `--pin_memory` | PyTorch runtime tuning. |
 | `--tune`, `--tune_csv`, `--tune_eval_frac` | Enable and configure the hyperparameter sweep. |
 | `--curve_steps`, `--curve_min_frac`, `--curve_epochs`, `--curve_repeats` | Generate learning curves over increasing sample sizes. |
 | `--noise_levels` | Comma-separated Gaussian noise standard deviations for robustness testing (`0` automatically included). |
@@ -121,7 +115,7 @@ All flags are documented in `run_experiment.py` (`python run_experiment.py --hel
 ## RGAN Analytics Terminal (`web_dashboard/`)
 
 - **Stack:** React 18, Vite, Recharts, Vanilla CSS (Premium "Trading Terminal" Theme).
-- **Data Source:** `web_dashboard/public/data/metrics.json`. The `run_experiment.py` script automatically copies results here.
+- **Data Source:** User-uploaded `metrics.json`.
 - **Features:**
   - **Professional Aesthetic:** High-density, dark-mode interface designed for financial analysis.
   - **Precision Data:** All metrics displayed with 8 decimal places.
@@ -130,7 +124,6 @@ All flags are documented in `run_experiment.py` (`python run_experiment.py --hel
     - **Detailed Metrics Table:** RMSE, MAE, sMAPE, MASE for all models (RGAN, LSTM, ARIMA, ARMA, Naive).
     - **Confidence Intervals:** 95% CI bounds for robust statistical comparison.
     - **Interactive Charts:** Zoomable training dynamics and noise robustness curves.
-  - **Auto-Launch:** The dashboard automatically opens in your browser after an experiment completes.
 
 ---
 
