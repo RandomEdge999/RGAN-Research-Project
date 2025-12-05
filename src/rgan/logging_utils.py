@@ -65,6 +65,23 @@ def epoch_progress(total: int, description: str = "Training"):
             TimeRemainingColumn,
             TextColumn,
         )
+        
+        # Define a custom column for system stats
+        class SystemStatsColumn(TextColumn):
+            def render(self, task):
+                try:
+                    import psutil
+                    import torch
+                    cpu = psutil.cpu_percent()
+                    ram = psutil.virtual_memory().percent
+                    gpu_mem = 0.0
+                    if torch.cuda.is_available():
+                        gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3) # GB
+                    
+                    return f"[bold #f472b6]CPU:[/bold #f472b6] {cpu:>4.1f}% | [bold #a78bfa]RAM:[/bold #a78bfa] {ram:>4.1f}% | [bold #34d399]GPU Mem:[/bold #34d399] {gpu_mem:.2f}GB"
+                except ImportError:
+                    return ""
+
         # Custom "Radar" Spinner and detailed columns
         with Progress(
             SpinnerColumn(spinner_name="dots", style="#38bdf8"),
@@ -76,9 +93,12 @@ def epoch_progress(total: int, description: str = "Training"):
             TextColumn("•", style="#475569"),
             TimeRemainingColumn(),
             TextColumn("•", style="#475569"),
+            SystemStatsColumn(""), # Add live system stats
+            TextColumn("•", style="#475569"),
             TextColumn("{task.fields[status]}", style="#94a3b8"),
             expand=True,
             transient=False, # Keep the bar after completion for history
+            refresh_per_second=4, # Update frequently for stats
         ) as progress:
             task_id = progress.add_task(description, total=total, status="Initializing...")
             yield progress, task_id
