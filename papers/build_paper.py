@@ -42,7 +42,9 @@ def build_error_rows(metrics):
         ("rgan", "R-GAN"),
         ("lstm", "LSTM"),
         ("naive_baseline", "Naïve Baseline"),
-        ("naive_bayes", "Naïve Bayes"),
+        ("tree_ensemble", "Tree Ensemble"),
+        ("arima", "ARIMA"),
+        ("arma", "ARMA"),
     ]:
         if key not in metrics:
             continue
@@ -85,7 +87,7 @@ def main():
         rgan_curve=_check(m["rgan"]["curve"]),
         lstm_curve=_check(m["lstm"]["curve"]),
         naive_curve=_check(m["naive_baseline"].get("curve") or m["rgan"]["curve"]),
-        naive_bayes_curve=_check(m["naive_bayes"].get("curve") or m["lstm"]["curve"]),
+        tree_ensemble_curve=_check(m.get("tree_ensemble", {}).get("curve") or m["lstm"]["curve"]),
         compare_test=_check(m["compare_plots"]["test"]),
         compare_train=_check(m["compare_plots"]["train"]),
         naive_comparison=_check(m["compare_plots"].get("naive_comparison", m["compare_plots"]["test"])),

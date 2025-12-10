@@ -167,5 +167,6 @@ Interactive counterparts share the same filenames suffixed by `_interactive.html
 - **Missing classical plots:** Install `statsmodels` (`pip install statsmodels`) to enable ETS/ARIMA baselines.
 - **No metrics generated:** Ensure the run completed without interruption. Partial runs may leave stale PNGs but no `metrics.json`.
 - **Dashboard shows blank sections:** Verify the metrics file path in the browser console and confirm CORS is not blocking the fetch (serve the dashboard via HTTP rather than opening `index.html` directly from disk).
+- **Windows DataLoader hangs:** If training freezes on Windows, try adding `--num_workers 0 --persistent_workers false` to disable multi-process data loading, which can deadlock on Windows/WSL.
 
 For deeper customisation (new baselines, alternative logging, etc.), browse the modules under `src/rgan/` and `dashboard/` for inline documentation.
