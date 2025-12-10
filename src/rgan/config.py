@@ -37,6 +37,7 @@ class TrainConfig:
     Attributes:
         epochs: Total number of training epochs.
         batch_size: Batch size for training.
+        eval_batch_size: Batch size for validation/test evaluation.
         lr_g: Learning rate for the Generator.
         lr_d: Learning rate for the Discriminator.
         lambda_reg: Regularization strength (for supervised loss).
@@ -49,6 +50,9 @@ class TrainConfig:
         patience: Early stopping patience.
         device: Device to train on ('cpu' or 'cuda').
         num_workers: Number of DataLoader workers.
+        prefetch_factor: Prefetch factor for background DataLoader workers.
+        persistent_workers: Keep DataLoader workers alive between epochs.
+        pin_memory: Pin host memory to accelerate H2D copies when using CUDA.
         seed: Random seed for reproducibility.
         
         # Model Hyperparameters (required for LSTM and convenience)
@@ -64,6 +68,7 @@ class TrainConfig:
     """
     epochs: int = 100
     batch_size: int = 64
+    eval_batch_size: int = 512
     lr_g: float = 1e-3
     lr_d: float = 1e-3
     lambda_reg: float = 0.1
@@ -76,6 +81,9 @@ class TrainConfig:
     patience: int = 10
     device: str = "cpu"
     num_workers: int = 0
+    prefetch_factor: int = 2
+    persistent_workers: bool = True
+    pin_memory: bool = True
     seed: int = 42
     
     # Model Params
@@ -101,6 +109,8 @@ class TrainConfig:
     use_logits: bool = False
     track_discriminator_outputs: bool = True
     amp: bool = True
+    strict_device: bool = False
+    wgan_clip_value: float = 0.01
     
     def __post_init__(self):
         if self.lambda_reg_start is None:
