@@ -339,7 +339,7 @@ def main():
     ap.add_argument("--lambda_reg", type=float, default=0.1)
     ap.add_argument(
         "--gan_variant",
-        choices=["standard", "wgan-gp"],
+        choices=["standard", "wgan", "wgan-gp"],
         default="standard",
         help="Adversarial loss variant (standard BCE or Wasserstein with GP).",
     )
@@ -357,6 +357,12 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=5.0)
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument(
+        "--wgan_clip_value",
+        type=float,
+        default=0.01,
+        help="Weight-clipping magnitude for vanilla WGAN training.",
+    )
     ap.add_argument(
         "--supervised_warmup_epochs",
         type=int,
@@ -608,6 +614,7 @@ def main():
         H=args.H,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
         lambda_reg=args.lambda_reg,
         units_g=args.units_g,
         units_d=args.units_d,
@@ -623,6 +630,9 @@ def main():
         d_activation=args.d_activation if args.d_activation else None,
         amp=args.amp,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
+        pin_memory=args.pin_memory,
         device=device_str,
         gan_variant=args.gan_variant,
         d_steps=args.d_steps,
@@ -638,13 +648,18 @@ def main():
         ema_decay=args.ema_decay,
         use_logits=args.use_logits,
         track_discriminator_outputs=True,
+        strict_device=args.require_cuda,
+        wgan_clip_value=args.wgan_clip_value,
     )
 
     print_kv_table(console, "Configuration", {
         "L/H": f"{args.L}/{args.H}",
         "Epochs": args.epochs,
         "Batch Size": args.batch_size,
+        "Eval Batch Size": args.eval_batch_size,
         "Units (G/D)": f"{args.units_g}/{args.units_d}",
+        "GAN Variant": args.gan_variant,
+        "D/G Steps": f"{args.d_steps}/{args.g_steps}",
         "Lambda": args.lambda_reg,
         "Learning Rates (G/D)": f"{args.lrG}/{args.lrD}",
         "Dropout": args.dropout,
@@ -1338,6 +1353,14 @@ def main():
                 d_layers=base_config.d_layers,
                 g_dense=(g_dense_act if g_dense_act else "linear"),
                 d_activation=base_config.d_activation or "sigmoid",
+                gan_variant=base_config.gan_variant,
+                d_steps=base_config.d_steps,
+                g_steps=base_config.g_steps,
+                wgan_gp_lambda=base_config.wgan_gp_lambda,
+                wgan_clip_value=base_config.wgan_clip_value,
+                use_logits=base_config.use_logits,
+                amp=base_config.amp,
+                device=base_config.device,
             ),
         ),
         lstm=dict(
