@@ -9,7 +9,6 @@ Noise-resilient time-series forecasting with an LSTM Regression-GAN (R-GAN) and 
 - **PyTorch Regression-GAN pipeline** with deterministic seeding, AMP, early stopping, gradient clipping, and configurable generator/discriminator stacks.
 - **Baseline coverage** for supervised LSTM, naive persistence, ARIMA, and ARMA, plus optional ETS/ARIMA classical references.
 - **Quantitative diagnostics** including RMSE/MSE/MAE/Bias with bootstrap confidence intervals in both scaled and original units, and automated noise-robustness sweeps.
-- **Learning-curve analysis** across increasing training-set sizes to quantify sample efficiency.
 - **RGAN Analytics Terminal** (`web_dashboard/`) built with React + Vite + Recharts that ingests `results/metrics.json` to deliver executive-friendly storytelling with a professional trading terminal aesthetic.
 - **Camera-ready LaTeX builder** (`papers/build_paper.py`) that injects every figure, metric table, and architecture summary into the manuscript template.
 
@@ -73,7 +72,6 @@ python run_experiment.py \
   --epochs 5 \
   --gan_variant wgan-gp \
   --skip_classical \
-  --curve_steps 0 \
   --noise_levels 0 \
   --bootstrap_samples 0
 ```
@@ -125,9 +123,8 @@ Compile the resulting `.tex` file with your LaTeX toolchain (e.g., `pdflatex` or
 | `--prefetch_factor` | Background prefetch for multi-worker DataLoaders. |
 | `--gpu_id` | ID of the GPU to use (default: 0). |
 | `--require_cuda` | Strict mode: Fail if CUDA is not available or the specified GPU ID is invalid. |
-| `--skip_classical` | Skip ARIMA/ARMA/tree baselines and classical error curves for faster smoke tests. |
+| `--skip_classical` | Skip ARIMA/ARMA/tree baselines for faster smoke tests. |
 | `--tune`, `--tune_csv`, `--tune_eval_frac` | Enable and configure the hyperparameter sweep. |
-| `--curve_steps`, `--curve_min_frac`, `--curve_epochs`, `--curve_repeats` | Generate learning curves over increasing sample sizes. |
 | `--noise_levels` | Comma-separated Gaussian noise standard deviations for robustness testing (`0` automatically included). |
 | `--results_dir` | Destination for artifacts (defaults to `./results`). |
 
@@ -154,7 +151,7 @@ All flags are documented in `run_experiment.py` (`python run_experiment.py --hel
 
 Running `run_experiment.py` populates the chosen `--results_dir` with:
 
-- `metrics.json` – master record of dataset metadata, evaluation metrics (train/test/noise), learning-curve values, architecture summaries, tuning results, and artifact paths.
+- `metrics.json` – master record of dataset metadata, evaluation metrics (train/test/noise), architecture summaries, tuning results, and artifact paths.
 - Plot artifacts in both static (PNG) and interactive HTML formats for every figure referenced in the manuscript and dashboard.
 - `tuning_results.csv` – only when `--tune` is supplied; contains per-trial metrics and seeds for reproducibility.
 - Serialized models/checkpoints emitted by the training routines (see `results/` subdirectories).
@@ -168,8 +165,6 @@ Key static figures (PNG):
 - `arma_train_test_rmse_vs_epochs.png`
 - `models_test_error.png` and `models_train_error.png`
 - `naive_baseline_vs_naive_bayes.png`
-- `classical_error_vs_samples.png` (when ETS/ARIMA available)
-- `ml_error_vs_samples.png` (learning curves)
 
 Interactive counterparts share the same filenames suffixed by `_interactive.html` when Plotly export succeeds.
 
@@ -181,12 +176,11 @@ Interactive counterparts share the same filenames suffixed by `_interactive.html
 
 - Classical baselines (ARIMA/ARMA/tree ensemble) can dominate startup on long series. Disable with `--skip_classical`.
 - Hyperparameter sweeps via `--tune` launch multiple full trainings. Leave disabled unless exploring the search space.
-- Learning curves (`--curve_steps > 0`) retrain on growing subsets. Set `--curve_steps 0` for single-pass runs.
-- Noise robustness (`--noise_levels` with multiple values) repeats evaluation per noise level. Use a single value (e.g., `0`).
-- Bootstrap confidence intervals (`--bootstrap_samples 300` by default) repeatedly resample metrics. Set `--bootstrap_samples 0` to skip.
+ - Noise robustness (`--noise_levels` with multiple values) repeats evaluation per noise level. Use a single value (e.g., `0`).
+ - Bootstrap confidence intervals (`--bootstrap_samples 300` by default) repeatedly resample metrics. Set `--bootstrap_samples 0` to skip.
 
 - **Rich styling errors:** The console now degrades gracefully if `rich` lacks gradient support, but ensure `rich>=13` for the full experience (`pip install --upgrade rich`).
-- **Slow CPU training:** Reduce `--epochs`, disable learning curves (`--curve_steps 0`), and set DataLoader flags for single-process loading (`--num_workers 0 --persistent_workers false --pin_memory false`).
+- **Slow CPU training:** Reduce `--epochs` and set DataLoader flags for single-process loading (`--num_workers 0 --persistent_workers false --pin_memory false`).
 - **GPU not detected:** Install the appropriate PyTorch wheel for your CUDA version (see https://pytorch.org/get-started/locally/). Reinstall requirements afterwards.
 - **Enforce GPU usage:** Pass `--require_cuda --gpu_id <id>` to fail fast if the requested GPU is unavailable instead of silently falling back to CPU.
 - **Missing classical plots:** Install `statsmodels` (`pip install statsmodels`) to enable ETS/ARIMA baselines.
