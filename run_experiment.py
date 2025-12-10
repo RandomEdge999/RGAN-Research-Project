@@ -77,6 +77,44 @@ def log_phase(console, title: str):
         console.print(f"[green]✓ {title} completed[/green] [dim]{elapsed:.1f}s[/dim]")
 
 
+def describe_resource_heavy_steps(args: argparse.Namespace, console) -> None:
+    """Surface optional costly steps so users understand startup/runtime cost."""
+
+    heavy_steps = []
+
+    if not args.skip_classical:
+        heavy_steps.append(
+            "Classical baselines (ARIMA/ARMA/tree ensemble) fit on the full training set"
+            " and can dominate startup on long series. Use --skip_classical to disable."
+        )
+    if args.tune:
+        heavy_steps.append(
+            "Hyperparameter sweep (--tune) runs multiple R-GAN fits; expect extended runtime."
+        )
+    if args.curve_steps > 0:
+        heavy_steps.append(
+            "Learning-curve resampling (--curve_steps) trains several models on growing subsets."
+        )
+    noise_levels = parse_noise_levels(str(args.noise_levels))
+    if len(noise_levels) > 1:
+        heavy_steps.append(
+            "Robustness evaluation across multiple noise levels; reduce --noise_levels to a single"
+            " value to skip."
+        )
+    if args.bootstrap_samples > 0:
+        heavy_steps.append(
+            "Bootstrap uncertainty estimation adds repeated metric computation; set"
+            " --bootstrap_samples 0 to omit."
+        )
+
+    if heavy_steps:
+        console.print("[bold yellow]Resource-heavy components enabled:[/bold yellow]")
+        for item in heavy_steps:
+            console.print(f" • {item}")
+    else:
+        console.print("[green]All optional heavy components are disabled for this run.[/green]")
+
+
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -556,6 +594,8 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     noise_levels = parse_noise_levels(str(args.noise_levels))
+
+    describe_resource_heavy_steps(args, console)
 
     try:
         from src.rgan.models_torch import (
