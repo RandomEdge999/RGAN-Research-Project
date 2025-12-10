@@ -109,6 +109,7 @@ Compile the resulting `.tex` file with your LaTeX toolchain (e.g., `pdflatex` or
 | `--prefetch_factor` | Background prefetch for multi-worker DataLoaders. |
 | `--gpu_id` | ID of the GPU to use (default: 0). |
 | `--require_cuda` | Strict mode: Fail if CUDA is not available or the specified GPU ID is invalid. |
+| `--skip_classical` | Skip ARIMA/ARMA/tree baselines and classical error curves for faster smoke tests. |
 | `--tune`, `--tune_csv`, `--tune_eval_frac` | Enable and configure the hyperparameter sweep. |
 | `--curve_steps`, `--curve_min_frac`, `--curve_epochs`, `--curve_repeats` | Generate learning curves over increasing sample sizes. |
 | `--noise_levels` | Comma-separated Gaussian noise standard deviations for robustness testing (`0` automatically included). |
