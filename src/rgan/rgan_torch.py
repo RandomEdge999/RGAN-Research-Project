@@ -227,7 +227,30 @@ def train_rgan_torch(
         A dictionary containing the trained models, history, and evaluation statistics.
     """
     G, D = models
-    device = torch.device(config.device)
+    console = get_console()
+    requested_device = torch.device(config.device)
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        hint = (
+            "Torch reports no accessible CUDA device. Ensure you installed a CUDA-enabled PyTorch build "
+            "(e.g., pip install 'torch==2.2.2+cu121') and that NVIDIA drivers are available."
+        )
+        if config.strict_device:
+            raise RuntimeError(
+                f"CUDA device {config.device} was requested but is unavailable. {hint}"
+            )
+        console.print(
+            f"[yellow]CUDA unavailable — falling back to CPU despite requested device {config.device}. {hint}[/yellow]"
+        )
+        requested_device = torch.device("cpu")
+
+    if requested_device.type == "cuda":
+        torch.cuda.set_device(requested_device)
+        device_name = torch.cuda.get_device_name(requested_device)
+        console.print(f"[green]Using CUDA device:[/green] {device_name} ({requested_device})")
+    else:
+        console.print("[yellow]Using CPU for training (no CUDA device active).[/yellow]")
+
+    device = requested_device
     G.to(device)
     D.to(device)
 
@@ -240,10 +263,16 @@ def train_rgan_torch(
     mse = nn.MSELoss()
 
     use_logits = config.use_logits
-    bce_loss = nn.BCEWithLogitsLoss() if use_logits else nn.BCELoss()
 
     gan_variant = config.gan_variant.lower()
-    default_d_steps = 5 if gan_variant == "wgan-gp" else 1
+    if gan_variant not in {"standard", "wgan", "wgan-gp"}:
+        raise ValueError(f"Unsupported GAN variant '{config.gan_variant}'.")
+    if gan_variant in {"wgan", "wgan-gp"}:
+        use_logits = True  # Wasserstein training expects raw scores
+
+    bce_loss = nn.BCEWithLogitsLoss() if use_logits else nn.BCELoss()
+
+    default_d_steps = 5 if gan_variant in {"wgan", "wgan-gp"} else 1
     d_steps = max(1, config.d_steps)
     g_steps = max(1, config.g_steps)
     warmup_epochs = max(0, config.supervised_warmup_epochs)
@@ -262,7 +291,9 @@ def train_rgan_torch(
     track_logits = config.track_discriminator_outputs
 
     disc_activation = config.d_activation.lower() if config.d_activation else ""
-    if not disc_activation and not use_logits:
+    if gan_variant in {"wgan", "wgan-gp"}:
+        disc_activation = ""  # Force linear outputs for Wasserstein critics
+    elif not disc_activation and not use_logits:
         disc_activation = "sigmoid"
 
     def _disc_output_to_prob(tensor: torch.Tensor) -> torch.Tensor:
@@ -360,7 +391,6 @@ def train_rgan_torch(
 
     train_loader = make_loader(current_batch_size)
 
-    console = get_console()
     with epoch_progress(config.epochs, description="R-GAN (Torch)") as (progress, task_id):
         for epoch in range(1, config.epochs + 1):
             supervised_only = epoch <= warmup_epochs
@@ -409,10 +439,13 @@ def train_rgan_torch(
                                     D_real = D(real_pairs)
                                     D_fake = D(fake_pairs)
 
-                                if gan_variant == "wgan-gp":
+                                if gan_variant in {"wgan", "wgan-gp"}:
                                     D_loss_main = -(D_real.mean() - D_fake.mean())
-                                    gp = _gradient_penalty(D, real_pairs, fake_pairs, device, gp_lambda)
-                                    D_loss = D_loss_main + gp
+                                    if gan_variant == "wgan-gp":
+                                        gp = _gradient_penalty(D, real_pairs, fake_pairs, device, gp_lambda)
+                                        D_loss = D_loss_main + gp
+                                    else:
+                                        D_loss = D_loss_main
                                 else:
                                     real_targets = torch.full_like(D_real, config.label_smooth)
                                     fake_targets = torch.zeros_like(D_fake)
@@ -441,9 +474,15 @@ def train_rgan_torch(
                                 scaler_D.step(optD)
                                 scaler_D.update()
 
+                                if gan_variant == "wgan":
+                                    clip_val = float(config.wgan_clip_value)
+                                    for p in D.parameters():
+                                        if p.requires_grad:
+                                            p.data.clamp_(-clip_val, clip_val)
+
                                 epoch_D_losses.append(float(D_loss_main.detach().cpu()))
                                 if track_logits:
-                                    if gan_variant == "wgan-gp":
+                                    if gan_variant in {"wgan", "wgan-gp"}:
                                         epoch_D_real.append(float(D_real.mean().detach().cpu()))
                                         epoch_D_fake.append(float(D_fake.mean().detach().cpu()))
                                     else:
@@ -465,7 +504,7 @@ def train_rgan_torch(
 
                                 if supervised_only:
                                     adv_loss = torch.tensor(0.0, device=device)
-                                elif gan_variant == "wgan-gp":
+                                elif gan_variant in {"wgan", "wgan-gp"}:
                                     adv_loss = -D(fake_pairs).mean()
                                 else:
                                     logits = D(fake_pairs)
