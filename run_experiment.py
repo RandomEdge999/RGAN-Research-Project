@@ -7,10 +7,12 @@ import platform
 import random
 import subprocess
 import sys
+import time
 from itertools import combinations
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
+from contextlib import contextmanager
 
 import numpy as np
 from numpy.lib import NumpyVersion
@@ -34,7 +36,6 @@ from src.rgan.baselines import (
     arima_forecast,
     arma_forecast,
     tree_ensemble_forecast,
-    classical_curves_vs_samples,
 )
 from src.rgan.data import (
     load_csv_series,
@@ -47,8 +48,6 @@ from src.rgan.plots import (
     plot_single_train_test,
     plot_constant_train_test,
     plot_compare_models_bars,
-    plot_classical_curves,
-    plot_learning_curves,
     create_error_metrics_table,
 )
 from src.rgan.tune import tune_rgan
@@ -60,6 +59,53 @@ from src.rgan.metrics import (
     diebold_mariano,
 )
 from src.rgan.config import TrainConfig, ModelConfig
+
+
+@contextmanager
+def log_phase(console, title: str):
+    """Lightweight console-timed phase logger to surface progress during long steps."""
+
+    console.print(f"[bold cyan]→ {title}...[/bold cyan]")
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        console.print(f"[green]✓ {title} completed[/green] [dim]{elapsed:.1f}s[/dim]")
+
+
+def describe_resource_heavy_steps(args: argparse.Namespace, console) -> None:
+    """Surface optional costly steps so users understand startup/runtime cost."""
+
+    heavy_steps = []
+
+    if not args.skip_classical:
+        heavy_steps.append(
+            "Classical baselines (ARIMA/ARMA/tree ensemble) fit on the full training set"
+            " and can dominate startup on long series. Use --skip_classical to disable."
+        )
+    if args.tune:
+        heavy_steps.append(
+            "Hyperparameter sweep (--tune) runs multiple R-GAN fits; expect extended runtime."
+        )
+    noise_levels = parse_noise_levels(str(args.noise_levels))
+    if len(noise_levels) > 1:
+        heavy_steps.append(
+            "Robustness evaluation across multiple noise levels; reduce --noise_levels to a single"
+            " value to skip."
+        )
+    if args.bootstrap_samples > 0:
+        heavy_steps.append(
+            "Bootstrap uncertainty estimation adds repeated metric computation; set"
+            " --bootstrap_samples 0 to omit."
+        )
+
+    if heavy_steps:
+        console.print("[bold yellow]Resource-heavy components enabled:[/bold yellow]")
+        for item in heavy_steps:
+            console.print(f" • {item}")
+    else:
+        console.print("[green]All optional heavy components are disabled for this run.[/green]")
 
 
 def set_seed(seed: int = 42) -> None:
@@ -151,178 +197,6 @@ def parse_noise_levels(spec: str) -> np.ndarray:
     if 0.0 not in values:
         values.append(0.0)
     return np.array(sorted(set(values)), dtype=float)
-
-
-def compute_learning_curves(
-    args: argparse.Namespace,
-    base_config: TrainConfig,
-    Xfull_tr: np.ndarray,
-    Yfull_tr: np.ndarray,
-    Xte: np.ndarray,
-    Yte: np.ndarray,
-    n_features: int,
-) -> Tuple[List[int], Dict[str, List[float]], Dict[str, List[float]]]:
-    if args.curve_steps <= 0:
-        return [], {}, {}
-
-    total = len(Xfull_tr)
-    if total < 2:
-        return [], {}, {}
-
-    min_size = max(int(args.curve_min_frac * total), 5)
-    if args.curve_steps == 1:
-        sizes = np.array([total], dtype=int)
-    else:
-        sizes = np.linspace(min_size, total, args.curve_steps, dtype=int)
-    sizes = np.clip(sizes, 2, total)
-    sizes = np.unique(sizes)
-
-    curves_mean = {
-        "R-GAN": [],
-        "LSTM": [],
-        "Tree Ensemble": [],
-        "Naïve Baseline": [],
-        "ARIMA": [],
-        "ARMA": [],
-    }
-    curves_std = {key: [] for key in curves_mean}
-    used_sizes = []
-
-    rng = np.random.default_rng(args.seed)
-    naive_test_stats, _ = naive_baseline(Xte, Yte)
-
-    from src.rgan.models_torch import (
-        build_generator as build_generator_backend,
-        build_discriminator as build_discriminator_backend,
-    )
-    from src.rgan.rgan_torch import train_rgan_torch as train_rgan_backend
-    from src.rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
-
-    repeats = max(1, getattr(args, "curve_repeats", 1))
-
-    for size in sizes:
-        if size < 2:
-            continue
-        if size > total:
-            continue
-
-        rmse_acc = {key: [] for key in curves_mean}
-
-        for rep in range(repeats):
-            if size == total:
-                selection = np.arange(total)
-            else:
-                selection = rng.choice(total, size=size, replace=False)
-
-            Xsubset = Xfull_tr[selection]
-            Ysubset = Yfull_tr[selection]
-
-            try:
-                sub_split = split_windows_for_training(
-                    Xsubset,
-                    Ysubset,
-                    val_fraction=args.val_frac,
-                    eval_fraction=0.0,
-                    shuffle=True,
-                    rng=rng,
-                )
-            except ValueError:
-                continue
-
-            data_splits = {
-                "Xtr": sub_split["X_train"],
-                "Ytr": sub_split["Y_train"],
-                "Xval": sub_split["X_val"],
-                "Yval": sub_split["Y_val"],
-                "Xte": Xte,
-                "Yte": Yte,
-            }
-
-            # Create a copy of base_config for this curve point
-            # Since TrainConfig is a dataclass, we can use replace or just create new
-            import dataclasses
-            curve_config = dataclasses.replace(base_config)
-            curve_config.epochs = max(1, min(base_config.epochs, args.curve_epochs))
-            curve_config.patience = min(curve_config.patience, curve_config.epochs)
-
-            set_seed(args.seed + rep)
-
-            # Build models
-            # Note: We need to pass args manually to build functions or update them to take config
-            # Assuming build functions still take kwargs
-            
-            G_curve = build_generator_backend(
-                L=base_config.L,
-                H=base_config.H,
-                n_in=n_features,
-                units=curve_config.units_g,
-                dropout=curve_config.dropout,
-                num_layers=curve_config.g_layers,
-                dense_activation=curve_config.g_dense_activation,
-                layer_norm=(curve_config.gan_variant == "wgan-gp"),
-            )
-            D_curve = build_discriminator_backend(
-                L=base_config.L,
-                H=base_config.H,
-                units=curve_config.units_d,
-                dropout=curve_config.dropout,
-                num_layers=curve_config.d_layers,
-                activation=curve_config.d_activation,
-                layer_norm=(curve_config.gan_variant == "wgan-gp"),
-                use_spectral_norm=(curve_config.gan_variant == "wgan-gp"),
-            )
-            
-            rgan_curve_out = train_rgan_backend(
-                curve_config,
-                (G_curve, D_curve),
-                data_splits,
-                str(args.results_dir),
-                tag=f"rgan_curve_{size}_{rep}",
-            )
-            lstm_curve_out = train_lstm_backend(
-                curve_config,
-                data_splits,
-                str(args.results_dir),
-                tag=f"lstm_curve_{size}_{rep}",
-            )
-
-            rmse_acc["R-GAN"].append(rgan_curve_out["test_stats"]["rmse"])
-            rmse_acc["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
-
-            rmse_acc["Naïve Baseline"].append(naive_test_stats["rmse"])
-            
-            arima_stats, _ = arima_forecast(
-                sub_split["X_train"], sub_split["Y_train"], Xte, Yte
-            )
-            rmse_acc["ARIMA"].append(arima_stats["rmse"])
-            
-            arma_stats, _ = arma_forecast(
-                sub_split["X_train"], sub_split["Y_train"], Xte, Yte
-            )
-            rmse_acc["ARMA"].append(arma_stats["rmse"])
-            tree_stats, _ = tree_ensemble_forecast(
-                sub_split["X_train"],
-                sub_split["Y_train"],
-                Xte,
-                Yte,
-                random_state=args.seed + rep,
-            )
-            rmse_acc["Tree Ensemble"].append(tree_stats["rmse"])
-
-        if not any(rmse_acc[key] for key in rmse_acc):
-            continue
-
-        used_sizes.append(int(size))
-        for key in curves_mean:
-            values = rmse_acc[key]
-            if values:
-                curves_mean[key].append(float(np.mean(values)))
-                curves_std[key].append(float(np.std(values, ddof=1)) if len(values) > 1 else 0.0)
-            else:
-                curves_mean[key].append(float("nan"))
-                curves_std[key].append(float("nan"))
-
-    return used_sizes, curves_mean, curves_std
 
 
 def main():
@@ -431,15 +305,6 @@ def main():
         default=0.1,
         help="Additional fraction of the training windows reserved as a tuning-only hold-out set.",
     )
-    ap.add_argument("--curve_steps", type=int, default=0)
-    ap.add_argument("--curve_min_frac", type=float, default=0.4)
-    ap.add_argument("--curve_epochs", type=int, default=40)
-    ap.add_argument(
-        "--curve_repeats",
-        type=int,
-        default=3,
-        help="Number of resampled runs per learning-curve point for variance estimation.",
-    )
     # Torch runtime knobs
     ap.add_argument("--amp", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
                     help="Enable automatic mixed precision for PyTorch training")
@@ -463,6 +328,14 @@ def main():
         type=int,
         default=300,
         help="Number of bootstrap resamples for metric uncertainty estimates.",
+    )
+    ap.add_argument(
+        "--skip_classical",
+        action="store_true",
+        help=(
+            "Skip slow classical baselines (ARIMA/ARMA/tree ensemble). Useful for quick "
+            "smoke tests or when you only care about the neural models."
+        ),
     )
     ap.add_argument(
         "--tune",
@@ -533,6 +406,8 @@ def main():
 
     noise_levels = parse_noise_levels(str(args.noise_levels))
 
+    describe_resource_heavy_steps(args, console)
+
     try:
         from src.rgan.models_torch import (
             build_generator as build_generator_backend,
@@ -554,39 +429,41 @@ def main():
 
     set_seed(args.seed)
 
-    df, target_col, time_used = load_csv_series(args.csv, args.target, args.time_col, args.resample, args.agg)
-    prep = interpolate_and_standardize(df, target_col, train_ratio=args.train_ratio)
-    target_mean = prep["target_mean"]
-    target_std = prep["target_std"]
+    with log_phase(console, "Load dataset and standardize"):
+        df, target_col, time_used = load_csv_series(args.csv, args.target, args.time_col, args.resample, args.agg)
+        prep = interpolate_and_standardize(df, target_col, train_ratio=args.train_ratio)
+        target_mean = prep["target_mean"]
+        target_std = prep["target_std"]
 
-    print_kv_table(console, "Dataset", {
-        "CSV": args.csv,
-        "Target": target_col,
-        "Time Column": time_used or "(none)",
-        "Rows": len(df),
-        "Train/Test Split": f"{args.train_ratio:.2f}/{1-args.train_ratio:.2f}",
-    })
+        print_kv_table(console, "Dataset", {
+            "CSV": args.csv,
+            "Target": target_col,
+            "Time Column": time_used or "(none)",
+            "Rows": len(df),
+            "Train/Test Split": f"{args.train_ratio:.2f}/{1-args.train_ratio:.2f}",
+        })
 
-    try:
-        if prep["covariates"]:
-            Xfull_tr, Yfull_tr = make_windows_with_covariates(
-                prep["scaled_train"], target_col, prep["covariates"], args.L, args.H
-            )
-            Xte, Yte = make_windows_with_covariates(
-                prep["scaled_test"], target_col, prep["covariates"], args.L, args.H
-            )
-        else:
-            Xfull_tr, Yfull_tr = make_windows_univariate(
-                prep["scaled_train"], target_col, args.L, args.H
-            )
-            Xte, Yte = make_windows_univariate(
-                prep["scaled_test"], target_col, args.L, args.H
-            )
-    except ValueError as exc:
-        raise ValueError(
-            "Unable to construct training/test windows with the provided L/H settings. "
-            "Consider decreasing --L/--H or ensuring the dataset has sufficient rows."
-        ) from exc
+    with log_phase(console, "Create training and test windows"):
+        try:
+            if prep["covariates"]:
+                Xfull_tr, Yfull_tr = make_windows_with_covariates(
+                    prep["scaled_train"], target_col, prep["covariates"], args.L, args.H
+                )
+                Xte, Yte = make_windows_with_covariates(
+                    prep["scaled_test"], target_col, prep["covariates"], args.L, args.H
+                )
+            else:
+                Xfull_tr, Yfull_tr = make_windows_univariate(
+                    prep["scaled_train"], target_col, args.L, args.H
+                )
+                Xte, Yte = make_windows_univariate(
+                    prep["scaled_test"], target_col, args.L, args.H
+                )
+        except ValueError as exc:
+            raise ValueError(
+                "Unable to construct training/test windows with the provided L/H settings. "
+                "Consider decreasing --L/--H or ensuring the dataset has sufficient rows."
+            ) from exc
 
     base_splits = split_windows_for_training(
         Xfull_tr,
@@ -669,99 +546,100 @@ def main():
     used_tune = ""
     best_hp = None
     if args.tune:
-        if args.tune_csv:
-            df_tune, target_tune, _ = load_csv_series(args.tune_csv, args.target, args.time_col, args.resample, args.agg)
-            prep_t = interpolate_and_standardize(df_tune, target_tune, train_ratio=args.train_ratio)
-            if prep_t["covariates"]:
-                Xtune, Ytune = make_windows_with_covariates(prep_t["scaled_train"], target_tune, prep_t["covariates"], args.L, args.H)
+        with log_phase(console, "Hyperparameter tuning sweep"):
+            if args.tune_csv:
+                df_tune, target_tune, _ = load_csv_series(args.tune_csv, args.target, args.time_col, args.resample, args.agg)
+                prep_t = interpolate_and_standardize(df_tune, target_tune, train_ratio=args.train_ratio)
+                if prep_t["covariates"]:
+                    Xtune, Ytune = make_windows_with_covariates(prep_t["scaled_train"], target_tune, prep_t["covariates"], args.L, args.H)
+                else:
+                    Xtune, Ytune = make_windows_univariate(prep_t["scaled_train"], target_tune, args.L, args.H)
+                used_tune = args.tune_csv
             else:
-                Xtune, Ytune = make_windows_univariate(prep_t["scaled_train"], target_tune, args.L, args.H)
-            used_tune = args.tune_csv
-        else:
-            Xtune, Ytune = Xfull_tr, Yfull_tr
-            used_tune = args.csv
-        tune_splits = split_windows_for_training(
-            Xtune,
-            Ytune,
-            val_fraction=args.val_frac,
-            eval_fraction=args.tune_eval_frac,
-            shuffle=False,
-        )
+                Xtune, Ytune = Xfull_tr, Yfull_tr
+                used_tune = args.csv
+            tune_splits = split_windows_for_training(
+                Xtune,
+                Ytune,
+                val_fraction=args.val_frac,
+                eval_fraction=args.tune_eval_frac,
+                shuffle=False,
+            )
 
-        lr_candidates_g = sorted({max(1e-5, args.lrG * factor) for factor in (0.5, 1.0, 1.5)})
-        lr_candidates_g.append(max(1e-5, args.lrG))
-        lr_candidates_g = sorted(set(lr_candidates_g))
-        lr_candidates_d = sorted({max(1e-5, args.lrD * factor) for factor in (0.5, 1.0, 1.5)})
-        lr_candidates_d.append(max(1e-5, args.lrD))
-        lr_candidates_d = sorted(set(lr_candidates_d))
+            lr_candidates_g = sorted({max(1e-5, args.lrG * factor) for factor in (0.5, 1.0, 1.5)})
+            lr_candidates_g.append(max(1e-5, args.lrG))
+            lr_candidates_g = sorted(set(lr_candidates_g))
+            lr_candidates_d = sorted({max(1e-5, args.lrD * factor) for factor in (0.5, 1.0, 1.5)})
+            lr_candidates_d.append(max(1e-5, args.lrD))
+            lr_candidates_d = sorted(set(lr_candidates_d))
 
-        dropout_candidates = sorted(
-            {round(val, 3) for val in (0.0, args.dropout, min(args.dropout + 0.1, 0.3))}
-        )
-        lambda_candidates = sorted({0.05, 0.1, 0.2, args.lambda_reg})
-        layer_choices = sorted({1, args.g_layers, max(1, args.g_layers - 1), args.g_layers + 1})
-        unit_choices_g = sorted({32, 64, 128, args.units_g})
-        unit_choices_d = sorted({32, 64, 128, args.units_d})
+            dropout_candidates = sorted(
+                {round(val, 3) for val in (0.0, args.dropout, min(args.dropout + 0.1, 0.3))}
+            )
+            lambda_candidates = sorted({0.05, 0.1, 0.2, args.lambda_reg})
+            layer_choices = sorted({1, args.g_layers, max(1, args.g_layers - 1), args.g_layers + 1})
+            unit_choices_g = sorted({32, 64, 128, args.units_g})
+            unit_choices_d = sorted({32, 64, 128, args.units_d})
 
-        dense_candidates = [None]
-        if args.g_dense_activation:
-            dense_candidates.append(args.g_dense_activation)
-        dense_candidates.append("relu")
-        dense_candidates = list(dict.fromkeys(dense_candidates))
+            dense_candidates = [None]
+            if args.g_dense_activation:
+                dense_candidates.append(args.g_dense_activation)
+            dense_candidates.append("relu")
+            dense_candidates = list(dict.fromkeys(dense_candidates))
 
-        disc_act_candidates = [None]
-        if args.d_activation:
-            disc_act_candidates.append(args.d_activation)
-        disc_act_candidates.extend(["sigmoid", "tanh"])
-        disc_act_candidates = list(dict.fromkeys(disc_act_candidates))
+            disc_act_candidates = [None]
+            if args.d_activation:
+                disc_act_candidates.append(args.d_activation)
+            disc_act_candidates.extend(["sigmoid", "tanh"])
+            disc_act_candidates = list(dict.fromkeys(disc_act_candidates))
 
-        hp_grid = {
-            "units_g": unit_choices_g,
-            "units_d": unit_choices_d,
-            "lambda_reg": lambda_candidates,
-            "dropout": dropout_candidates,
-            "g_layers": layer_choices,
-            "d_layers": layer_choices,
-            "lr_g": lr_candidates_g, # Changed to match TrainConfig field name
-            "lr_d": lr_candidates_d, # Changed to match TrainConfig field name
-            "g_dense_activation": dense_candidates,
-            "d_activation": disc_act_candidates,
-            "epochs_each": [30, 45],
-        }
-        
-        # Note: tune_rgan expects a dict for base_config to update it easily, 
-        # but we refactored it to take a dict and convert internally.
-        # So we pass a dict representation of base_config.
-        # Actually, tune_rgan signature is: base_config: Dict[str, Any]
-        # So we should pass base_config.__dict__ or similar.
-        # But wait, base_config is a dataclass instance now.
-        # I should pass dataclasses.asdict(base_config)
-        import dataclasses
-        
-        best_hp, df_tune_res = tune_rgan(
-            hp_grid,
-            dataclasses.asdict(base_config),
-            tune_splits,
-            str(results_dir),
-            seed=args.seed,
-        )
-        df_tune_res.to_csv(results_dir/"tuning_results.csv", index=False)
-        
-        # Update base_config with best_hp
-        # Since base_config is a dataclass, we can use replace
-        # But best_hp is a dict.
-        # We need to filter keys again or just iterate.
-        valid_fields = {f.name for f in dataclasses.fields(base_config)}
-        updates = {}
-        for key, value in best_hp.items():
-            if key in {"val_rmse", "seed"}:
-                continue
-            if value is None:
-                continue
-            if key in valid_fields:
-                updates[key] = value
-        
-        base_config = dataclasses.replace(base_config, **updates)
+            hp_grid = {
+                "units_g": unit_choices_g,
+                "units_d": unit_choices_d,
+                "lambda_reg": lambda_candidates,
+                "dropout": dropout_candidates,
+                "g_layers": layer_choices,
+                "d_layers": layer_choices,
+                "lr_g": lr_candidates_g, # Changed to match TrainConfig field name
+                "lr_d": lr_candidates_d, # Changed to match TrainConfig field name
+                "g_dense_activation": dense_candidates,
+                "d_activation": disc_act_candidates,
+                "epochs_each": [30, 45],
+            }
+
+            # Note: tune_rgan expects a dict for base_config to update it easily,
+            # but we refactored it to take a dict and convert internally.
+            # So we pass a dict representation of base_config.
+            # Actually, tune_rgan signature is: base_config: Dict[str, Any]
+            # So we should pass base_config.__dict__ or similar.
+            # But wait, base_config is a dataclass instance now.
+            # I should pass dataclasses.asdict(base_config)
+            import dataclasses
+
+            best_hp, df_tune_res = tune_rgan(
+                hp_grid,
+                dataclasses.asdict(base_config),
+                tune_splits,
+                str(results_dir),
+                seed=args.seed,
+            )
+            df_tune_res.to_csv(results_dir/"tuning_results.csv", index=False)
+
+            # Update base_config with best_hp
+            # Since base_config is a dataclass, we can use replace
+            # But best_hp is a dict.
+            # We need to filter keys again or just iterate.
+            valid_fields = {f.name for f in dataclasses.fields(base_config)}
+            updates = {}
+            for key, value in best_hp.items():
+                if key in {"val_rmse", "seed"}:
+                    continue
+                if value is None:
+                    continue
+                if key in valid_fields:
+                    updates[key] = value
+
+            base_config = dataclasses.replace(base_config, **updates)
 
     g_dense_act = base_config.g_dense_activation
 
@@ -789,21 +667,23 @@ def main():
         layer_norm=layer_norm,
         use_spectral_norm=use_spectral_norm,
     )
-    
-    rgan_out = train_rgan_backend(
-        base_config, 
-        (G,D), 
-        {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, 
-        str(results_dir), 
-        tag="rgan"
-    )
 
-    lstm_out = train_lstm_backend(
-        base_config, 
-        {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte}, 
-        str(results_dir), 
-        tag="lstm"
-    )
+    with log_phase(console, "Train R-GAN (PyTorch)"):
+        rgan_out = train_rgan_backend(
+            base_config,
+            (G,D),
+            {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
+            str(results_dir),
+            tag="rgan"
+        )
+
+    with log_phase(console, "Train supervised LSTM baseline"):
+        lstm_out = train_lstm_backend(
+            base_config,
+            {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
+            str(results_dir),
+            tag="lstm"
+        )
 
     rgan_curve_artifacts = plot_single_train_test(
         rgan_out["history"]["epoch"],
@@ -819,6 +699,37 @@ def main():
         "LSTM (Supervised): Error vs Epochs",
         results_dir / "lstm_train_test_rmse_vs_epochs.png",
     )
+
+    def _blank_stats() -> Dict[str, float]:
+        nan_keys = [
+            "rmse",
+            "mae",
+            "mse",
+            "bias",
+            "smape",
+            "maape",
+            "mase",
+            "rmse_std",
+            "rmse_ci_low",
+            "rmse_ci_high",
+            "mae_std",
+            "mae_ci_low",
+            "mae_ci_high",
+            "rmse_orig",
+            "mae_orig",
+            "mse_orig",
+            "bias_orig",
+            "smape_orig",
+            "maape_orig",
+            "mase_orig",
+            "rmse_orig_std",
+            "rmse_orig_ci_low",
+            "rmse_orig_ci_high",
+            "mae_orig_std",
+            "mae_orig_ci_low",
+            "mae_orig_ci_high",
+        ]
+        return {k: float("nan") for k in nan_keys}
 
     _, naive_train_pred = naive_baseline(Xtr, Ytr)
     _, naive_test_pred = naive_baseline(Xte, Yte)
@@ -849,122 +760,123 @@ def main():
         results_dir / "naive_train_test_rmse_vs_epochs.png",
     )
 
-    # ARIMA implementation
-    _, arima_train_pred = arima_forecast(Xtr, Ytr)
-    arima_train_stats = summarise_with_uncertainty(
-        Ytr,
-        arima_train_pred,
-        n_bootstrap=args.bootstrap_samples,
-        seed=args.seed,
-        original_mean=target_mean,
-        original_std=target_std,
-        training_series=training_series_scaled,
-        training_series_orig=training_series_orig,
-    )
-    _, arima_test_pred = arima_forecast(Xtr, Ytr, Xte, Yte)
-    arima_test_stats = summarise_with_uncertainty(
-        Yte,
-        arima_test_pred,
-        n_bootstrap=args.bootstrap_samples,
-        seed=args.seed + 1,
-        original_mean=target_mean,
-        original_std=target_std,
-        training_series=training_series_scaled,
-        training_series_orig=training_series_orig,
-    )
-    arima_curve_artifacts = plot_constant_train_test(
-        arima_train_stats["rmse"],
-        arima_test_stats["rmse"],
-        "ARIMA: Error vs Epochs",
-        results_dir / "arima_train_test_rmse_vs_epochs.png",
-    )
+    if args.skip_classical:
+        arima_train_stats = _blank_stats()
+        arima_test_stats = _blank_stats()
+        arima_curve_artifacts = {"static": "", "interactive": ""}
+        arma_train_stats = _blank_stats()
+        arma_test_stats = _blank_stats()
+        arma_curve_artifacts = {"static": "", "interactive": ""}
+        tree_train_stats = _blank_stats()
+        tree_test_stats = _blank_stats()
+        tree_curve_artifacts = {"static": "", "interactive": ""}
+        tree_config = {}
+    else:
+        with log_phase(console, "Train classical baselines (ARIMA/ARMA/Tree ensemble)"):
+            # ARIMA implementation
+            _, arima_train_pred = arima_forecast(Xtr, Ytr)
+            arima_train_stats = summarise_with_uncertainty(
+                Ytr,
+                arima_train_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+            _, arima_test_pred = arima_forecast(Xtr, Ytr, Xte, Yte)
+            arima_test_stats = summarise_with_uncertainty(
+                Yte,
+                arima_test_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed + 1,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+            arima_curve_artifacts = plot_constant_train_test(
+                arima_train_stats["rmse"],
+                arima_test_stats["rmse"],
+                "ARIMA: Error vs Epochs",
+                results_dir / "arima_train_test_rmse_vs_epochs.png",
+            )
 
-    # ARMA implementation
-    _, arma_train_pred = arma_forecast(Xtr, Ytr)
-    arma_train_stats = summarise_with_uncertainty(
-        Ytr,
-        arma_train_pred,
-        n_bootstrap=args.bootstrap_samples,
-        seed=args.seed,
-        original_mean=target_mean,
-        original_std=target_std,
-        training_series=training_series_scaled,
-        training_series_orig=training_series_orig,
-    )
-    _, arma_test_pred = arma_forecast(Xtr, Ytr, Xte, Yte)
-    arma_test_stats = summarise_with_uncertainty(
-        Yte,
-        arma_test_pred,
-        n_bootstrap=args.bootstrap_samples,
-        seed=args.seed + 1,
-        original_mean=target_mean,
-        original_std=target_std,
-        training_series=training_series_scaled,
-        training_series_orig=training_series_orig,
-    )
-    arma_curve_artifacts = plot_constant_train_test(
-        arma_train_stats["rmse"],
-        arma_test_stats["rmse"],
-        "ARMA: Error vs Epochs",
-        results_dir / "arma_train_test_rmse_vs_epochs.png",
-    )
+            # ARMA implementation
+            _, arma_train_pred = arma_forecast(Xtr, Ytr)
+            arma_train_stats = summarise_with_uncertainty(
+                Ytr,
+                arma_train_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+            _, arma_test_pred = arma_forecast(Xtr, Ytr, Xte, Yte)
+            arma_test_stats = summarise_with_uncertainty(
+                Yte,
+                arma_test_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed + 1,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+            arma_curve_artifacts = plot_constant_train_test(
+                arma_train_stats["rmse"],
+                arma_test_stats["rmse"],
+                "ARMA: Error vs Epochs",
+                results_dir / "arma_train_test_rmse_vs_epochs.png",
+            )
 
-    _, tree_train_pred, tree_model = tree_ensemble_forecast(
-        Xtr,
-        Ytr,
-        random_state=args.seed,
-        return_model=True,
-    )
-    tree_train_pred = tree_train_pred.astype(np.float32, copy=False)
-    tree_train_stats = summarise_with_uncertainty(
-        Ytr,
-        tree_train_pred,
-        n_bootstrap=args.bootstrap_samples,
-        seed=args.seed + 2,
-        original_mean=target_mean,
-        original_std=target_std,
-        training_series=training_series_scaled,
-        training_series_orig=training_series_orig,
-    )
-    tree_test_pred = tree_model.predict(Xte.reshape(Xte.shape[0], -1)).astype(np.float32)
-    tree_test_pred = tree_test_pred.reshape(Xte.shape[0], horizon, 1)
-    tree_test_stats = summarise_with_uncertainty(
-        Yte,
-        tree_test_pred,
-        n_bootstrap=args.bootstrap_samples,
-        seed=args.seed + 3,
-        original_mean=target_mean,
-        original_std=target_std,
-        training_series=training_series_scaled,
-        training_series_orig=training_series_orig,
-    )
-    tree_curve_artifacts = plot_constant_train_test(
-        tree_train_stats["rmse"],
-        tree_test_stats["rmse"],
-        "Tree Ensemble: Error vs Epochs",
-        results_dir / "tree_ensemble_train_test_rmse_vs_epochs.png",
-    )
-    tree_config = {
-        "estimator": "GradientBoostingRegressor",
-        "loss": "squared_error",
-        "learning_rate": 0.05,
-        "n_estimators": 400,
-        "subsample": 0.7,
-        "max_depth": 3,
-        "random_state": args.seed,
-    }
-
-    learning_sizes, learning_curve_values, learning_curve_stds = compute_learning_curves(
-        args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, Xtr.shape[-1]
-    )
-    learning_curve_artifacts = None
-    if learning_sizes:
-        learning_curve_artifacts = plot_learning_curves(
-            learning_sizes,
-            learning_curve_values,
-            results_dir / "ml_error_vs_samples.png",
-            curve_stds=learning_curve_stds,
-        )
+            _, tree_train_pred, tree_model = tree_ensemble_forecast(
+                Xtr,
+                Ytr,
+                random_state=args.seed,
+                return_model=True,
+            )
+            tree_train_pred = tree_train_pred.astype(np.float32, copy=False)
+            tree_train_stats = summarise_with_uncertainty(
+                Ytr,
+                tree_train_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed + 2,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+            tree_test_pred = tree_model.predict(Xte.reshape(Xte.shape[0], -1)).astype(np.float32)
+            tree_test_pred = tree_test_pred.reshape(Xte.shape[0], horizon, 1)
+            tree_test_stats = summarise_with_uncertainty(
+                Yte,
+                tree_test_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed + 3,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+            tree_curve_artifacts = plot_constant_train_test(
+                tree_train_stats["rmse"],
+                tree_test_stats["rmse"],
+                "Tree Ensemble: Error vs Epochs",
+                results_dir / "tree_ensemble_train_test_rmse_vs_epochs.png",
+            )
+            tree_config = {
+                "estimator": "GradientBoostingRegressor",
+                "loss": "squared_error",
+                "learning_rate": 0.05,
+                "n_estimators": 400,
+                "subsample": 0.7,
+                "max_depth": 3,
+                "random_state": args.seed,
+            }
 
     _, rgan_train_pred = compute_metrics_backend(rgan_out["G"], Xtr, Ytr)
     rgan_train_stats = summarise_with_uncertainty(
@@ -1013,14 +925,9 @@ def main():
     lstm_out["train_stats"] = lstm_train_stats
     lstm_out["test_stats"] = lstm_test_stats
 
-    sizes, ets_curve, arima_curve = classical_curves_vs_samples(prep["train_df"][target_col].values, prep["test_df"][target_col].values, min_frac=0.3, steps=6)
-    class_curve_artifacts = (
-        plot_classical_curves(sizes, ets_curve, arima_curve, results_dir / "classical_error_vs_samples.png")
-        if sizes is not None
-        else None
-    )
-    ets_rmse_full = float(np.nan if ets_curve is None else ets_curve[-1])
-    arima_rmse_full = float(np.nan if arima_curve is None else arima_curve[-1])
+    class_curve_artifacts = None
+    ets_rmse_full = float("nan")
+    arima_rmse_full = float("nan")
 
     # Noise robustness across multiple perturbation levels
     noise_results = []
@@ -1288,14 +1195,6 @@ def main():
     }
     lstm_architecture = describe_model(lstm_out["model"])
 
-    learning_curves_serializable = {
-        "means": {k: [float(v) for v in vals] for k, vals in learning_curve_values.items()},
-        "stds": {
-            k: [float(v) for v in learning_curve_stds.get(k, [0.0] * len(learning_curve_values.get(k, [])))]
-            for k in learning_curve_values
-        },
-    }
-
     packages = {}
     for pkg in ("numpy", "pandas", "torch", "scikit-learn"):
         module_name = pkg.replace("-", "_")
@@ -1408,14 +1307,8 @@ def main():
         classical=dict(
             ets_rmse_full=ets_rmse_full,
             arima_rmse_full=arima_rmse_full,
-            curves=class_curve_artifacts["static"] if class_curve_artifacts else "",
-            curves_interactive=class_curve_artifacts.get("interactive", "") if class_curve_artifacts else "",
-        ),
-        learning_curves=dict(
-            sizes=[int(s) for s in learning_sizes],
-            curves=learning_curves_serializable,
-            plot=learning_curve_artifacts["static"] if learning_curve_artifacts else "",
-            plot_interactive=learning_curve_artifacts.get("interactive", "") if learning_curve_artifacts else "",
+            curves="",
+            curves_interactive="",
         ),
         advanced_metrics=advanced_metrics_summary,
         statistical_tests=dict(diebold_mariano=dm_results),
