@@ -101,8 +101,12 @@ Compile the resulting `.tex` file with your LaTeX toolchain (e.g., `pdflatex` or
 | `--L`, `--H` | Input window length and forecast horizon. |
 | `--epochs`, `--batch_size` | Training schedule knobs for both GAN and LSTM. |
 | `--units_g`, `--units_d`, `--g_layers`, `--d_layers` | Generator/discriminator architecture. |
+| `--gan_variant` | Adversarial loss style (`standard`, `wgan`, or `wgan-gp`). |
+| `--d_steps`, `--g_steps` | Critic/Generator updates per batch (Wasserstein defaults to 5 D steps when unset). |
+| `--wgan_clip_value`, `--wgan_gp_lambda` | Wasserstein regularisers (weight clipping vs. gradient penalty strength). |
 | `--lambda_reg`, `--dropout`, `--label_smooth`, `--grad_clip` | Regularisation controls. |
 | `--amp`, `--eval_batch_size`, `--num_workers`, `--persistent_workers`, `--pin_memory` | PyTorch runtime tuning. |
+| `--prefetch_factor` | Background prefetch for multi-worker DataLoaders. |
 | `--gpu_id` | ID of the GPU to use (default: 0). |
 | `--require_cuda` | Strict mode: Fail if CUDA is not available or the specified GPU ID is invalid. |
 | `--tune`, `--tune_csv`, `--tune_eval_frac` | Enable and configure the hyperparameter sweep. |
@@ -159,6 +163,7 @@ Interactive counterparts share the same filenames suffixed by `_interactive.html
 - **Rich styling errors:** The console now degrades gracefully if `rich` lacks gradient support, but ensure `rich>=13` for the full experience (`pip install --upgrade rich`).
 - **Slow CPU training:** Reduce `--epochs`, disable learning curves (`--curve_steps 0`), and set DataLoader flags for single-process loading (`--num_workers 0 --persistent_workers false --pin_memory false`).
 - **GPU not detected:** Install the appropriate PyTorch wheel for your CUDA version (see https://pytorch.org/get-started/locally/). Reinstall requirements afterwards.
+- **Enforce GPU usage:** Pass `--require_cuda --gpu_id <id>` to fail fast if the requested GPU is unavailable instead of silently falling back to CPU.
 - **Missing classical plots:** Install `statsmodels` (`pip install statsmodels`) to enable ETS/ARIMA baselines.
 - **No metrics generated:** Ensure the run completed without interruption. Partial runs may leave stale PNGs but no `metrics.json`.
 - **Dashboard shows blank sections:** Verify the metrics file path in the browser console and confirm CORS is not blocking the fetch (serve the dashboard via HTTP rather than opening `index.html` directly from disk).
