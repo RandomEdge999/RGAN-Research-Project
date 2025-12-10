@@ -62,6 +62,22 @@ python run_experiment.py \
   --d_activation linear
 ```
 
+**Want a lean smoke test?** You can keep the full pipeline available while avoiding the slowest extras:
+
+```bash
+python run_experiment.py \
+  --csv src/rgan/Binance_Data.csv \
+  --target index_value \
+  --time_col calc_time \
+  --results_dir results_quick \
+  --epochs 5 \
+  --gan_variant wgan-gp \
+  --skip_classical \
+  --curve_steps 0 \
+  --noise_levels 0 \
+  --bootstrap_samples 0
+```
+
 ### 4. View Results in Dashboard
 
 The dashboard is a standalone application. You can run it once and use it to view results from any experiment by uploading the generated `metrics.json` file.
@@ -160,6 +176,14 @@ Interactive counterparts share the same filenames suffixed by `_interactive.html
 ---
 
 ## Troubleshooting & Tips
+
+**Resource hotspots (optional features you can turn off when speed matters):**
+
+- Classical baselines (ARIMA/ARMA/tree ensemble) can dominate startup on long series. Disable with `--skip_classical`.
+- Hyperparameter sweeps via `--tune` launch multiple full trainings. Leave disabled unless exploring the search space.
+- Learning curves (`--curve_steps > 0`) retrain on growing subsets. Set `--curve_steps 0` for single-pass runs.
+- Noise robustness (`--noise_levels` with multiple values) repeats evaluation per noise level. Use a single value (e.g., `0`).
+- Bootstrap confidence intervals (`--bootstrap_samples 300` by default) repeatedly resample metrics. Set `--bootstrap_samples 0` to skip.
 
 - **Rich styling errors:** The console now degrades gracefully if `rich` lacks gradient support, but ensure `rich>=13` for the full experience (`pip install --upgrade rich`).
 - **Slow CPU training:** Reduce `--epochs`, disable learning curves (`--curve_steps 0`), and set DataLoader flags for single-process loading (`--num_workers 0 --persistent_workers false --pin_memory false`).
