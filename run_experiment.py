@@ -36,7 +36,6 @@ from src.rgan.baselines import (
     arima_forecast,
     arma_forecast,
     tree_ensemble_forecast,
-    classical_curves_vs_samples,
 )
 from src.rgan.data import (
     load_csv_series,
@@ -49,8 +48,6 @@ from src.rgan.plots import (
     plot_single_train_test,
     plot_constant_train_test,
     plot_compare_models_bars,
-    plot_classical_curves,
-    plot_learning_curves,
     create_error_metrics_table,
 )
 from src.rgan.tune import tune_rgan
@@ -90,10 +87,6 @@ def describe_resource_heavy_steps(args: argparse.Namespace, console) -> None:
     if args.tune:
         heavy_steps.append(
             "Hyperparameter sweep (--tune) runs multiple R-GAN fits; expect extended runtime."
-        )
-    if args.curve_steps > 0:
-        heavy_steps.append(
-            "Learning-curve resampling (--curve_steps) trains several models on growing subsets."
         )
     noise_levels = parse_noise_levels(str(args.noise_levels))
     if len(noise_levels) > 1:
@@ -206,178 +199,6 @@ def parse_noise_levels(spec: str) -> np.ndarray:
     return np.array(sorted(set(values)), dtype=float)
 
 
-def compute_learning_curves(
-    args: argparse.Namespace,
-    base_config: TrainConfig,
-    Xfull_tr: np.ndarray,
-    Yfull_tr: np.ndarray,
-    Xte: np.ndarray,
-    Yte: np.ndarray,
-    n_features: int,
-) -> Tuple[List[int], Dict[str, List[float]], Dict[str, List[float]]]:
-    if args.curve_steps <= 0:
-        return [], {}, {}
-
-    total = len(Xfull_tr)
-    if total < 2:
-        return [], {}, {}
-
-    min_size = max(int(args.curve_min_frac * total), 5)
-    if args.curve_steps == 1:
-        sizes = np.array([total], dtype=int)
-    else:
-        sizes = np.linspace(min_size, total, args.curve_steps, dtype=int)
-    sizes = np.clip(sizes, 2, total)
-    sizes = np.unique(sizes)
-
-    curves_mean = {
-        "R-GAN": [],
-        "LSTM": [],
-        "Tree Ensemble": [],
-        "Naïve Baseline": [],
-        "ARIMA": [],
-        "ARMA": [],
-    }
-    curves_std = {key: [] for key in curves_mean}
-    used_sizes = []
-
-    rng = np.random.default_rng(args.seed)
-    naive_test_stats, _ = naive_baseline(Xte, Yte)
-
-    from src.rgan.models_torch import (
-        build_generator as build_generator_backend,
-        build_discriminator as build_discriminator_backend,
-    )
-    from src.rgan.rgan_torch import train_rgan_torch as train_rgan_backend
-    from src.rgan.lstm_supervised_torch import train_lstm_supervised_torch as train_lstm_backend
-
-    repeats = max(1, getattr(args, "curve_repeats", 1))
-
-    for size in sizes:
-        if size < 2:
-            continue
-        if size > total:
-            continue
-
-        rmse_acc = {key: [] for key in curves_mean}
-
-        for rep in range(repeats):
-            if size == total:
-                selection = np.arange(total)
-            else:
-                selection = rng.choice(total, size=size, replace=False)
-
-            Xsubset = Xfull_tr[selection]
-            Ysubset = Yfull_tr[selection]
-
-            try:
-                sub_split = split_windows_for_training(
-                    Xsubset,
-                    Ysubset,
-                    val_fraction=args.val_frac,
-                    eval_fraction=0.0,
-                    shuffle=True,
-                    rng=rng,
-                )
-            except ValueError:
-                continue
-
-            data_splits = {
-                "Xtr": sub_split["X_train"],
-                "Ytr": sub_split["Y_train"],
-                "Xval": sub_split["X_val"],
-                "Yval": sub_split["Y_val"],
-                "Xte": Xte,
-                "Yte": Yte,
-            }
-
-            # Create a copy of base_config for this curve point
-            # Since TrainConfig is a dataclass, we can use replace or just create new
-            import dataclasses
-            curve_config = dataclasses.replace(base_config)
-            curve_config.epochs = max(1, min(base_config.epochs, args.curve_epochs))
-            curve_config.patience = min(curve_config.patience, curve_config.epochs)
-
-            set_seed(args.seed + rep)
-
-            # Build models
-            # Note: We need to pass args manually to build functions or update them to take config
-            # Assuming build functions still take kwargs
-            
-            G_curve = build_generator_backend(
-                L=base_config.L,
-                H=base_config.H,
-                n_in=n_features,
-                units=curve_config.units_g,
-                dropout=curve_config.dropout,
-                num_layers=curve_config.g_layers,
-                dense_activation=curve_config.g_dense_activation,
-                layer_norm=(curve_config.gan_variant == "wgan-gp"),
-            )
-            D_curve = build_discriminator_backend(
-                L=base_config.L,
-                H=base_config.H,
-                units=curve_config.units_d,
-                dropout=curve_config.dropout,
-                num_layers=curve_config.d_layers,
-                activation=curve_config.d_activation,
-                layer_norm=(curve_config.gan_variant == "wgan-gp"),
-                use_spectral_norm=(curve_config.gan_variant == "wgan-gp"),
-            )
-            
-            rgan_curve_out = train_rgan_backend(
-                curve_config,
-                (G_curve, D_curve),
-                data_splits,
-                str(args.results_dir),
-                tag=f"rgan_curve_{size}_{rep}",
-            )
-            lstm_curve_out = train_lstm_backend(
-                curve_config,
-                data_splits,
-                str(args.results_dir),
-                tag=f"lstm_curve_{size}_{rep}",
-            )
-
-            rmse_acc["R-GAN"].append(rgan_curve_out["test_stats"]["rmse"])
-            rmse_acc["LSTM"].append(lstm_curve_out["test_stats"]["rmse"])
-
-            rmse_acc["Naïve Baseline"].append(naive_test_stats["rmse"])
-            
-            arima_stats, _ = arima_forecast(
-                sub_split["X_train"], sub_split["Y_train"], Xte, Yte
-            )
-            rmse_acc["ARIMA"].append(arima_stats["rmse"])
-            
-            arma_stats, _ = arma_forecast(
-                sub_split["X_train"], sub_split["Y_train"], Xte, Yte
-            )
-            rmse_acc["ARMA"].append(arma_stats["rmse"])
-            tree_stats, _ = tree_ensemble_forecast(
-                sub_split["X_train"],
-                sub_split["Y_train"],
-                Xte,
-                Yte,
-                random_state=args.seed + rep,
-            )
-            rmse_acc["Tree Ensemble"].append(tree_stats["rmse"])
-
-        if not any(rmse_acc[key] for key in rmse_acc):
-            continue
-
-        used_sizes.append(int(size))
-        for key in curves_mean:
-            values = rmse_acc[key]
-            if values:
-                curves_mean[key].append(float(np.mean(values)))
-                curves_std[key].append(float(np.std(values, ddof=1)) if len(values) > 1 else 0.0)
-            else:
-                curves_mean[key].append(float("nan"))
-                curves_std[key].append(float("nan"))
-
-    return used_sizes, curves_mean, curves_std
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
@@ -484,15 +305,6 @@ def main():
         default=0.1,
         help="Additional fraction of the training windows reserved as a tuning-only hold-out set.",
     )
-    ap.add_argument("--curve_steps", type=int, default=0)
-    ap.add_argument("--curve_min_frac", type=float, default=0.4)
-    ap.add_argument("--curve_epochs", type=int, default=40)
-    ap.add_argument(
-        "--curve_repeats",
-        type=int,
-        default=3,
-        help="Number of resampled runs per learning-curve point for variance estimation.",
-    )
     # Torch runtime knobs
     ap.add_argument("--amp", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
                     help="Enable automatic mixed precision for PyTorch training")
@@ -521,9 +333,8 @@ def main():
         "--skip_classical",
         action="store_true",
         help=(
-            "Skip slow classical baselines (ARIMA/ARMA/tree ensemble) and the classical "
-            "error curves. Useful for quick smoke tests or when you only care about the "
-            "neural models."
+            "Skip slow classical baselines (ARIMA/ARMA/tree ensemble). Useful for quick "
+            "smoke tests or when you only care about the neural models."
         ),
     )
     ap.add_argument(
@@ -1067,18 +878,6 @@ def main():
                 "random_state": args.seed,
             }
 
-    learning_sizes, learning_curve_values, learning_curve_stds = compute_learning_curves(
-        args, base_config, Xfull_tr, Yfull_tr, Xte, Yte, Xtr.shape[-1]
-    )
-    learning_curve_artifacts = None
-    if learning_sizes:
-        learning_curve_artifacts = plot_learning_curves(
-            learning_sizes,
-            learning_curve_values,
-            results_dir / "ml_error_vs_samples.png",
-            curve_stds=learning_curve_stds,
-        )
-
     _, rgan_train_pred = compute_metrics_backend(rgan_out["G"], Xtr, Ytr)
     rgan_train_stats = summarise_with_uncertainty(
         Ytr,
@@ -1126,19 +925,9 @@ def main():
     lstm_out["train_stats"] = lstm_train_stats
     lstm_out["test_stats"] = lstm_test_stats
 
-    if args.skip_classical:
-        class_curve_artifacts = None
-        ets_rmse_full = float("nan")
-        arima_rmse_full = float("nan")
-    else:
-        sizes, ets_curve, arima_curve = classical_curves_vs_samples(prep["train_df"][target_col].values, prep["test_df"][target_col].values, min_frac=0.3, steps=6)
-        class_curve_artifacts = (
-            plot_classical_curves(sizes, ets_curve, arima_curve, results_dir / "classical_error_vs_samples.png")
-            if sizes is not None
-            else None
-        )
-        ets_rmse_full = float(np.nan if ets_curve is None else ets_curve[-1])
-        arima_rmse_full = float(np.nan if arima_curve is None else arima_curve[-1])
+    class_curve_artifacts = None
+    ets_rmse_full = float("nan")
+    arima_rmse_full = float("nan")
 
     # Noise robustness across multiple perturbation levels
     noise_results = []
@@ -1406,14 +1195,6 @@ def main():
     }
     lstm_architecture = describe_model(lstm_out["model"])
 
-    learning_curves_serializable = {
-        "means": {k: [float(v) for v in vals] for k, vals in learning_curve_values.items()},
-        "stds": {
-            k: [float(v) for v in learning_curve_stds.get(k, [0.0] * len(learning_curve_values.get(k, [])))]
-            for k in learning_curve_values
-        },
-    }
-
     packages = {}
     for pkg in ("numpy", "pandas", "torch", "scikit-learn"):
         module_name = pkg.replace("-", "_")
@@ -1526,14 +1307,8 @@ def main():
         classical=dict(
             ets_rmse_full=ets_rmse_full,
             arima_rmse_full=arima_rmse_full,
-            curves=class_curve_artifacts["static"] if class_curve_artifacts else "",
-            curves_interactive=class_curve_artifacts.get("interactive", "") if class_curve_artifacts else "",
-        ),
-        learning_curves=dict(
-            sizes=[int(s) for s in learning_sizes],
-            curves=learning_curves_serializable,
-            plot=learning_curve_artifacts["static"] if learning_curve_artifacts else "",
-            plot_interactive=learning_curve_artifacts.get("interactive", "") if learning_curve_artifacts else "",
+            curves="",
+            curves_interactive="",
         ),
         advanced_metrics=advanced_metrics_summary,
         statistical_tests=dict(diebold_mariano=dm_results),
