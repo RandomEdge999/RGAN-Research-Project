@@ -1,16 +1,50 @@
-# React + Vite
+# RGAN Analytics Terminal
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A professional React dashboard for visualizing R-GAN experiment results. Features a premium "Trading Terminal" aesthetic designed for financial time-series analysis.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **React 18** with Vite for fast development
+- **Recharts** for interactive charts
+- **Lucide Icons** for modern iconography
+- **react-dropzone** for file upload handling
+- **Vanilla CSS** with CSS variables for theming
 
-## React Compiler
+## Quick Start
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+# Install dependencies
+npm install
 
-## Expanding the ESLint configuration
+# Start development server
+npm run dev
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+# Build for production
+npm run build
+```
+
+## Usage
+
+1. Run an experiment using `run_experiment.py` to generate a `metrics.json` file
+2. Start the dashboard with `npm run dev`
+3. Open `http://localhost:5173` in your browser
+4. Drag and drop your `metrics.json` file into the upload area
+
+## Features
+
+- **Performance Summary** – Key KPIs including best RMSE and baseline comparison
+- **Detailed Metrics Table** – RMSE, MAE, sMAPE, MASE for all models
+- **Original Scale Metrics** – Unscaled error values for real-world interpretation
+- **Training Dynamics** – Interactive D/G loss and validation RMSE curves
+- **Noise Robustness Analysis** – Model performance across noise perturbation levels
+- **Statistical Confidence** – 95% bootstrap confidence intervals
+
+## File Structure
+
+```
+src/
+├── App.jsx          # Root component
+├── Dashboard.jsx    # Main dashboard component
+├── index.css        # Trading terminal theme styles
+└── main.jsx         # Entry point
+```
