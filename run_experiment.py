@@ -339,7 +339,7 @@ def main():
     ap.add_argument("--lambda_reg", type=float, default=0.1)
     ap.add_argument(
         "--gan_variant",
-        choices=["standard", "wgan-gp"],
+        choices=["standard", "wgan", "wgan-gp"],
         default="standard",
         help="Adversarial loss variant (standard BCE or Wasserstein with GP).",
     )
@@ -357,6 +357,12 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=5.0)
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument(
+        "--wgan_clip_value",
+        type=float,
+        default=0.01,
+        help="Weight-clipping magnitude for vanilla WGAN training.",
+    )
     ap.add_argument(
         "--supervised_warmup_epochs",
         type=int,
@@ -638,6 +644,8 @@ def main():
         ema_decay=args.ema_decay,
         use_logits=args.use_logits,
         track_discriminator_outputs=True,
+        strict_device=args.require_cuda,
+        wgan_clip_value=args.wgan_clip_value,
     )
 
     print_kv_table(console, "Configuration", {
