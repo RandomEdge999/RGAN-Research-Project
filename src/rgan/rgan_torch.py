@@ -274,7 +274,16 @@ def train_rgan_torch(
 
     default_d_steps = 5 if gan_variant in {"wgan", "wgan-gp"} else 1
     d_steps = max(1, config.d_steps)
+    if gan_variant in {"wgan", "wgan-gp"} and config.d_steps <= 1:
+        d_steps = default_d_steps
+        console.log(
+            f"[R-GAN Torch] Using {d_steps} discriminator steps per batch for {gan_variant.upper()} stability."
+        )
     g_steps = max(1, config.g_steps)
+    eval_batch_size = max(1, int(config.eval_batch_size))
+    config.d_steps = d_steps
+    config.g_steps = g_steps
+    config.eval_batch_size = eval_batch_size
     warmup_epochs = max(0, config.supervised_warmup_epochs)
     patience = config.patience
     
@@ -369,10 +378,9 @@ def train_rgan_torch(
         hist["D_fake_mean"] = []
 
     num_workers = config.num_workers
-    # Optimization: Increase prefetch factor for high-end GPUs
-    prefetch_factor = 4 
-    persistent_workers = (num_workers > 0)
-    pin_memory = (device.type == "cuda")
+    prefetch_factor = max(1, config.prefetch_factor)
+    persistent_workers = bool(config.persistent_workers and num_workers > 0)
+    pin_memory = bool(config.pin_memory and device.type == "cuda")
 
     train_ds = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(Ytr))
 
@@ -386,7 +394,7 @@ def train_rgan_torch(
             persistent_workers=persistent_workers,
         )
         if num_workers > 0:
-            kwargs["prefetch_factor"] = max(1, prefetch_factor)
+            kwargs["prefetch_factor"] = prefetch_factor
         return DataLoader(train_ds, **kwargs)
 
     train_loader = make_loader(current_batch_size)
@@ -569,10 +577,7 @@ def train_rgan_torch(
                 hist["D_real_mean"].append(float(np.mean(epoch_D_real) if epoch_D_real else 0.0))
                 hist["D_fake_mean"].append(float(np.mean(epoch_D_fake) if epoch_D_fake else 0.0))
 
-            # Use eval_batch_size from config if present, else default to batch_size
-            # Since we don't have eval_batch_size in TrainConfig yet, we'll just use batch_size
-            # or add it to TrainConfig. Let's assume batch_size for now or hardcode 512 cap.
-            eval_bs = max(1, min(512, current_batch_size))
+            eval_bs = max(1, min(config.eval_batch_size, current_batch_size))
 
             if use_ema and ema_shadow is not None:
                 backup = _swap_params_with_shadow(G, ema_shadow)
@@ -617,7 +622,7 @@ def train_rgan_torch(
     else:
         G_ema = None
 
-    eval_bs = max(1, min(512, current_batch_size))
+    eval_bs = max(1, min(config.eval_batch_size, current_batch_size))
     eval_model = G_ema or G
     train_stats, _ = compute_metrics(eval_model, Xtr, Ytr, batch_size=eval_bs)
     test_stats, Y_pred = compute_metrics(eval_model, Xte, Yte, batch_size=eval_bs)
