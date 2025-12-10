@@ -101,6 +101,8 @@ class TrainConfig:
     use_logits: bool = False
     track_discriminator_outputs: bool = True
     amp: bool = True
+    strict_device: bool = False
+    wgan_clip_value: float = 0.01
     
     def __post_init__(self):
         if self.lambda_reg_start is None:
