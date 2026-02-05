@@ -677,6 +677,12 @@ def main():
             tag="rgan"
         )
 
+        # Save trained RGAN generator for use in augmentation experiments
+        import torch
+        rgan_model_path = results_dir / "rgan_model.pt"
+        torch.save(rgan_out["G"].state_dict(), rgan_model_path)
+        console.log(f"✓ Saved RGAN generator to: {rgan_model_path}")
+
     with log_phase(console, "Train supervised LSTM baseline"):
         lstm_out = train_lstm_backend(
             base_config,
