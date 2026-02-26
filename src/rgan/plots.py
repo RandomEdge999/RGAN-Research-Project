@@ -394,6 +394,107 @@ def create_error_metrics_table(model_results: dict, out_path: str = None):
     return df
 
 
+def plot_predictions(predictions_dict: Dict[str, np.ndarray], save_path: str, n_samples: int = 4):
+    """
+    Plot ground truth vs model predictions for a few samples.
+    
+    Args:
+        predictions_dict: Dictionary {model_name: predictions_array}
+                          predictions_array shape: (N, H, 1) or (N, H)
+        save_path: Path to save the plot (without extension)
+        n_samples: Number of samples to plot
+    """
+    if not predictions_dict:
+        return
+
+    # keys = list(predictions_dict.keys())
+    # num_models = len(keys)
+    
+    # Get ground truth if available for reference
+    truth = predictions_dict.get('True')
+    
+    # Check available samples
+    available_samples = 0
+    for k, v in predictions_dict.items():
+        if v is not None:
+            available_samples = len(v)
+            break
+            
+    n_samples = min(n_samples, available_samples)
+    if n_samples <= 0:
+        return
+
+    # Create figure
+    fig, axes = plt.subplots(n_samples, 1, figsize=(10, 3 * n_samples), sharex=True)
+    if n_samples == 1:
+        axes = [axes]
+    
+    for i in range(n_samples):
+        ax = axes[i]
+        for model_name, preds in predictions_dict.items():
+            if preds is None:
+                continue
+            
+            # Handle shapes (N, H, 1) or (N, H)
+            try:
+                if len(preds) <= i: continue
+                y = preds[i].flatten()
+            except:
+                continue
+            
+            style = '-'
+            alpha = 0.7
+            width = 1.5
+            color = None
+            
+            if model_name == 'True':
+                style = 'k-'
+                alpha = 1.0
+                width = 2.0
+                label = 'Ground Truth'
+            else:
+                label = model_name
+                
+            ax.plot(y, style, label=label, alpha=alpha, linewidth=width)
+            
+        ax.set_title(f"Sample {i}")
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.legend()
+            
+    plt.tight_layout()
+    _finalise_static(fig, Path(save_path))
+    
+    # Interactive plot if possible
+    if _HAS_PLOTLY:
+        try:
+            fig_go = make_subplots(rows=n_samples, cols=1, subplot_titles=[f"Sample {i}" for i in range(n_samples)])
+            
+            for i in range(n_samples):
+                for model_name, preds in predictions_dict.items():
+                    if preds is None:
+                        continue
+                    try:
+                        if len(preds) <= i: continue
+                        y = preds[i].flatten()
+                    except: continue
+
+                    line_dict = dict(width=2)
+                    if model_name == 'True':
+                        line_dict['color'] = 'black'
+                        line_dict['dash'] = 'solid'
+                    
+                    fig_go.add_trace(
+                        go.Scatter(y=y, mode='lines', name=model_name if i == 0 else None,
+                                  line=line_dict, showlegend=(i==0)),
+                        row=i+1, col=1
+                    )
+            
+            fig_go.update_layout(height=300*n_samples, title_text="Predictions Comparison")
+            _write_interactive(fig_go, Path(save_path))
+        except Exception:
+            pass
+
 
 
 

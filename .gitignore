@@ -37,7 +37,8 @@ web_dashboard/dist/
 web_dashboard/.env
 
 # Project Specific
-results_*/
+results/
+data/
 *.csv
 !src/rgan/small_data.csv
 !src/rgan/Binance_Data.csv

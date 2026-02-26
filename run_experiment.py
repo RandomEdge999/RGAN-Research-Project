@@ -48,6 +48,7 @@ from src.rgan.plots import (
     plot_single_train_test,
     plot_constant_train_test,
     plot_compare_models_bars,
+    plot_predictions,
     create_error_metrics_table,
 )
 from src.rgan.tune import tune_rgan
@@ -348,7 +349,7 @@ def main():
         help="Exit immediately if CUDA is unavailable (helpful when you expect to use a GPU).",
     )
     ap.add_argument("--tune_csv", default="")
-    ap.add_argument("--results_dir", default="./results")
+    ap.add_argument("--results_dir", default="./results/experiment")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gpu_id", type=int, default=0, help="ID of the GPU to use (default: 0).")
     args = ap.parse_args()
@@ -1022,18 +1023,21 @@ def main():
             training_series_orig=training_series_orig,
         )
 
-        tree_noisy_flat = tree_model.predict(Xte_noisy.reshape(Xte_noisy.shape[0], -1)).astype(np.float32)
-        tree_noisy_pred = tree_noisy_flat.reshape(Xte_noisy.shape[0], horizon, 1)
-        tree_noise_summary = summarise_with_uncertainty(
-            Yte,
-            tree_noisy_pred,
-            n_bootstrap=args.bootstrap_samples,
-            seed=args.seed + idx,
-            original_mean=target_mean,
-            original_std=target_std,
-            training_series=training_series_scaled,
-            training_series_orig=training_series_orig,
-        )
+        if "tree_model" in locals() and tree_model is not None:
+            tree_noisy_flat = tree_model.predict(Xte_noisy.reshape(Xte_noisy.shape[0], -1)).astype(np.float32)
+            tree_noisy_pred = tree_noisy_flat.reshape(Xte_noisy.shape[0], horizon, 1)
+            tree_noise_summary = summarise_with_uncertainty(
+                Yte,
+                tree_noisy_pred,
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed + idx,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
+            )
+        else:
+            tree_noise_summary = {}
 
         noise_results.append(
             {
@@ -1140,14 +1144,38 @@ def main():
             )
     print("="*80)
 
+    # Plot predictions
+    print("Visualizing predictions...")
+    
+    predictions_dict = {
+        "True": Yte,
+        "R-GAN": rgan_out['pred_test'],
+        "LSTM (Supervised)": lstm_out['pred_test']
+    }
+    
+    if "tree_test_pred" in locals() and tree_test_pred is not None:
+         predictions_dict["Tree Ensemble"] = tree_test_pred
+    if "arima_test_pred" in locals() and arima_test_pred is not None:
+         predictions_dict["ARIMA"] = arima_test_pred
+    if "arma_test_pred" in locals() and arma_test_pred is not None:
+         predictions_dict["ARMA"] = arma_test_pred
+
+    plot_predictions(
+        predictions_dict,
+        save_path=os.path.join(args.results_dir, "predictions_comparison")
+    )
+
     predictions_test = {
         "R-GAN": rgan_out["pred_test"],
         "LSTM": lstm_out["pred_test"],
-        "Tree Ensemble": tree_test_pred,
         "Naïve Baseline": naive_test_pred,
-        "ARIMA": arima_test_pred,
-        "ARMA": arma_test_pred,
     }
+    if "tree_test_pred" in locals() and tree_test_pred is not None:
+         predictions_test["Tree Ensemble"] = tree_test_pred
+    if "arima_test_pred" in locals() and arima_test_pred is not None:
+         predictions_test["ARIMA"] = arima_test_pred
+    if "arma_test_pred" in locals() and arma_test_pred is not None:
+         predictions_test["ARMA"] = arma_test_pred
     actual_test_orig_flat = (Yte.reshape(-1) * target_std) + target_mean
     preds_orig_flat = {
         name: (np.asarray(pred).reshape(-1) * target_std) + target_mean for name, pred in predictions_test.items()
