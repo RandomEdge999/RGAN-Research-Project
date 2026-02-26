@@ -180,51 +180,64 @@ def _extract_time_series_features(samples):
     return np.array(features_list)
 
 
-def discrimination_score(real_samples, fake_samples, n_folds=5):
+def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
     """
-    Train binary classifier to distinguish real from synthetic sequences.
-
-    Returns classification metrics that indicate how easily real vs fake can be distinguished.
-    High scores suggest synthetic data is very different from real (quality issue).
-    Low scores suggest synthetic data is similar to real (good quality).
-
+    Train multiple binary classifiers (RF, SVM, MLP) to distinguish real from synthetic.
+    
     Args:
-        real_samples: np.ndarray of shape (n_samples, sequence_length, features) or (n_samples, sequence_length)
-        fake_samples: np.ndarray of same shape as real_samples
-        n_folds: int, number of cross-validation folds
-
+        real_samples: np.ndarray
+        fake_samples: np.ndarray
+        n_folds: int
+        
     Returns:
         dict: {
-            'accuracy': float,
-            'f1': float,
-            'precision': float,
-            'recall': float
+            'Random Forest': {metrics},
+            'SVM (RBF)': {metrics},
+            'MLP': {metrics}
         }
     """
-    # Extract features
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import make_pipeline
+    
+    # Extract feature
     real_features = _extract_time_series_features(real_samples)
     fake_features = _extract_time_series_features(fake_samples)
-
-    # Create dataset with labels (0 = real, 1 = fake)
+    
     X = np.vstack([real_features, fake_features])
     y = np.hstack([np.zeros(len(real_features)), np.ones(len(fake_features))])
-
-    # Train classifier with cross-validation
-    clf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-    y_pred = cross_val_predict(clf, X, y, cv=min(n_folds, len(X) // 2))
-
-    # Calculate metrics
-    accuracy = float(accuracy_score(y, y_pred))
-    f1 = float(f1_score(y, y_pred, zero_division=0))
-    precision = float(precision_score(y, y_pred, zero_division=0))
-    recall = float(recall_score(y, y_pred, zero_division=0))
-
-    return {
-        'accuracy': accuracy,
-        'f1': f1,
-        'precision': precision,
-        'recall': recall
+    
+    classifiers = {
+        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
+        'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=42)),
+        'MLP': make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42))
     }
+    
+    results = {}
+    
+    for name, clf in classifiers.items():
+        try:
+            # Cross-validation
+            y_pred = cross_val_predict(clf, X, y, cv=min(n_folds, len(X) // 2))
+            
+            results[name] = {
+                'accuracy': float(accuracy_score(y, y_pred)),
+                'f1': float(f1_score(y, y_pred, zero_division=0)),
+                'precision': float(precision_score(y, y_pred, zero_division=0)),
+                'recall': float(recall_score(y, y_pred, zero_division=0))
+            }
+        except Exception as e:
+            print(f"Classifier {name} failed: {e}")
+            results[name] = {'accuracy': 0, 'f1': 0, 'precision': 0, 'recall': 0}
+            
+    return results
+
+
+def discrimination_score(real_samples, fake_samples, n_folds=5):
+    """Legacy wrapper for backward compatibility."""
+    res = evaluate_discriminators(real_samples, fake_samples, n_folds)
+    return res.get('Random Forest', {})
 
 
 # ============================================================================
