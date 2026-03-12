@@ -16,30 +16,59 @@ import pandas as pd
 # ── Dataset registry ────────────────────────────────────────────────
 # Split sizes follow the TSLib convention exactly:
 #   ETTh*: 12 months train / 4 months val / 4 months test (hourly)
-#   Weather, Exchange: 70 / 10 / 20 ratio split
+#   ETTm*: same ratio but 15-min granularity (4× more data points)
+#   Weather, Exchange, ECL, Traffic, ILI: 70 / 10 / 20 ratio split
 #
 # ``hf_name`` is the config name passed to ``datasets.load_dataset``.
 
 TSLIB_DATASETS: Dict[str, dict] = {
+    # ── ETT family (Electricity Transformer Temperature) ────────────
     "ETTh1": {
         "hf_name": "ETTh1",
         "target": "OT",
-        "split": (8640, 2880, 2880),
+        "split": (8640, 2880, 2880),       # 14,400 rows, hourly
     },
     "ETTh2": {
         "hf_name": "ETTh2",
         "target": "OT",
-        "split": (8640, 2880, 2880),
+        "split": (8640, 2880, 2880),       # 14,400 rows, hourly
     },
+    "ETTm1": {
+        "hf_name": "ETTm1",
+        "target": "OT",
+        "split": (34560, 11520, 11520),    # 57,600 rows, 15-min
+    },
+    "ETTm2": {
+        "hf_name": "ETTm2",
+        "target": "OT",
+        "split": (34560, 11520, 11520),    # 57,600 rows, 15-min
+    },
+    # ── Large multivariate benchmarks ───────────────────────────────
     "Weather": {
         "hf_name": "weather",
         "target": "OT",
-        "split_ratio": (0.7, 0.1, 0.2),
+        "split_ratio": (0.7, 0.1, 0.2),   # ~52,696 rows, 21 features
     },
     "Exchange": {
         "hf_name": "exchange_rate",
         "target": "OT",
-        "split_ratio": (0.7, 0.1, 0.2),
+        "split_ratio": (0.7, 0.1, 0.2),   # ~7,588 rows, 8 currencies
+    },
+    "ECL": {
+        "hf_name": "electricity",
+        "target": "OT",
+        "split_ratio": (0.7, 0.1, 0.2),   # ~26,304 rows, 321 clients
+    },
+    "Traffic": {
+        "hf_name": "traffic",
+        "target": "OT",
+        "split_ratio": (0.7, 0.1, 0.2),   # ~17,544 rows, 862 sensors
+    },
+    # ── Domain-specific ─────────────────────────────────────────────
+    "ILI": {
+        "hf_name": "national_illness",
+        "target": "OT",
+        "split_ratio": (0.7, 0.1, 0.2),   # ~966 rows, 7 features
     },
 }
 

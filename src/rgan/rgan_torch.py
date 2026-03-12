@@ -1,5 +1,8 @@
 import copy
+import dataclasses
+import os
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Any, Union
 
 import numpy as np
@@ -207,6 +210,93 @@ def _swap_params_with_shadow(
     return backup
 
 
+def _save_checkpoint(
+    path: Path,
+    epoch: int,
+    G: nn.Module,
+    D: nn.Module,
+    optG: torch.optim.Optimizer,
+    optD: torch.optim.Optimizer,
+    scaler_G: Any,
+    scaler_D: Any,
+    best_val: float,
+    best_state: Optional[Dict[str, torch.Tensor]],
+    bad_epochs: int,
+    history: Dict[str, List[float]],
+    ema_shadow: Optional[Dict[str, torch.Tensor]],
+    current_batch_size: int,
+    config: TrainConfig,
+) -> None:
+    """Save a complete training checkpoint to disk."""
+    ckpt = {
+        "epoch": epoch,
+        "G_state_dict": G.state_dict(),
+        "D_state_dict": D.state_dict(),
+        "optG_state_dict": optG.state_dict(),
+        "optD_state_dict": optD.state_dict(),
+        "best_val": best_val,
+        "best_state": best_state,
+        "bad_epochs": bad_epochs,
+        "history": history,
+        "ema_shadow": ema_shadow,
+        "current_batch_size": current_batch_size,
+        "config_dict": dataclasses.asdict(config),
+    }
+    # Save scaler state only if they have real state (not _IdentityScaler)
+    if hasattr(scaler_G, "state_dict") and not isinstance(scaler_G, _IdentityScaler):
+        ckpt["scaler_G_state_dict"] = scaler_G.state_dict()
+    if hasattr(scaler_D, "state_dict") and not isinstance(scaler_D, _IdentityScaler):
+        ckpt["scaler_D_state_dict"] = scaler_D.state_dict()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a temp file then rename for atomicity
+    tmp_path = path.with_suffix(".tmp")
+    torch.save(ckpt, tmp_path)
+    tmp_path.rename(path)
+
+
+def _load_checkpoint(
+    path: Path,
+    G: nn.Module,
+    D: nn.Module,
+    optG: torch.optim.Optimizer,
+    optD: torch.optim.Optimizer,
+    scaler_G: Any,
+    scaler_D: Any,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Load a training checkpoint and restore all state.
+
+    Returns a dict with: epoch, best_val, best_state, bad_epochs, history,
+    ema_shadow, current_batch_size.
+    """
+    console = get_console()
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    G.load_state_dict(ckpt["G_state_dict"])
+    D.load_state_dict(ckpt["D_state_dict"])
+    optG.load_state_dict(ckpt["optG_state_dict"])
+    optD.load_state_dict(ckpt["optD_state_dict"])
+
+    if "scaler_G_state_dict" in ckpt and not isinstance(scaler_G, _IdentityScaler):
+        scaler_G.load_state_dict(ckpt["scaler_G_state_dict"])
+    if "scaler_D_state_dict" in ckpt and not isinstance(scaler_D, _IdentityScaler):
+        scaler_D.load_state_dict(ckpt["scaler_D_state_dict"])
+
+    console.print(
+        f"[green]Resumed from checkpoint:[/green] epoch {ckpt['epoch']}, "
+        f"best_val={ckpt['best_val']:.6f}"
+    )
+    return {
+        "epoch": ckpt["epoch"],
+        "best_val": ckpt["best_val"],
+        "best_state": ckpt["best_state"],
+        "bad_epochs": ckpt["bad_epochs"],
+        "history": ckpt["history"],
+        "ema_shadow": ckpt.get("ema_shadow"),
+        "current_batch_size": ckpt.get("current_batch_size", 64),
+    }
+
+
 def train_rgan_torch(
     config: TrainConfig,
     models: Tuple[nn.Module, nn.Module],
@@ -258,8 +348,8 @@ def train_rgan_torch(
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
     Xte, Yte = data_splits["Xte"], data_splits["Yte"]
 
-    optG = torch.optim.Adam(G.parameters(), lr=config.lr_g)
-    optD = torch.optim.Adam(D.parameters(), lr=config.lr_d)
+    optG = torch.optim.Adam(G.parameters(), lr=config.lr_g, weight_decay=config.weight_decay)
+    optD = torch.optim.Adam(D.parameters(), lr=config.lr_d, weight_decay=config.weight_decay)
     mse = nn.MSELoss()
 
     use_logits = config.use_logits
@@ -331,7 +421,7 @@ def train_rgan_torch(
         targets_fp32 = targets if targets.dtype == torch.float32 else targets.float()
         
         if device.type == "cuda":
-            with AMP.autocast("cuda", enabled=False):
+            with AMP.autocast(device.type, enabled=False):
                 return bce_loss(inputs_fp32, targets_fp32)
         return bce_loss(inputs_fp32, targets_fp32)
 
@@ -356,6 +446,7 @@ def train_rgan_torch(
     best_val = float("inf")
     best_state = None
     bad_epochs = 0
+    start_epoch = 1
 
     use_ema = 0.0 < ema_decay < 1.0
     ema_shadow: Optional[Dict[str, torch.Tensor]] = _init_ema(G) if use_ema else None
@@ -376,6 +467,20 @@ def train_rgan_torch(
     if track_logits:
         hist["D_real_mean"] = []
         hist["D_fake_mean"] = []
+
+    # --- Checkpoint resume ---
+    if config.resume_from and os.path.isfile(config.resume_from):
+        restored = _load_checkpoint(
+            Path(config.resume_from), G, D, optG, optD, scaler_G, scaler_D, device
+        )
+        start_epoch = restored["epoch"] + 1
+        best_val = restored["best_val"]
+        best_state = restored["best_state"]
+        bad_epochs = restored["bad_epochs"]
+        hist = restored["history"]
+        if restored["ema_shadow"] is not None:
+            ema_shadow = restored["ema_shadow"]
+        current_batch_size = restored["current_batch_size"]
 
     num_workers = config.num_workers
     prefetch_factor = max(1, config.prefetch_factor)
@@ -400,7 +505,9 @@ def train_rgan_torch(
     train_loader = make_loader(current_batch_size)
 
     with epoch_progress(config.epochs, description="R-GAN (Torch)") as (progress, task_id):
-        for epoch in range(1, config.epochs + 1):
+        if start_epoch > 1:
+            progress.update(task_id, completed=start_epoch - 1)
+        for epoch in range(start_epoch, config.epochs + 1):
             supervised_only = epoch <= warmup_epochs
             lambda_reg = lambda_reg_end
             if lambda_reg_warmup > 1:
@@ -432,12 +539,12 @@ def train_rgan_torch(
                             for _ in range(d_steps):
                                 optD.zero_grad(set_to_none=True)
                                 with torch.no_grad():
-                                    with AMP.autocast("cuda", enabled=amp_enabled):
+                                    with AMP.autocast(device.type, enabled=amp_enabled):
                                         Y_fake_detached = G(Xb)
                                 if Y_fake_detached.dtype != target_series.dtype:
                                     Y_fake_detached = Y_fake_detached.to(dtype=target_series.dtype)
 
-                                with AMP.autocast("cuda", enabled=amp_enabled):
+                                with AMP.autocast(device.type, enabled=amp_enabled):
                                     real_pairs = torch.cat([target_series, Yb], dim=1)
                                     fake_pairs = torch.cat([target_series, Y_fake_detached], dim=1)
                                     if noise_std_epoch > 0:
@@ -473,11 +580,8 @@ def train_rgan_torch(
                                 scaler_D.unscale_(optD)
                                 clip_grad_value_(D.parameters(), config.grad_clip)
 
-                                grad_sq = 0.0
-                                for p in D.parameters():
-                                    if p.grad is not None:
-                                        grad_sq += p.grad.detach().pow(2).sum().item()
-                                epoch_grad_D.append(float(np.sqrt(grad_sq)))
+                                total_norm = torch.nn.utils.clip_grad_norm_(D.parameters(), float('inf'))
+                                epoch_grad_D.append(float(total_norm))
 
                                 scaler_D.step(optD)
                                 scaler_D.update()
@@ -501,7 +605,7 @@ def train_rgan_torch(
 
                         for _ in range(g_steps):
                             optG.zero_grad(set_to_none=True)
-                            with AMP.autocast("cuda", enabled=amp_enabled):
+                            with AMP.autocast(device.type, enabled=amp_enabled):
                                 Y_fake = G(Xb)
                                 cat_target = target_series
                                 if cat_target.dtype != Y_fake.dtype:
@@ -535,11 +639,8 @@ def train_rgan_torch(
                             scaler_G.unscale_(optG)
                             clip_grad_value_(G.parameters(), config.grad_clip)
 
-                            grad_sq = 0.0
-                            for p in G.parameters():
-                                if p.grad is not None:
-                                    grad_sq += p.grad.detach().pow(2).sum().item()
-                            epoch_grad_G.append(float(np.sqrt(grad_sq)))
+                            total_norm = torch.nn.utils.clip_grad_norm_(G.parameters(), float('inf'))
+                            epoch_grad_G.append(float(total_norm))
 
                             scaler_G.step(optG)
                             scaler_G.update()
@@ -603,15 +704,42 @@ def train_rgan_torch(
                 "Test": te_stats["rmse"],
             })
 
-            if va_stats["rmse"] < best_val - 1e-7:
-                best_val = va_stats["rmse"]
+            va_rmse = va_stats["rmse"]
+            if np.isnan(va_rmse):
+                console.log(f"[R-GAN Torch] Validation RMSE is NaN at epoch {epoch}. Counting as bad epoch.")
+                bad_epochs += 1
+            elif va_rmse < best_val - 1e-7:
+                best_val = va_rmse
                 best_state = copy.deepcopy(G.state_dict())
                 bad_epochs = 0
             else:
                 bad_epochs += 1
                 if bad_epochs >= patience:
                     console.log(f"[R-GAN Torch] Early stopping at epoch {epoch}.")
+                    # Save final checkpoint before breaking
+                    if config.checkpoint_dir:
+                        ckpt_dir = Path(config.checkpoint_dir)
+                        _save_checkpoint(
+                            ckpt_dir / "checkpoint_latest.pt", epoch,
+                            G, D, optG, optD, scaler_G, scaler_D,
+                            best_val, best_state, bad_epochs, hist,
+                            ema_shadow, current_batch_size, config,
+                        )
                     break
+
+            # --- Periodic checkpoint save ---
+            if (
+                config.checkpoint_dir
+                and config.checkpoint_every > 0
+                and epoch % config.checkpoint_every == 0
+            ):
+                ckpt_dir = Path(config.checkpoint_dir)
+                _save_checkpoint(
+                    ckpt_dir / "checkpoint_latest.pt", epoch,
+                    G, D, optG, optD, scaler_G, scaler_D,
+                    best_val, best_state, bad_epochs, hist,
+                    ema_shadow, current_batch_size, config,
+                )
 
     if best_state is not None:
         G.load_state_dict(best_state)
