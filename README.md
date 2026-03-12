@@ -1,154 +1,123 @@
-# RGAN Research Project
+# RGAN — Noise-Resilient Time-Series Forecasting
 
-Noise-resilient time-series forecasting with an LSTM Regression-GAN (R-GAN) and a fully instrumented reporting toolchain. This repository reproduces the instructor's original prototype while extending it with modern PyTorch training, reproducibility controls, and a publication-ready paper builder.
-
----
-
-## Feature Highlights
-
-- **PyTorch Regression-GAN pipeline** with deterministic seeding, AMP, early stopping, gradient clipping, and configurable generator/discriminator stacks.
-- **Baseline coverage** for supervised LSTM, naive persistence, ARIMA, and ARMA, plus optional ETS/ARIMA classical references.
-- **Quantitative diagnostics** including RMSE/MSE/MAE/Bias with bootstrap confidence intervals in both scaled and original units, and automated noise-robustness sweeps.
-- **Camera-ready LaTeX builder** (`papers/build_paper.py`) that injects every figure, metric table, and architecture summary into the manuscript template.
+LSTM-based Generative Adversarial Network for time-series forecasting, with a focus on robustness under real-world noise. Active research project working toward publication.
 
 ---
 
-## Quick Start
+## What This Is
 
-### 0. Prerequisites
-- Python 3.10+ (project tested with Python 3.11.4)
-- pip
-- (Optional) CUDA-capable GPU + PyTorch build with CUDA for faster training
+RGAN trains an LSTM generator and LSTM discriminator adversarially to forecast time-series data. The key research question: does the GAN training signal make forecasts more robust to noise than supervised baselines?
 
-### 1. Create and activate a virtual environment
+**Models included:**
 
-**Windows (PowerShell)**
-```powershell
-python -m venv .venv
-\.venv\Scripts\Activate.ps1
-```
-
-**macOS / Linux (bash or zsh)**
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 2. Install dependencies
-
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-> **Tip:** If you need a specific PyTorch build (e.g., with CUDA 12.1), install it before running the command above, then rerun `pip install -r requirements.txt` to pick up the remaining packages.
-
-### 3. Run an experiment
-
-Run the training script to generate results. This will create a `metrics.json` file in your specified results directory.
-
-```bash
-python -m rgan.scripts.run_training \
-  --csv src/rgan/Binance_Data.csv \
-  --target index_value \
-  --time_col calc_time \
-  --results_dir results_auto \
-  --epochs 50 \
-  --gan_variant wgan-gp \
-  --use_logits True \
-  --d_activation linear
-```
-
-**Want a lean smoke test?** You can keep the full pipeline available while avoiding the slowest extras:
-
-```bash
-python -m rgan.scripts.run_training \
-  --csv src/rgan/Binance_Data.csv \
-  --target index_value \
-  --time_col calc_time \
-  --results_dir results_quick \
-  --epochs 5 \
-  --gan_variant wgan-gp \
-  --skip_classical \
-  --noise_levels 0 \
-  --bootstrap_samples 0
-```
-
-### 4. Build the LaTeX paper
-
-```bash
-python papers/build_paper.py \
-  --metrics results/metrics.json \
-  --out results/research_paper.tex
-```
-Compile the resulting `.tex` file with your LaTeX toolchain (e.g., `pdflatex` or `latexmk`).
+| Model | Type |
+|-------|------|
+| RGAN, RGAN-WGAN, RGAN-WGAN-GP | GAN variants (ours) |
+| LSTM Supervised | Neural baseline |
+| DLinear, NLinear | Linear baselines |
+| FITS | Frequency-domain baseline |
+| PatchTST, iTransformer | Transformer baselines |
+| TimeGAN | GAN competitor |
+| Naive, ARIMA, ARMA, Tree Ensemble | Classical baselines |
 
 ---
 
-## CLI Reference
+## Setup
+
+```bash
+pip install -e .
+```
+
+For AWS/SageMaker cloud training:
+```bash
+pip install -e ".[cloud]"
+```
+
+---
+
+## Running Experiments
+
+```bash
+# Train on Binance data (all models, 80 epochs)
+rgan-train --csv data/binance/Binance_Data.csv --target index_value --epochs 80
+
+# With checkpointing (for resumable runs)
+rgan-train --csv data/binance/Binance_Data.csv --target index_value --epochs 80 \
+  --checkpoint_dir checkpoints/ --checkpoint_every 10
+
+# Resume from checkpoint
+rgan-train --csv data/binance/Binance_Data.csv --target index_value --epochs 80 \
+  --checkpoint_dir checkpoints/ --resume_from checkpoints/checkpoint_latest.pt
+
+# Noise robustness sweep
+rgan-train --csv data/binance/Binance_Data.csv --target index_value \
+  --noise_levels 0,0.01,0.05,0.1,0.2
+
+# Data augmentation experiment
+rgan-augment --csv data/binance/Binance_Data.csv
+
+# TSLib benchmarks
+rgan-benchmark --datasets ETTh1 --pred_lens 96,192,336,720
+```
+
+Alternatively via `python -m`:
+```bash
+python -m rgan.scripts.run_training --csv data/binance/Binance_Data.csv --target index_value --epochs 80
+```
+
+---
+
+## Key CLI Flags
 
 | Flag | Purpose |
-| ---- | ------- |
-| `--csv` | Path to the input CSV. Required. |
-| `--target`, `--time_col` | Column names (use `auto` to infer). |
-| `--L`, `--H` | Input window length and forecast horizon. |
-| `--epochs`, `--batch_size` | Training schedule knobs for both GAN and LSTM. |
-| `--units_g`, `--units_d`, `--g_layers`, `--d_layers` | Generator/discriminator architecture. |
-| `--gan_variant` | Adversarial loss style (`standard`, `wgan`, or `wgan-gp`). |
-| `--d_steps`, `--g_steps` | Critic/Generator updates per batch (Wasserstein defaults to 5 D steps when unset). |
-| `--wgan_clip_value`, `--wgan_gp_lambda` | Wasserstein regularisers (weight clipping vs. gradient penalty strength). |
-| `--lambda_reg`, `--dropout`, `--label_smooth`, `--grad_clip` | Regularisation controls. |
-| `--amp`, `--eval_batch_size`, `--num_workers`, `--persistent_workers`, `--pin_memory` | PyTorch runtime tuning. |
-| `--prefetch_factor` | Background prefetch for multi-worker DataLoaders. |
-| `--gpu_id` | ID of the GPU to use (default: 0). |
-| `--require_cuda` | Strict mode: Fail if CUDA is not available or the specified GPU ID is invalid. |
-| `--skip_classical` | Skip ARIMA/ARMA/tree baselines for faster smoke tests. |
-| `--tune`, `--tune_csv`, `--tune_eval_frac` | Enable and configure the hyperparameter sweep. |
-| `--noise_levels` | Comma-separated Gaussian noise standard deviations for robustness testing (`0` automatically included). |
-| `--results_dir` | Destination for artifacts (defaults to `./results`). |
+|------|---------|
+| `--csv` | Path to input CSV |
+| `--target` | Target column name |
+| `--epochs` | Number of training epochs |
+| `--gan_variant` | `standard`, `wgan`, or `wgan-gp` |
+| `--L`, `--H` | Input window length and forecast horizon |
+| `--units_g`, `--units_d` | Generator/discriminator hidden size |
+| `--noise_levels` | Comma-separated σ values for robustness testing |
+| `--checkpoint_dir` | Directory to save checkpoints |
+| `--checkpoint_every` | Save checkpoint every N epochs |
+| `--resume_from` | Path to checkpoint file to resume from |
+| `--skip_classical` | Skip ARIMA/ARMA/tree baselines |
+| `--results_dir` | Output directory (default: `./results`) |
 
-All flags are documented in `run_experiment.py` (`python -m rgan.scripts.run_training --help`).
+---
+
+## Datasets
+
+Real-world noisy datasets used for evaluation:
+
+| Dataset | Rows | Target | Noise Type |
+|---------|------|--------|------------|
+| Binance crypto | 86K | `index_value` | Market microstructure noise |
+| Household Power | 2M | `Global_active_power` | Appliance load spikes |
+| Beijing Air Quality | 420K | `PM2.5` | Outdoor sensor drift |
+| MetroPT-3 Air Compressor | 1.5M | `TP2` | Mechanical wear noise |
+| Gas Sensor Home | 929K | `CO_sensor` | Chemical sensor drift |
+| Micro Gas Turbine | 71K | `el_power` | Mechanical + electrical noise |
+
+Data files are not tracked in git. See `data/*/README.md` for download instructions.
 
 ---
 
 ## Outputs
 
-Running `run_experiment.py` populates the chosen `--results_dir` with:
+Results are saved to `--results_dir` (default: `results/`):
 
-- `metrics.json` – master record of dataset metadata, evaluation metrics (train/test/noise), architecture summaries, tuning results, and artifact paths.
-- Plot artifacts in both static (PNG) and interactive HTML formats for every figure referenced in the manuscript.
-- `tuning_results.csv` – only when `--tune` is supplied; contains per-trial metrics and seeds for reproducibility.
-- Serialized models/checkpoints emitted by the training routines (see `results/` subdirectories).
-- Optional LaTeX manuscript generated via `papers/build_paper.py` (`research_paper.tex`).
-
-Key static figures (PNG):
-- `rgan_train_test_rmse_vs_epochs.png`
-- `lstm_train_test_rmse_vs_epochs.png`
-- `naive_train_test_rmse_vs_epochs.png`
-- `arima_train_test_rmse_vs_epochs.png`
-- `arma_train_test_rmse_vs_epochs.png`
-- `models_test_error.png` and `models_train_error.png`
-- `naive_baseline_vs_naive_bayes.png`
-
-Interactive counterparts share the same filenames suffixed by `_interactive.html` when Plotly export succeeds.
+- `metrics.json` — all metrics, architecture summaries, artifact paths
+- `noise_robustness_table.csv` — RMSE per model per noise level
+- `augmentation_results.csv` — downstream forecasting with synthetic data
+- PNG/HTML plots for all figures
 
 ---
 
-## Troubleshooting & Tips
+## Cloud Training (AWS SageMaker)
 
-**Resource hotspots (optional features you can turn off when speed matters):**
+See `cloud/` for SageMaker infrastructure. Requires `cloud/config.yaml` (not tracked — contains AWS credentials).
 
-- Classical baselines (ARIMA/ARMA/tree ensemble) can dominate startup on long series. Disable with `--skip_classical`.
-- Hyperparameter sweeps via `--tune` launch multiple full trainings. Leave disabled unless exploring the search space.
- - Noise robustness (`--noise_levels` with multiple values) repeats evaluation per noise level. Use a single value (e.g., `0`).
- - Bootstrap confidence intervals (`--bootstrap_samples 300` by default) repeatedly resample metrics. Set `--bootstrap_samples 0` to skip.
-
-- **Rich styling errors:** The console now degrades gracefully if `rich` lacks gradient support, but ensure `rich>=13` for the full experience (`pip install --upgrade rich`).
-- **Slow CPU training:** Reduce `--epochs` and set DataLoader flags for single-process loading (`--num_workers 0 --persistent_workers false --pin_memory false`).
-- **GPU not detected:** Install the appropriate PyTorch wheel for your CUDA version (see https://pytorch.org/get-started/locally/). Reinstall requirements afterwards.
-- **Enforce GPU usage:** Pass `--require_cuda --gpu_id <id>` to fail fast if the requested GPU is unavailable instead of silently falling back to CPU.
-- **Missing classical plots:** Install `statsmodels` (`pip install statsmodels`) to enable ETS/ARIMA baselines.
-- **No metrics generated:** Ensure the run completed without interruption. Partial runs may leave stale PNGs but no `metrics.json`.
-- **Windows DataLoader hangs:** If training freezes on Windows, try adding `--num_workers 0 --persistent_workers false` to disable multi-process data loading, which can deadlock on Windows/WSL.
-
-For deeper customisation (new baselines, alternative logging, etc.), browse the modules under `src/rgan/` for inline documentation.
+```bash
+python -m cloud.launch --csv data/binance/Binance_Data.csv --epochs 80
+```
