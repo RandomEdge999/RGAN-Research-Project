@@ -82,8 +82,13 @@ def load_csv_series(
     if time_used is not None:
         logger.info(f"Using time column: {time_used}")
         # Coerce to datetime, logging dropped rows
+        # If the column is numeric, treat as Unix milliseconds (most common for financial data)
         original_len = len(df)
-        df[time_used] = pd.to_datetime(df[time_used], errors="coerce")
+        if pd.api.types.is_numeric_dtype(df[time_used]):
+            df[time_used] = pd.to_datetime(df[time_used], unit="ms", errors="coerce")
+            logger.info(f"Parsed '{time_used}' as Unix millisecond timestamps.")
+        else:
+            df[time_used] = pd.to_datetime(df[time_used], errors="coerce")
         df = df.dropna(subset=[time_used]).sort_values(time_used).reset_index(drop=True)
         dropped = original_len - len(df)
         if dropped > 0:

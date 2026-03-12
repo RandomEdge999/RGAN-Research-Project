@@ -33,15 +33,22 @@ ENV/
 node_modules/
 npm-debug.log
 yarn-error.log
-web_dashboard/dist/
-web_dashboard/.env
 
 # Project Specific
 results/
-data/
-*.csv
-!src/rgan/small_data.csv
-!src/rgan/Binance_Data.csv
+checkpoints/
+
+# Data — track READMEs and directory structure, but not the actual data files
+data/**/*.csv
+data/**/*.txt
+data/**/*.dat
+data/**/*.zip
+data/**/*.pdf
+# Keep READMEs in data folders
+!data/**/README.md
+
+# Cloud config (contains AWS account info)
+cloud/config.yaml
 
 # IDEs
 .vscode/
@@ -53,3 +60,10 @@ data/
 .DS_Store
 Thumbs.db
 old_code/
+
+# LaTeX build artifacts
+papers/*.aux
+papers/*.log
+papers/*.out
+papers/*.pdf
+papers/figures/

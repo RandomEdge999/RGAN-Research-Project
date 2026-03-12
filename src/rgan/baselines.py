@@ -6,6 +6,8 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
+from .metrics import error_stats as _error_stats
+
 
 try:
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -20,14 +22,6 @@ if _HAS_STATSMODELS and ConvergenceWarning is not None:
     _STATSMODELS_WARNING_CATEGORIES = (UserWarning, ConvergenceWarning)
 else:
     _STATSMODELS_WARNING_CATEGORIES = (UserWarning,)
-
-def _error_stats(y_true: np.ndarray, y_pred: np.ndarray):
-    diff = y_pred - y_true
-    mse = float(np.mean(diff ** 2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(diff)))
-    bias = float(np.mean(diff))
-    return {"rmse": rmse, "mae": mae, "mse": mse, "bias": bias}
 
 def naive_baseline(X, Y):
     """Naive baseline that repeats the last observed value."""

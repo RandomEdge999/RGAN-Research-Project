@@ -16,8 +16,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_predict
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from scipy.linalg import sqrtm
-from scipy import signal
 import warnings
+
+from .plots import _PALETTE, _style_axes, _finalise_static, _write_interactive, _HAS_PLOTLY, _ensure_path
 
 warnings.filterwarnings('ignore')
 
@@ -25,20 +26,9 @@ warnings.filterwarnings('ignore')
 try:
     import plotly.graph_objects as go
     import plotly.express as px
-    _HAS_PLOTLY = True
 except ImportError:
-    _HAS_PLOTLY = False
-
-# Color palette (matching existing plots.py)
-_PALETTE = [
-    "#6366F1",  # Indigo
-    "#EC4899",  # Pink
-    "#22D3EE",  # Cyan
-    "#F59E0B",  # Amber
-    "#10B981",  # Emerald
-    "#8B5CF6",  # Purple
-    "#F97316",  # Orange
-]
+    go = None
+    px = None
 
 
 # ============================================================================
@@ -398,30 +388,6 @@ def create_data_augmentation_table(augmentation_results, out_path):
 # PART 4: VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def _style_axes(ax):
-    """Apply consistent styling to matplotlib axes."""
-    ax.grid(True, alpha=0.2, linestyle='--', color='gray')
-    ax.set_facecolor('#f8fafc')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-
-def _finalise_static(fig, out_path):
-    """Save matplotlib figure and return path."""
-    out_path_png = str(out_path).replace('.png', '') + '.png'
-    fig.tight_layout()
-    fig.savefig(out_path_png, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    return out_path_png
-
-
-def _write_interactive(fig, out_path):
-    """Save plotly figure and return path."""
-    out_path_html = str(out_path).replace('.png', '') + '.html'
-    fig.write_html(out_path_html)
-    return out_path_html
-
-
 def plot_real_vs_synthetic_sequences(real_seqs, synthetic_seqs, out_path, n_samples=5):
     """
     Create line chart overlay showing real vs synthetic sequences.
@@ -435,6 +401,8 @@ def plot_real_vs_synthetic_sequences(real_seqs, synthetic_seqs, out_path, n_samp
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
+    out_path = _ensure_path(out_path)
+
     # Ensure 2D
     if real_seqs.ndim == 3:
         real_seqs = real_seqs.squeeze()
@@ -503,6 +471,7 @@ def plot_real_vs_synthetic_distributions(real_seqs, synthetic_seqs, out_path, bi
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
+    out_path = _ensure_path(out_path)
     real_flat = real_seqs.flatten()
     synthetic_flat = synthetic_seqs.flatten()
 
@@ -549,6 +518,7 @@ def plot_data_augmentation_comparison(augmentation_results, out_path):
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
+    out_path = _ensure_path(out_path)
     models = []
     real_only_rmse = []
     real_plus_rmse = []
