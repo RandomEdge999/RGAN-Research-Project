@@ -16,8 +16,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_predict
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from scipy.linalg import sqrtm
-from scipy import signal
 import warnings
+
+from .plots import _PALETTE, _style_axes, _finalise_static, _write_interactive, _HAS_PLOTLY, _ensure_path
 
 warnings.filterwarnings('ignore')
 
@@ -25,20 +26,9 @@ warnings.filterwarnings('ignore')
 try:
     import plotly.graph_objects as go
     import plotly.express as px
-    _HAS_PLOTLY = True
 except ImportError:
-    _HAS_PLOTLY = False
-
-# Color palette (matching existing plots.py)
-_PALETTE = [
-    "#6366F1",  # Indigo
-    "#EC4899",  # Pink
-    "#22D3EE",  # Cyan
-    "#F59E0B",  # Amber
-    "#10B981",  # Emerald
-    "#8B5CF6",  # Purple
-    "#F97316",  # Orange
-]
+    go = None
+    px = None
 
 
 # ============================================================================
@@ -180,51 +170,64 @@ def _extract_time_series_features(samples):
     return np.array(features_list)
 
 
-def discrimination_score(real_samples, fake_samples, n_folds=5):
+def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
     """
-    Train binary classifier to distinguish real from synthetic sequences.
-
-    Returns classification metrics that indicate how easily real vs fake can be distinguished.
-    High scores suggest synthetic data is very different from real (quality issue).
-    Low scores suggest synthetic data is similar to real (good quality).
-
+    Train multiple binary classifiers (RF, SVM, MLP) to distinguish real from synthetic.
+    
     Args:
-        real_samples: np.ndarray of shape (n_samples, sequence_length, features) or (n_samples, sequence_length)
-        fake_samples: np.ndarray of same shape as real_samples
-        n_folds: int, number of cross-validation folds
-
+        real_samples: np.ndarray
+        fake_samples: np.ndarray
+        n_folds: int
+        
     Returns:
         dict: {
-            'accuracy': float,
-            'f1': float,
-            'precision': float,
-            'recall': float
+            'Random Forest': {metrics},
+            'SVM (RBF)': {metrics},
+            'MLP': {metrics}
         }
     """
-    # Extract features
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import make_pipeline
+    
+    # Extract feature
     real_features = _extract_time_series_features(real_samples)
     fake_features = _extract_time_series_features(fake_samples)
-
-    # Create dataset with labels (0 = real, 1 = fake)
+    
     X = np.vstack([real_features, fake_features])
     y = np.hstack([np.zeros(len(real_features)), np.ones(len(fake_features))])
-
-    # Train classifier with cross-validation
-    clf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-    y_pred = cross_val_predict(clf, X, y, cv=min(n_folds, len(X) // 2))
-
-    # Calculate metrics
-    accuracy = float(accuracy_score(y, y_pred))
-    f1 = float(f1_score(y, y_pred, zero_division=0))
-    precision = float(precision_score(y, y_pred, zero_division=0))
-    recall = float(recall_score(y, y_pred, zero_division=0))
-
-    return {
-        'accuracy': accuracy,
-        'f1': f1,
-        'precision': precision,
-        'recall': recall
+    
+    classifiers = {
+        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
+        'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=42)),
+        'MLP': make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42))
     }
+    
+    results = {}
+    
+    for name, clf in classifiers.items():
+        try:
+            # Cross-validation
+            y_pred = cross_val_predict(clf, X, y, cv=min(n_folds, len(X) // 2))
+            
+            results[name] = {
+                'accuracy': float(accuracy_score(y, y_pred)),
+                'f1': float(f1_score(y, y_pred, zero_division=0)),
+                'precision': float(precision_score(y, y_pred, zero_division=0)),
+                'recall': float(recall_score(y, y_pred, zero_division=0))
+            }
+        except Exception as e:
+            print(f"Classifier {name} failed: {e}")
+            results[name] = {'accuracy': 0, 'f1': 0, 'precision': 0, 'recall': 0}
+            
+    return results
+
+
+def discrimination_score(real_samples, fake_samples, n_folds=5):
+    """Legacy wrapper for backward compatibility."""
+    res = evaluate_discriminators(real_samples, fake_samples, n_folds)
+    return res.get('Random Forest', {})
 
 
 # ============================================================================
@@ -385,30 +388,6 @@ def create_data_augmentation_table(augmentation_results, out_path):
 # PART 4: VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def _style_axes(ax):
-    """Apply consistent styling to matplotlib axes."""
-    ax.grid(True, alpha=0.2, linestyle='--', color='gray')
-    ax.set_facecolor('#f8fafc')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-
-def _finalise_static(fig, out_path):
-    """Save matplotlib figure and return path."""
-    out_path_png = str(out_path).replace('.png', '') + '.png'
-    fig.tight_layout()
-    fig.savefig(out_path_png, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    return out_path_png
-
-
-def _write_interactive(fig, out_path):
-    """Save plotly figure and return path."""
-    out_path_html = str(out_path).replace('.png', '') + '.html'
-    fig.write_html(out_path_html)
-    return out_path_html
-
-
 def plot_real_vs_synthetic_sequences(real_seqs, synthetic_seqs, out_path, n_samples=5):
     """
     Create line chart overlay showing real vs synthetic sequences.
@@ -422,6 +401,8 @@ def plot_real_vs_synthetic_sequences(real_seqs, synthetic_seqs, out_path, n_samp
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
+    out_path = _ensure_path(out_path)
+
     # Ensure 2D
     if real_seqs.ndim == 3:
         real_seqs = real_seqs.squeeze()
@@ -490,6 +471,7 @@ def plot_real_vs_synthetic_distributions(real_seqs, synthetic_seqs, out_path, bi
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
+    out_path = _ensure_path(out_path)
     real_flat = real_seqs.flatten()
     synthetic_flat = synthetic_seqs.flatten()
 
@@ -536,6 +518,7 @@ def plot_data_augmentation_comparison(augmentation_results, out_path):
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
+    out_path = _ensure_path(out_path)
     models = []
     real_only_rmse = []
     real_plus_rmse = []

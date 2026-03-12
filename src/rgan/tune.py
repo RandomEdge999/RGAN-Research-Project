@@ -144,8 +144,8 @@ def tune_rgan(
                 dropout=cfg_dict.get("dropout", 0.0),
                 num_layers=cfg_dict.get("g_layers", 1),
                 dense_activation=cfg_dict.get("g_dense_activation"),
-                layer_norm=True, # Defaulting to True as per previous run_experiment logic? 
-                                 # Actually run_experiment sets it based on wgan-gp.
+                layer_norm=True, # Defaulting to True as per previous run_training logic? 
+                                 # Actually run_training sets it based on wgan-gp.
                                  # tune.py didn't seem to set layer_norm explicitly before.
                                  # I'll leave it as default or what was there.
                                  # The previous code didn't pass layer_norm.

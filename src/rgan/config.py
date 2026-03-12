@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from typing import Optional
 
 @dataclass
 class ModelConfig:
@@ -111,7 +111,13 @@ class TrainConfig:
     amp: bool = True
     strict_device: bool = False
     wgan_clip_value: float = 0.01
-    
+    weight_decay: float = 0.0
+
+    # Checkpoint & Resume
+    checkpoint_dir: Optional[str] = None
+    checkpoint_every: int = 0
+    resume_from: Optional[str] = None
+
     def __post_init__(self):
         if self.lambda_reg_start is None:
             self.lambda_reg_start = self.lambda_reg

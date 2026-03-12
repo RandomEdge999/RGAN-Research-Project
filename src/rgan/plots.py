@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -394,6 +394,257 @@ def create_error_metrics_table(model_results: dict, out_path: str = None):
     return df
 
 
+def plot_predictions(predictions_dict: Dict[str, np.ndarray], save_path: str, n_samples: int = 4):
+    """
+    Plot ground truth vs model predictions for a few samples.
+    
+    Args:
+        predictions_dict: Dictionary {model_name: predictions_array}
+                          predictions_array shape: (N, H, 1) or (N, H)
+        save_path: Path to save the plot (without extension)
+        n_samples: Number of samples to plot
+    """
+    if not predictions_dict:
+        return
+
+    # keys = list(predictions_dict.keys())
+    # num_models = len(keys)
+    
+    # Get ground truth if available for reference
+    truth = predictions_dict.get('True')
+    
+    # Check available samples
+    available_samples = 0
+    for k, v in predictions_dict.items():
+        if v is not None:
+            available_samples = len(v)
+            break
+            
+    n_samples = min(n_samples, available_samples)
+    if n_samples <= 0:
+        return
+
+    # Create figure
+    fig, axes = plt.subplots(n_samples, 1, figsize=(10, 3 * n_samples), sharex=True)
+    if n_samples == 1:
+        axes = [axes]
+    
+    for i in range(n_samples):
+        ax = axes[i]
+        for model_name, preds in predictions_dict.items():
+            if preds is None:
+                continue
+            
+            # Handle shapes (N, H, 1) or (N, H)
+            try:
+                if len(preds) <= i: continue
+                y = preds[i].flatten()
+            except:
+                continue
+            
+            style = '-'
+            alpha = 0.7
+            width = 1.5
+            color = None
+            
+            if model_name == 'True':
+                style = 'k-'
+                alpha = 1.0
+                width = 2.0
+                label = 'Ground Truth'
+            else:
+                label = model_name
+                
+            ax.plot(y, style, label=label, alpha=alpha, linewidth=width)
+            
+        ax.set_title(f"Sample {i}")
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.legend()
+            
+    plt.tight_layout()
+    _finalise_static(fig, Path(save_path))
+    
+    # Interactive plot if possible
+    if _HAS_PLOTLY:
+        try:
+            fig_go = make_subplots(rows=n_samples, cols=1, subplot_titles=[f"Sample {i}" for i in range(n_samples)])
+            
+            for i in range(n_samples):
+                for model_name, preds in predictions_dict.items():
+                    if preds is None:
+                        continue
+                    try:
+                        if len(preds) <= i: continue
+                        y = preds[i].flatten()
+                    except: continue
+
+                    line_dict = dict(width=2)
+                    if model_name == 'True':
+                        line_dict['color'] = 'black'
+                        line_dict['dash'] = 'solid'
+                    
+                    fig_go.add_trace(
+                        go.Scatter(y=y, mode='lines', name=model_name if i == 0 else None,
+                                  line=line_dict, showlegend=(i==0)),
+                        row=i+1, col=1
+                    )
+            
+            fig_go.update_layout(height=300*n_samples, title_text="Predictions Comparison")
+            _write_interactive(fig_go, Path(save_path))
+        except Exception:
+            pass
 
 
+def create_noise_robustness_table(
+    noise_results: List[dict],
+    out_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Build a noise robustness table: RMSE per model at each noise level.
+
+    Args:
+        noise_results: List of dicts from run_training, one per noise level.
+            Each dict has keys like 'sd', 'rgan', 'lstm', ... where each model
+            value is a stats dict with 'rmse_orig' (or 'rmse').
+        out_path: Optional CSV path.
+
+    Returns:
+        DataFrame with models as rows, noise levels as columns, values = RMSE.
+    """
+    model_keys = [
+        ("rgan", "RGAN"),
+        ("lstm", "LSTM"),
+        ("dlinear", "DLinear"),
+        ("nlinear", "NLinear"),
+        ("fits", "FITS"),
+        ("patchtst", "PatchTST"),
+        ("itransformer", "iTransformer"),
+        ("naive_baseline", "Naive"),
+        ("arima", "ARIMA"),
+        ("arma", "ARMA"),
+        ("tree_ensemble", "Tree Ensemble"),
+    ]
+
+    sds = [r["sd"] for r in noise_results]
+
+    rows = []
+    for key, label in model_keys:
+        row = {"Model": label}
+        baseline_rmse = None
+        for nr in noise_results:
+            sd = nr["sd"]
+            stats = nr.get(key, {})
+            if not stats:
+                row[f"σ={sd}"] = None
+                continue
+            rmse = stats.get("rmse_orig", stats.get("rmse"))
+            row[f"σ={sd}"] = rmse
+            if sd == 0.0 and rmse is not None:
+                baseline_rmse = rmse
+
+        # Compute degradation (% increase from clean to noisiest)
+        if baseline_rmse and len(sds) > 1:
+            noisiest = noise_results[-1]
+            noisy_stats = noisiest.get(key, {})
+            noisy_rmse = noisy_stats.get("rmse_orig", noisy_stats.get("rmse"))
+            if noisy_rmse is not None and baseline_rmse > 0:
+                row["Degradation %"] = f"{(noisy_rmse - baseline_rmse) / baseline_rmse * 100:+.1f}%"
+            else:
+                row["Degradation %"] = "-"
+        else:
+            row["Degradation %"] = "-"
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if out_path:
+        df.to_csv(out_path, index=False)
+    return df
+
+
+def plot_noise_robustness(
+    noise_results: List[dict],
+    out_path: str,
+) -> Dict[str, str]:
+    """Plot RMSE vs noise level for all models — the core paper figure.
+
+    Args:
+        noise_results: List of dicts from run_training.
+        out_path: Save path (without extension).
+
+    Returns:
+        Dict with 'static' and 'interactive' paths.
+    """
+    model_keys = [
+        ("rgan", "RGAN", "#E74C3C", "-", "o"),
+        ("lstm", "LSTM", "#3498DB", "--", "s"),
+        ("dlinear", "DLinear", "#2ECC71", "-.", "^"),
+        ("nlinear", "NLinear", "#9B59B6", ":", "d"),
+        ("fits", "FITS", "#F39C12", "-.", "v"),
+        ("patchtst", "PatchTST", "#1ABC9C", "--", "P"),
+        ("itransformer", "iTransformer", "#E67E22", "-", "X"),
+        ("naive_baseline", "Naive", "#95A5A6", ":", "*"),
+    ]
+
+    sds = [r["sd"] for r in noise_results]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for key, label, color, ls, marker in model_keys:
+        rmses = []
+        for nr in noise_results:
+            stats = nr.get(key, {})
+            if not stats:
+                rmses.append(np.nan)
+                continue
+            rmse = stats.get("rmse_orig", stats.get("rmse"))
+            rmses.append(rmse if rmse is not None else np.nan)
+
+        if all(np.isnan(v) for v in rmses):
+            continue
+
+        ax.plot(sds, rmses, label=label, color=color, linestyle=ls,
+                marker=marker, markersize=6, linewidth=2)
+
+    ax.set_xlabel("Noise Standard Deviation (σ)", fontsize=12)
+    ax.set_ylabel("Test RMSE (original scale)", fontsize=12)
+    ax.set_title("Noise Robustness: RMSE Degradation Under Input Perturbation", fontsize=13)
+    ax.legend(loc="upper left", fontsize=9, ncol=2)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=-0.005)
+    plt.tight_layout()
+
+    out = Path(out_path)
+    static_path = _finalise_static(fig, out)
+
+    html_path = ""
+    if _HAS_PLOTLY:
+        fig_i = go.Figure()
+        for key, label, color, ls, marker in model_keys:
+            rmses = []
+            for nr in noise_results:
+                stats = nr.get(key, {})
+                if not stats:
+                    rmses.append(None)
+                    continue
+                rmse = stats.get("rmse_orig", stats.get("rmse"))
+                rmses.append(rmse)
+            if all(v is None for v in rmses):
+                continue
+            dash_map = {"-": "solid", "--": "dash", "-.": "dashdot", ":": "dot"}
+            fig_i.add_trace(go.Scatter(
+                x=sds, y=rmses, name=label,
+                line=dict(color=color, dash=dash_map.get(ls, "solid"), width=2),
+                mode="lines+markers",
+            ))
+        fig_i.update_layout(
+            title="Noise Robustness: RMSE Degradation Under Input Perturbation",
+            xaxis_title="Noise Standard Deviation (σ)",
+            yaxis_title="Test RMSE (original scale)",
+            template="plotly_white",
+            height=500, width=900,
+        )
+        html_path = _write_interactive(fig_i, out)
+
+    return {"static": static_path, "interactive": html_path}
 
