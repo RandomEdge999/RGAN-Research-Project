@@ -61,9 +61,5 @@ cloud/config.yaml
 Thumbs.db
 old_code/
 
-# LaTeX build artifacts
-papers/*.aux
-papers/*.log
-papers/*.out
-papers/*.pdf
-papers/figures/
+# Papers (manuscript — keep local only)
+papers/
