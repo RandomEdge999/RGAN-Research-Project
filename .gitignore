@@ -63,3 +63,6 @@ old_code/
 
 # Papers (manuscript — keep local only)
 papers/
+
+# Docs (internal notes — keep local only)
+docs/
