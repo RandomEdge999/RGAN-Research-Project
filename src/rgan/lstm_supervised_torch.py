@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Any, Tuple, Optional
 from .config import TrainConfig
-from .logging_utils import get_console, epoch_progress, update_epoch
+from .logging_utils import get_console, epoch_progress, update_epoch, log_info, log_step, log_warn, log_error, log_shape, log_debug
 from .metrics import error_stats
 
 
@@ -58,18 +58,24 @@ def train_lstm_supervised_torch(
 ) -> Dict[str, Any]:
     """Train a supervised LSTM baseline."""
     console = get_console()
+    log_info(f"train_lstm_supervised_torch called: epochs={config.epochs}, device={config.device}")
 
     # Determine device preference
     preferred = config.device
     if preferred == "auto":
         preferred = "cuda" if torch.cuda.is_available() else "cpu"
+    log_step(f"LSTM device preference resolved to: {preferred}")
 
     def _train_on_device(device: torch.device) -> Dict[str, Any]:
         L, H = config.L, config.H
         n_in = data_splits["Xtr"].shape[-1]
-        
+        log_step(f"Building LSTM: L={L}, H={H}, n_in={n_in}, units={config.units_g}")
+
         # Note: 'units_g' is used as the hidden size for the LSTM
         model = LSTMSupervised(L, H, n_in=n_in, units=config.units_g).to(device)
+        log_step(f"LSTM model params: {sum(p.numel() for p in model.parameters())}")
+        log_shape("Xtr", data_splits["Xtr"])
+        log_shape("Ytr", data_splits["Ytr"])
         opt = torch.optim.Adam(model.parameters(), lr=config.lr_g)
         loss_fn = torch.nn.MSELoss()
 
@@ -132,21 +138,27 @@ def train_lstm_supervised_torch(
                     best_val = va_rmse
                     best_state = model.state_dict()
                     bad_epochs = 0
+                    log_debug(f"LSTM epoch {epoch}: new best val_rmse={va_rmse:.6f}")
                 else:
                     bad_epochs += 1
                     if bad_epochs >= patience:
-                        console.log(f"[LSTM Torch] Early stopping at epoch {epoch}.")
+                        log_info(f"LSTM early stopping at epoch {epoch}. best_val={best_val:.6f}")
                         break
 
         if best_state is not None:
+            log_step(f"Loading LSTM best state (best_val={best_val:.6f})")
             model.load_state_dict(best_state)
+        else:
+            log_warn("No LSTM best state saved")
 
         eval_batch_size = max(1, min(config.batch_size, 1024))
+        log_step(f"Computing final LSTM metrics (eval_batch_size={eval_batch_size})")
         tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
         te = _predict_in_batches(model, Xte, device, eval_batch_size)
         train_stats = error_stats(Ytr.reshape(-1), tr.reshape(-1))
         test_stats = error_stats(Yte.reshape(-1), te.reshape(-1))
-        
+        log_step(f"LSTM final: train_rmse={train_stats.get('rmse', 'N/A'):.6f}, test_rmse={test_stats.get('rmse', 'N/A'):.6f}")
+
         return {
             "model": model,
             "history": hist,
@@ -164,7 +176,8 @@ def train_lstm_supervised_torch(
             and preferred != "cpu"
             and _is_cuda_launch_failure(err)
         ):
-            console.log("[LSTM Torch] CUDA failure detected; retrying on CPU.")
+            log_error(f"LSTM CUDA failure detected: {err}")
+            log_warn("Retrying LSTM training on CPU...")
             torch.cuda.empty_cache()
             return _train_on_device(torch.device("cpu"))
         raise

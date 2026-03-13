@@ -1,10 +1,8 @@
 import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Dict, List, TypedDict, cast
-import logging
 
-# Configure logging for data operations
-logger = logging.getLogger(__name__)
+from .logging_utils import log_info, log_step, log_warn, log_debug
 
 COMMON_TIME_COLS = ["calc_time", "date", "datetime", "time", "timestamp", "ts"]
 
@@ -50,7 +48,7 @@ def load_csv_series(
     Raises:
         ValueError: If the target column cannot be found or is missing.
     """
-    logger.info(f"Loading data from {path}")
+    log_step(f"Loading CSV from: {path}")
     df = pd.read_csv(path)
 
     # 1. Target Column Detection
@@ -63,7 +61,7 @@ def load_csv_series(
             if not numeric:
                 raise ValueError("No numeric columns found; please specify --target.")
             target_col = numeric[-1]
-            logger.info(f"Auto-detected target column: {target_col}")
+            log_step(f"Auto-detected target column: {target_col}")
     else:
         if target not in df.columns:
             raise ValueError(f"Target column '{target}' not found in CSV columns: {list(df.columns)}")
@@ -80,26 +78,29 @@ def load_csv_series(
 
     # 3. Time-based Preprocessing
     if time_used is not None:
-        logger.info(f"Using time column: {time_used}")
+        log_step(f"Using time column: {time_used}")
         # Coerce to datetime, logging dropped rows
         # If the column is numeric, treat as Unix milliseconds (most common for financial data)
         original_len = len(df)
         if pd.api.types.is_numeric_dtype(df[time_used]):
             df[time_used] = pd.to_datetime(df[time_used], unit="ms", errors="coerce")
-            logger.info(f"Parsed '{time_used}' as Unix millisecond timestamps.")
+            log_step(f"Parsed '{time_used}' as Unix millisecond timestamps.")
         else:
             df[time_used] = pd.to_datetime(df[time_used], errors="coerce")
         df = df.dropna(subset=[time_used]).sort_values(time_used).reset_index(drop=True)
         dropped = original_len - len(df)
         if dropped > 0:
-            logger.warning(f"Dropped {dropped} rows due to invalid datetime parsing in '{time_used}'.")
+            log_warn(f"Dropped {dropped} rows due to invalid datetime parsing in '{time_used}'.")
 
         if resample:
-            logger.info(f"Resampling data to frequency '{resample}' using aggregation '{agg}'.")
+            log_step(f"Resampling data to frequency '{resample}' using aggregation '{agg}'.")
             num_cols = df.select_dtypes(include=["number"]).columns.tolist()
             df = df.set_index(time_used).resample(resample).agg(agg)
             df = df[num_cols].reset_index()
 
+    log_step(f"Data loaded: {len(df)} rows, {len(df.columns)} columns")
+    log_step(f"Columns: {list(df.columns)}")
+    log_step(f"Target: {target_col}, Time: {time_used or '(none)'}")
     return df, target_col, time_used
 
 

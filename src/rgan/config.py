@@ -21,11 +21,11 @@ class ModelConfig:
     L: int
     H: int
     n_features: int = 1
-    units_g: int = 64
-    units_d: int = 64
-    g_layers: int = 1
-    d_layers: int = 1
-    dropout: float = 0.0
+    units_g: int = 128
+    units_d: int = 128
+    g_layers: int = 2
+    d_layers: int = 2
+    dropout: float = 0.1
     g_dense_activation: Optional[str] = None
     d_activation: str = "sigmoid"
     use_spectral_norm: bool = False
@@ -66,19 +66,19 @@ class TrainConfig:
         g_dense_activation: Activation for Generator's dense layer.
         d_activation: Activation for Discriminator.
     """
-    epochs: int = 100
+    epochs: int = 200
     batch_size: int = 64
-    eval_batch_size: int = 512
-    lr_g: float = 1e-3
-    lr_d: float = 1e-3
-    lambda_reg: float = 0.1
-    gan_variant: str = "standard"
-    d_steps: int = 1
+    eval_batch_size: int = 2048
+    lr_g: float = 5e-4
+    lr_d: float = 5e-4
+    lambda_reg: float = 0.5
+    gan_variant: str = "wgan-gp"
+    d_steps: int = 3
     g_steps: int = 1
     wgan_gp_lambda: float = 10.0
     label_smooth: float = 0.9
-    grad_clip: float = 5.0
-    patience: int = 10
+    grad_clip: float = 1.0
+    patience: int = 25
     device: str = "cpu"
     num_workers: int = 0
     prefetch_factor: int = 2
@@ -87,25 +87,25 @@ class TrainConfig:
     seed: int = 42
     
     # Model Params
-    L: int = 24
+    L: int = 60
     H: int = 12
-    units_g: int = 64
-    units_d: int = 64
-    g_layers: int = 1
-    d_layers: int = 1
-    dropout: float = 0.0
+    units_g: int = 128
+    units_d: int = 128
+    g_layers: int = 2
+    d_layers: int = 2
+    dropout: float = 0.1
     g_dense_activation: Optional[str] = None
     d_activation: str = "sigmoid"
     
     # Advanced Training Options
-    supervised_warmup_epochs: int = 0
+    supervised_warmup_epochs: int = 10
     lambda_reg_start: Optional[float] = None
     lambda_reg_end: Optional[float] = None
     lambda_reg_warmup_epochs: int = 1
     adv_weight: float = 1.0
     instance_noise_std: float = 0.0
     instance_noise_decay: float = 0.95
-    ema_decay: float = 0.0
+    ema_decay: float = 0.999
     use_logits: bool = False
     track_discriminator_outputs: bool = True
     amp: bool = True
@@ -113,9 +113,12 @@ class TrainConfig:
     wgan_clip_value: float = 0.01
     weight_decay: float = 0.0
 
+    # Evaluation
+    eval_every: int = 5  # Evaluate every N epochs (1 = every epoch)
+
     # Checkpoint & Resume
     checkpoint_dir: Optional[str] = None
-    checkpoint_every: int = 0
+    checkpoint_every: int = 10
     resume_from: Optional[str] = None
 
     def __post_init__(self):

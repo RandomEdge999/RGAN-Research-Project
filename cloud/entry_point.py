@@ -23,6 +23,12 @@ from pathlib import Path
 
 
 def main():
+    # Force unbuffered stdout so epoch logs appear in CloudWatch immediately
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    # Force plain-text logging — disable ANSI escape sequences in the subprocess
+    os.environ["TERM"] = "dumb"
+    os.environ["NO_COLOR"] = "1"
+
     # SageMaker environment
     data_dir = Path(os.environ.get("SM_CHANNEL_DATA", "/opt/ml/input/data/data"))
     model_dir = Path(os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
@@ -33,6 +39,16 @@ def main():
     # but doesn't run setup.sh automatically
     code_dir = Path("/opt/ml/code")
     if (code_dir / "pyproject.toml").exists():
+        # Install extra deps not in the PyTorch DLC (statsmodels, plotly, psutil)
+        print("[entry_point] Installing extra dependencies...")
+        deps_result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q",
+             "statsmodels>=0.13", "plotly>=5.22", "psutil>=5.9"],
+            capture_output=True, text=True,
+        )
+        if deps_result.returncode != 0:
+            print(f"[entry_point] WARNING: extra deps install issue:\n{deps_result.stderr}")
+
         print("[entry_point] Installing rgan package...")
         install_result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-e", str(code_dir), "--no-deps"],
@@ -54,7 +70,7 @@ def main():
     # Build the rgan-train command from hyperparameters
     # SageMaker passes hyperparameters as env vars prefixed with SM_HP_
     args = [
-        sys.executable, "-m", "rgan.scripts.run_training",
+        sys.executable, "-u", "-m", "rgan.scripts.run_training",
         "--csv", str(csv_path),
         "--results_dir", str(output_dir / "experiment"),
         "--checkpoint_dir", "/opt/ml/checkpoints",
@@ -97,12 +113,15 @@ def main():
         "SM_HP_GRAD_CLIP": "--grad_clip",
         "SM_HP_WEIGHT_DECAY": "--weight_decay",
         "SM_HP_ADV_WEIGHT": "--adv_weight",
+        "SM_HP_EVAL_EVERY": "--eval_every",
+        "SM_HP_EVAL_BATCH_SIZE": "--eval_batch_size",
     }
 
     # Boolean flags (--flag, no value)
     bool_flags = {
         "SM_HP_SKIP_CLASSICAL": "--skip_classical",
         "SM_HP_REQUIRE_CUDA": "--require_cuda",
+        "SM_HP_SKIP_NOISE_ROBUSTNESS": "--skip_noise_robustness",
     }
 
     for env_key, cli_flag in hp_mapping.items():

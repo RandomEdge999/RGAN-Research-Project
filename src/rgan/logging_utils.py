@@ -1,184 +1,270 @@
+"""Plain-text logging utilities for RGAN training.
+
+No Rich dependency. Every log line is timestamped and includes the caller location
+so that cloud logs (CloudWatch, SageMaker) show exactly where and when things happen.
+
+All output goes to both stdout AND a log file (when configured) so that failed runs
+always leave a complete trace on disk.
+"""
 import contextlib
-from typing import Any, Dict, Optional
+import inspect
+import os
 import sys
+import time
+import traceback
 import platform
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-def _fallback_console():
-    class Simple:
-        def rule(self, text: str):
-            print("\n" + "=" * 80)
-            print(text)
-            print("=" * 80)
 
-        def log(self, *args, **kwargs):
-            print(*args)
+# ---------------------------------------------------------------------------
+# Log file — set once via setup_log_file(), then every log line is tee'd there
+# ---------------------------------------------------------------------------
+_LOG_FILE = None
 
-        def print(self, *args, **kwargs):
-            print(*args)
-    return Simple()
 
-_CONSOLE = None
+def setup_log_file(results_dir: str) -> Path:
+    """Create a run.log in the given results directory and tee all future log
+    lines there.  Returns the path to the log file."""
+    global _LOG_FILE
+    p = Path(results_dir) / "run.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _LOG_FILE = open(p, "a", buffering=1)  # line-buffered
+    _write_to_log(f"--- Log file opened: {p.resolve()} ---")
+    _write_to_log(f"--- Python {sys.version} | {platform.platform()} ---")
+    _write_to_log(f"--- PID {os.getpid()} | CWD {os.getcwd()} ---")
+    return p
 
-def get_console():
-    global _CONSOLE
-    if _CONSOLE is not None:
-        return _CONSOLE
+
+def close_log_file() -> None:
+    """Flush and close the log file."""
+    global _LOG_FILE
+    if _LOG_FILE is not None:
+        try:
+            _LOG_FILE.flush()
+            _LOG_FILE.close()
+        except Exception:
+            pass
+        _LOG_FILE = None
+
+
+def _write_to_log(line: str) -> None:
+    """Write a line to the log file if one is open."""
+    if _LOG_FILE is not None:
+        try:
+            _LOG_FILE.write(line + "\n")
+            _LOG_FILE.flush()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
+
+def _timestamp() -> str:
+    """UTC timestamp for log lines."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _caller_location(depth: int = 2) -> str:
+    """Return 'filename:lineno:funcname' of the caller (skipping wrapper frames)."""
+    frame = inspect.currentframe()
     try:
-        from rich.console import Console
-        from rich.theme import Theme
+        for _ in range(depth):
+            if frame is not None:
+                frame = frame.f_back
+        if frame is not None:
+            fname = os.path.basename(frame.f_code.co_filename)
+            func = frame.f_code.co_name
+            return f"{fname}:{frame.f_lineno}:{func}"
+    finally:
+        del frame
+    return "?:?:?"
 
-        # Premium "Trading Terminal" Theme
-        # Dark Slate / Cyan / Neon Green palette
-        theme = Theme({
-            "banner.title": "bold white on #0f172a",
-            "banner.subtitle": "italic #38bdf8 on #0f172a",
-            "panel.border": "#38bdf8",
-            "table.header": "bold #f0f9ff on #0f172a",
-            "table.row": "#e2e8f0",
-            "table.row.even": "#cbd5e1",
-            "progress.description": "bold #f0f9ff",
-            "progress.percentage": "bold #38bdf8",
-            "progress.remaining": "italic #94a3b8",
-            "kv.key": "bold #0ea5e9",
-            "kv.value": "#f8fafc",
-        })
-        _CONSOLE = Console(theme=theme, highlight=False)
-        return _CONSOLE
-    except Exception:
-        return _fallback_console()
+
+def log(msg: str, level: str = "INFO") -> None:
+    """Print a timestamped, location-tagged log line to stdout and log file."""
+    loc = _caller_location(depth=2)
+    line = f"[{_timestamp()}] [{level}] [{loc}] {msg}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_info(msg: str) -> None:
+    loc = _caller_location(depth=2)
+    line = f"[{_timestamp()}] [INFO] [{loc}] {msg}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_warn(msg: str) -> None:
+    loc = _caller_location(depth=2)
+    line = f"[{_timestamp()}] [WARN] [{loc}] {msg}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_error(msg: str) -> None:
+    loc = _caller_location(depth=2)
+    line = f"[{_timestamp()}] [ERROR] [{loc}] {msg}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_debug(msg: str) -> None:
+    loc = _caller_location(depth=2)
+    line = f"[{_timestamp()}] [DEBUG] [{loc}] {msg}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_exception(msg: str = "Exception caught") -> None:
+    """Log an error message AND the full traceback of the current exception."""
+    loc = _caller_location(depth=2)
+    tb = traceback.format_exc()
+    header = f"[{_timestamp()}] [ERROR] [{loc}] {msg}"
+    print(header, flush=True)
+    print(tb, flush=True)
+    _write_to_log(header)
+    _write_to_log(tb)
+
+
+def log_traceback() -> None:
+    """Log the full traceback of the current exception (no extra message)."""
+    tb = traceback.format_exc()
+    print(tb, flush=True)
+    _write_to_log(tb)
+
+
+def log_step(msg: str) -> None:
+    """Log a granular step inside a larger operation.  Uses STEP level for easy
+    grep filtering when debugging failed runs."""
+    loc = _caller_location(depth=2)
+    line = f"[{_timestamp()}] [STEP] [{loc}] {msg}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_var(name: str, value: Any) -> None:
+    """Log the name and value of a variable for debugging.  Truncates large repr."""
+    loc = _caller_location(depth=2)
+    val_str = repr(value)
+    if len(val_str) > 500:
+        val_str = val_str[:500] + "... (truncated)"
+    line = f"[{_timestamp()}] [VAR] [{loc}] {name} = {val_str}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+def log_shape(name: str, arr: Any) -> None:
+    """Log the shape and dtype of a numpy/torch array."""
+    loc = _caller_location(depth=2)
+    shape = getattr(arr, "shape", "N/A")
+    dtype = getattr(arr, "dtype", type(arr).__name__)
+    line = f"[{_timestamp()}] [SHAPE] [{loc}] {name}: shape={shape} dtype={dtype}"
+    print(line, flush=True)
+    _write_to_log(line)
+
+
+# ---------------------------------------------------------------------------
+# Console object — simple wrapper so existing code keeps calling console.print / console.log
+# ---------------------------------------------------------------------------
+
+class PlainConsole:
+    """Minimal console that prints plain text with timestamps."""
+
+    def rule(self, text: str = "") -> None:
+        line = "=" * 80
+        out = f"\n{line}"
+        if text:
+            out += f"\n{text}"
+        out += f"\n{line}"
+        print(out, flush=True)
+        _write_to_log(out)
+
+    def log(self, *args, **kwargs) -> None:
+        msg = " ".join(str(a) for a in args)
+        loc = _caller_location(depth=2)
+        line = f"[{_timestamp()}] [LOG] [{loc}] {msg}"
+        print(line, flush=True)
+        _write_to_log(line)
+
+    def print(self, *args, **kwargs) -> None:
+        msg = " ".join(str(a) for a in args)
+        print(msg, flush=True)
+        _write_to_log(msg)
+
+
+_CONSOLE: Optional[PlainConsole] = None
+
+
+def get_console() -> PlainConsole:
+    global _CONSOLE
+    if _CONSOLE is None:
+        _CONSOLE = PlainConsole()
+    return _CONSOLE
+
 
 def has_rich() -> bool:
-    try:
-        import rich
-        return True
-    except Exception:
-        return False
+    """Always False — Rich UI is disabled for robust cloud logging."""
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Epoch progress — plain print, no progress bars
+# ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
 def epoch_progress(total: int, description: str = "Training"):
-    if has_rich():
-        from rich.progress import (
-            Progress,
-            SpinnerColumn,
-            BarColumn,
-            TimeElapsedColumn,
-            TimeRemainingColumn,
-            TextColumn,
-        )
-        
-        # Define a custom column for system stats
-        class SystemStatsColumn(TextColumn):
-            def render(self, task):
-                try:
-                    import psutil
-                    import torch
-                    cpu = psutil.cpu_percent()
-                    ram = psutil.virtual_memory().percent
-                    gpu_mem = 0.0
-                    if torch.cuda.is_available():
-                        gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3) # GB
-                    
-                    return f"[bold #f472b6]CPU:[/bold #f472b6] {cpu:>4.1f}% | [bold #a78bfa]RAM:[/bold #a78bfa] {ram:>4.1f}% | [bold #34d399]GPU Mem:[/bold #34d399] {gpu_mem:.2f}GB"
-                except ImportError:
-                    return ""
+    """Yield (None, None); epoch logging goes through update_epoch()."""
+    log_info(f"Starting {description} ({total} epochs)")
+    t0 = time.perf_counter()
+    yield None, None
+    elapsed = time.perf_counter() - t0
+    log_info(f"Finished {description} — total wall time {elapsed:.1f}s")
 
-        # Custom "Radar" Spinner and detailed columns
-        with Progress(
-            SpinnerColumn(spinner_name="dots", style="#38bdf8"),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=None, style="#1e293b", complete_style="#38bdf8", finished_style="#22c55e"),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•", style="#475569"),
-            TimeElapsedColumn(),
-            TextColumn("•", style="#475569"),
-            TimeRemainingColumn(),
-            TextColumn("•", style="#475569"),
-            SystemStatsColumn(""), # Add live system stats
-            TextColumn("•", style="#475569"),
-            TextColumn("{task.fields[status]}", style="#94a3b8"),
-            expand=True,
-            transient=False, # Keep the bar after completion for history
-            refresh_per_second=4, # Update frequently for stats
-        ) as progress:
-            task_id = progress.add_task(description, total=total, status="Initializing...")
-            yield progress, task_id
-    else:
-        yield None, None
 
-def update_epoch(progress: Any, task_id: Any, epoch: int, total: int, metrics: Dict[str, float]):
-    if progress is None:
-        msg = " | ".join([f"{k}={v:.6f}" for k, v in metrics.items()])
-        print(f"Epoch {epoch:03d}/{total:03d} | {msg}")
-        return
-    
-    # Format metrics for the progress bar
-    status_parts = []
-    for k, v in metrics.items():
-        color = "#22c55e" if "loss" not in k.lower() else "#f43f5e" # Green for metrics, Red for loss (heuristic)
-        if "rmse" in k.lower(): color = "#eab308" # Yellow for RMSE
-        status_parts.append(f"[{color}]{k}[/{color}]: {v:.6f}")
-    
-    status = " | ".join(status_parts)
-    progress.update(task_id, advance=1, status=status)
+def update_epoch(progress: Any, task_id: Any, epoch: int, total: int, metrics: Dict[str, float]) -> None:
+    """Log one epoch's metrics as a plain-text line."""
+    parts = [f"{k}={v:.6f}" for k, v in metrics.items()]
+    msg = " | ".join(parts)
+    # Include system stats if possible
+    sys_stats = ""
+    try:
+        import psutil
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        sys_stats = f" | CPU={cpu:.1f}% RAM={ram:.1f}%"
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.memory_allocated() / (1024**3)
+            gpu_max = torch.cuda.max_memory_allocated() / (1024**3)
+            sys_stats += f" GPU_MEM={gpu_mem:.2f}GB GPU_PEAK={gpu_max:.2f}GB"
+    except Exception:
+        pass
+    line = f"Epoch {epoch:03d}/{total:03d} | {msg}{sys_stats}"
+    print(line, flush=True)
+    _write_to_log(line)
 
-def print_banner(console, title: str, subtitle: str = ""):
-    if has_rich():
-        from rich.panel import Panel
-        from rich.text import Text
-        from rich.align import Align
-        from rich.table import Table
-        from rich import box
-        
-        # Create a grid for the banner content
-        grid = Table.grid(expand=True)
-        grid.add_column(justify="center", ratio=1)
-        
-        # Title with Gradient (simulated with colors if gradient not supported, but let's try standard styles)
-        title_text = Text(title.upper(), style="bold white")
-        subtitle_text = Text(subtitle, style="italic #38bdf8")
-        
-        grid.add_row(title_text)
-        grid.add_row(subtitle_text)
-        grid.add_row(Text("─" * 40, style="dim #475569")) # Separator
 
-        # System Info Row
-        sys_info = f"Python {sys.version.split()[0]} | {platform.system()} | Rich UI"
-        grid.add_row(Text(sys_info, style="dim #94a3b8"))
+# ---------------------------------------------------------------------------
+# Banner & key-value table
+# ---------------------------------------------------------------------------
 
-        console.print(Panel(
-            grid,
-            style="on #0f172a",
-            border_style="#38bdf8",
-            padding=(1, 2),
-            box=box.HEAVY_EDGE
-        ))
-    else:
-        console.rule(title)
-        print(subtitle)
+def print_banner(console: Any, title: str, subtitle: str = "") -> None:
+    console.rule(title.upper())
+    if subtitle:
+        console.print(subtitle)
+    sys_info = f"Python {sys.version.split()[0]} | {platform.system()} | PID {os.getpid()} | Plain-text logging"
+    console.print(sys_info)
 
-def print_kv_table(console, title: str, rows: Dict[str, Any]):
-    if has_rich():
-        from rich import box
-        from rich.table import Table
 
-        table = Table(
-            title=title,
-            box=box.ROUNDED,
-            title_style="bold #f0f9ff",
-            header_style="bold #38bdf8 on #1e293b",
-            border_style="#475569",
-            show_edge=True,
-            expand=True,
-            row_styles=["none", "dim"] # Alternating rows
-        )
-        table.add_column("Configuration", style="bold #0ea5e9", no_wrap=True, ratio=1)
-        table.add_column("Value", style="#f8fafc", ratio=2)
-        
-        for k, v in rows.items():
-            table.add_row(str(k), str(v))
-        
-        console.print(table)
-    else:
-        console.rule(title)
-        for k, v in rows.items():
-            console.log(f"- {k}: {v}")
+def print_kv_table(console: Any, title: str, rows: Dict[str, Any]) -> None:
+    console.rule(title)
+    for k, v in rows.items():
+        console.print(f"  {k}: {v}")

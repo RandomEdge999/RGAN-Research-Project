@@ -12,7 +12,7 @@ from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader, TensorDataset
 
 from .config import TrainConfig
-from .logging_utils import get_console, epoch_progress, update_epoch
+from .logging_utils import get_console, epoch_progress, update_epoch, log_info, log_step, log_warn, log_error, log_exception, log_debug, log_shape
 from .metrics import error_stats
 
 
@@ -144,6 +144,10 @@ def _gradient_penalty(
     Returns:
         The computed gradient penalty scalar tensor.
     """
+    # Ensure fp32 precision for gradient penalty — inputs may carry fp16 from
+    # AMP autocast, and the norm/subtraction (grad.norm - 1.0) loses precision in fp16.
+    real_inputs = real_inputs.float()
+    fake_inputs = fake_inputs.float()
     batch_size = real_inputs.size(0)
     epsilon = torch.rand(batch_size, 1, 1, device=device)
     epsilon = epsilon.expand_as(real_inputs)
@@ -282,8 +286,8 @@ def _load_checkpoint(
     if "scaler_D_state_dict" in ckpt and not isinstance(scaler_D, _IdentityScaler):
         scaler_D.load_state_dict(ckpt["scaler_D_state_dict"])
 
-    console.print(
-        f"[green]Resumed from checkpoint:[/green] epoch {ckpt['epoch']}, "
+    console.log(
+        f"Resumed from checkpoint: epoch {ckpt['epoch']}, "
         f"best_val={ckpt['best_val']:.6f}"
     )
     return {
@@ -318,6 +322,13 @@ def train_rgan_torch(
     """
     G, D = models
     console = get_console()
+    log_info(f"train_rgan_torch called: epochs={config.epochs}, batch_size={config.batch_size}, device={config.device}")
+    log_step(f"GAN variant: {config.gan_variant}, lr_g={config.lr_g}, lr_d={config.lr_d}")
+    log_step(f"lambda_reg={config.lambda_reg}, adv_weight={config.adv_weight}, patience={config.patience}")
+    log_step(f"AMP requested: {config.amp}, eval_every={config.eval_every}")
+    log_step(f"Generator params: {sum(p.numel() for p in G.parameters())}")
+    log_step(f"Discriminator params: {sum(p.numel() for p in D.parameters())}")
+
     requested_device = torch.device(config.device)
     if requested_device.type == "cuda" and not torch.cuda.is_available():
         hint = (
@@ -328,17 +339,17 @@ def train_rgan_torch(
             raise RuntimeError(
                 f"CUDA device {config.device} was requested but is unavailable. {hint}"
             )
-        console.print(
-            f"[yellow]CUDA unavailable — falling back to CPU despite requested device {config.device}. {hint}[/yellow]"
+        console.log(
+            f"WARNING: CUDA unavailable — falling back to CPU despite requested device {config.device}. {hint}"
         )
         requested_device = torch.device("cpu")
 
     if requested_device.type == "cuda":
         torch.cuda.set_device(requested_device)
         device_name = torch.cuda.get_device_name(requested_device)
-        console.print(f"[green]Using CUDA device:[/green] {device_name} ({requested_device})")
+        console.log(f"Using CUDA device: {device_name} ({requested_device})")
     else:
-        console.print("[yellow]Using CPU for training (no CUDA device active).[/yellow]")
+        console.log("WARNING: Using CPU for training (no CUDA device active).")
 
     device = requested_device
     G.to(device)
@@ -347,7 +358,14 @@ def train_rgan_torch(
     Xtr, Ytr = data_splits["Xtr"], data_splits["Ytr"]
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
     Xte, Yte = data_splits["Xte"], data_splits["Yte"]
+    log_shape("Xtr", Xtr)
+    log_shape("Ytr", Ytr)
+    log_shape("Xval", Xval)
+    log_shape("Yval", Yval)
+    log_shape("Xte", Xte)
+    log_shape("Yte", Yte)
 
+    log_step(f"Creating Adam optimizers: lr_g={config.lr_g}, lr_d={config.lr_d}, weight_decay={config.weight_decay}")
     optG = torch.optim.Adam(G.parameters(), lr=config.lr_g, weight_decay=config.weight_decay)
     optD = torch.optim.Adam(D.parameters(), lr=config.lr_d, weight_decay=config.weight_decay)
     mse = nn.MSELoss()
@@ -429,19 +447,24 @@ def train_rgan_torch(
     amp_requested = config.amp
     amp_available = AMP.available
     amp_enabled = amp_requested and (device.type == "cuda") and amp_available
+    log_step(f"AMP: requested={amp_requested}, available={amp_available}, enabled={amp_enabled}")
     
     if amp_requested and not amp_enabled:
         if device.type != "cuda":
             get_console().print(
-                "[yellow]AMP requested but no CUDA device is active; running in full precision.[/yellow]"
+                "WARNING: AMP requested but no CUDA device is active; running in full precision."
             )
         elif not amp_available:
             get_console().print(
-                "[yellow]AMP requested but unsupported by this PyTorch build; running in full precision.[/yellow]"
+                "WARNING: AMP requested but unsupported by this PyTorch build; running in full precision."
             )
 
     scaler_G = AMP.make_scaler(enabled=amp_enabled)
-    scaler_D = AMP.make_scaler(enabled=amp_enabled)
+    # WGAN-GP gradient penalty uses create_graph=True for second-order gradients.
+    # GradScaler inflates the loss, and that inflation leaks into the GP's
+    # second-order computation, producing incorrect gradients.  Disable scaling
+    # for D when using gradient penalty; G can still benefit from AMP scaling.
+    scaler_D = AMP.make_scaler(enabled=(amp_enabled and gan_variant != "wgan-gp"))
 
     best_val = float("inf")
     best_state = None
@@ -468,8 +491,14 @@ def train_rgan_torch(
         hist["D_real_mean"] = []
         hist["D_fake_mean"] = []
 
+    log_step(f"Training state: batch_size={current_batch_size}, warmup_epochs={warmup_epochs}, d_steps={d_steps}, g_steps={g_steps}")
+    log_step(f"Instance noise: std={instance_noise_std}, decay={instance_noise_decay}")
+    log_step(f"EMA: decay={ema_decay}, enabled={use_ema}")
+    log_step(f"Lambda reg: start={lambda_reg_start}, end={lambda_reg_end}, warmup={lambda_reg_warmup}")
+
     # --- Checkpoint resume ---
     if config.resume_from and os.path.isfile(config.resume_from):
+        log_step(f"Loading checkpoint from: {config.resume_from}")
         restored = _load_checkpoint(
             Path(config.resume_from), G, D, optG, optD, scaler_G, scaler_D, device
         )
@@ -487,7 +516,9 @@ def train_rgan_torch(
     persistent_workers = bool(config.persistent_workers and num_workers > 0)
     pin_memory = bool(config.pin_memory and device.type == "cuda")
 
+    log_step(f"DataLoader config: num_workers={num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}, prefetch_factor={prefetch_factor}")
     train_ds = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(Ytr))
+    log_step(f"TensorDataset created: {len(train_ds)} samples")
 
     def make_loader(bs: int) -> DataLoader:
         kwargs = dict(
@@ -505,7 +536,7 @@ def train_rgan_torch(
     train_loader = make_loader(current_batch_size)
 
     with epoch_progress(config.epochs, description="R-GAN (Torch)") as (progress, task_id):
-        if start_epoch > 1:
+        if start_epoch > 1 and progress is not None:
             progress.update(task_id, completed=start_epoch - 1)
         for epoch in range(start_epoch, config.epochs + 1):
             supervised_only = epoch <= warmup_epochs
@@ -581,7 +612,7 @@ def train_rgan_torch(
                                 clip_grad_value_(D.parameters(), config.grad_clip)
 
                                 total_norm = torch.nn.utils.clip_grad_norm_(D.parameters(), float('inf'))
-                                epoch_grad_D.append(float(total_norm))
+                                epoch_grad_D.append(total_norm.item() if isinstance(total_norm, torch.Tensor) else float(total_norm))
 
                                 scaler_D.step(optD)
                                 scaler_D.update()
@@ -592,16 +623,16 @@ def train_rgan_torch(
                                         if p.requires_grad:
                                             p.data.clamp_(-clip_val, clip_val)
 
-                                epoch_D_losses.append(float(D_loss_main.detach().cpu()))
+                                epoch_D_losses.append(D_loss_main.detach().item())
                                 if track_logits:
                                     if gan_variant in {"wgan", "wgan-gp"}:
-                                        epoch_D_real.append(float(D_real.mean().detach().cpu()))
-                                        epoch_D_fake.append(float(D_fake.mean().detach().cpu()))
+                                        epoch_D_real.append(D_real.mean().detach().item())
+                                        epoch_D_fake.append(D_fake.mean().detach().item())
                                     else:
                                         real_prob = torch.sigmoid(D_real) if use_logits else _disc_output_to_prob(D_real)
                                         fake_prob = torch.sigmoid(D_fake) if use_logits else _disc_output_to_prob(D_fake)
-                                        epoch_D_real.append(float(real_prob.mean().detach().cpu()))
-                                        epoch_D_fake.append(float(fake_prob.mean().detach().cpu()))
+                                        epoch_D_real.append(real_prob.mean().detach().item())
+                                        epoch_D_fake.append(fake_prob.mean().detach().item())
 
                         for _ in range(g_steps):
                             optG.zero_grad(set_to_none=True)
@@ -640,14 +671,14 @@ def train_rgan_torch(
                             clip_grad_value_(G.parameters(), config.grad_clip)
 
                             total_norm = torch.nn.utils.clip_grad_norm_(G.parameters(), float('inf'))
-                            epoch_grad_G.append(float(total_norm))
+                            epoch_grad_G.append(total_norm.item() if isinstance(total_norm, torch.Tensor) else float(total_norm))
 
                             scaler_G.step(optG)
                             scaler_G.update()
 
-                            epoch_G_losses.append(float(total_loss.detach().cpu()))
-                            epoch_adv.append(float(adv_loss.detach().cpu()))
-                            epoch_reg.append(float(reg_loss.detach().cpu()))
+                            epoch_G_losses.append(total_loss.detach().item())
+                            epoch_adv.append(adv_loss.detach().item())
+                            epoch_reg.append(reg_loss.detach().item())
 
                             if use_ema and ema_shadow is not None:
                                 _update_ema(ema_shadow, G, ema_decay)
@@ -656,14 +687,16 @@ def train_rgan_torch(
 
                     break
                 except torch.cuda.OutOfMemoryError:
+                    log_error(f"CUDA OOM at epoch {epoch}, current batch_size={current_batch_size}")
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     optD.zero_grad(set_to_none=True)
                     optG.zero_grad(set_to_none=True)
                     if current_batch_size == 1:
+                        log_error("Batch size already 1, cannot reduce further. Raising OOM.")
                         raise
                     current_batch_size = max(1, current_batch_size // 2)
-                    console.log(f"[R-GAN Torch] CUDA OOM detected. Reducing batch size to {current_batch_size}.")
+                    log_warn(f"Reducing batch size to {current_batch_size} and retrying epoch {epoch}")
                     train_loader = make_loader(current_batch_size)
                     continue
 
@@ -679,53 +712,60 @@ def train_rgan_torch(
                 hist["D_fake_mean"].append(float(np.mean(epoch_D_fake) if epoch_D_fake else 0.0))
 
             eval_bs = max(1, min(config.eval_batch_size, current_batch_size))
+            eval_every = max(1, getattr(config, "eval_every", 1))
+            is_eval_epoch = (epoch % eval_every == 0) or (epoch == config.epochs)
 
-            if use_ema and ema_shadow is not None:
-                backup = _swap_params_with_shadow(G, ema_shadow)
-                tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
-                te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
-                va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
-                _swap_params_with_shadow(G, backup)
+            if is_eval_epoch:
+                # Only evaluate on val set during training for speed;
+                # train/test metrics are computed at the end.
+                if use_ema and ema_shadow is not None:
+                    backup = _swap_params_with_shadow(G, ema_shadow)
+                    va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
+                    _swap_params_with_shadow(G, backup)
+                else:
+                    va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
+
+                hist["epoch"].append(epoch)
+                hist["val_rmse"].append(va_stats["rmse"])
+                # Placeholder for train/test — filled at end
+                hist["train_rmse"].append(float("nan"))
+                hist["test_rmse"].append(float("nan"))
+
+                update_epoch(progress, task_id, epoch, config.epochs, {
+                    "D": hist["D_loss"][-1],
+                    "G": hist["G_loss"][-1],
+                    "Val": va_stats["rmse"],
+                })
+
+                va_rmse = va_stats["rmse"]
+                if np.isnan(va_rmse):
+                    log_warn(f"Validation RMSE is NaN at epoch {epoch}. bad_epochs={bad_epochs+1}/{patience}")
+                    bad_epochs += 1
+                elif va_rmse < best_val - 1e-7:
+                    log_step(f"Epoch {epoch}: new best val RMSE={va_rmse:.6f} (prev={best_val:.6f})")
+                    best_val = va_rmse
+                    best_state = copy.deepcopy(G.state_dict())
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    log_debug(f"Epoch {epoch}: no improvement. val_rmse={va_rmse:.6f}, best={best_val:.6f}, bad_epochs={bad_epochs}/{patience}")
+                    if bad_epochs >= patience:
+                        log_info(f"Early stopping at epoch {epoch}. best_val={best_val:.6f}")
+                        if config.checkpoint_dir:
+                            ckpt_dir = Path(config.checkpoint_dir)
+                            _save_checkpoint(
+                                ckpt_dir / "checkpoint_latest.pt", epoch,
+                                G, D, optG, optD, scaler_G, scaler_D,
+                                best_val, best_state, bad_epochs, hist,
+                                ema_shadow, current_batch_size, config,
+                            )
+                        break
             else:
-                tr_stats, _ = compute_metrics(G, Xtr, Ytr, batch_size=eval_bs)
-                te_stats, _ = compute_metrics(G, Xte, Yte, batch_size=eval_bs)
-                va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
-
-            hist["epoch"].append(epoch)
-            hist["train_rmse"].append(tr_stats["rmse"])
-            hist["test_rmse"].append(te_stats["rmse"])
-            hist["val_rmse"].append(va_stats["rmse"])
-
-            update_epoch(progress, task_id, epoch, config.epochs, {
-                "D": hist["D_loss"][-1],
-                "G": hist["G_loss"][-1],
-                "Train": tr_stats["rmse"],
-                "Val": va_stats["rmse"],
-                "Test": te_stats["rmse"],
-            })
-
-            va_rmse = va_stats["rmse"]
-            if np.isnan(va_rmse):
-                console.log(f"[R-GAN Torch] Validation RMSE is NaN at epoch {epoch}. Counting as bad epoch.")
-                bad_epochs += 1
-            elif va_rmse < best_val - 1e-7:
-                best_val = va_rmse
-                best_state = copy.deepcopy(G.state_dict())
-                bad_epochs = 0
-            else:
-                bad_epochs += 1
-                if bad_epochs >= patience:
-                    console.log(f"[R-GAN Torch] Early stopping at epoch {epoch}.")
-                    # Save final checkpoint before breaking
-                    if config.checkpoint_dir:
-                        ckpt_dir = Path(config.checkpoint_dir)
-                        _save_checkpoint(
-                            ckpt_dir / "checkpoint_latest.pt", epoch,
-                            G, D, optG, optD, scaler_G, scaler_D,
-                            best_val, best_state, bad_epochs, hist,
-                            ema_shadow, current_batch_size, config,
-                        )
-                    break
+                # Non-eval epoch: just log losses
+                update_epoch(progress, task_id, epoch, config.epochs, {
+                    "D": hist["D_loss"][-1],
+                    "G": hist["G_loss"][-1],
+                })
 
             # --- Periodic checkpoint save ---
             if (
@@ -734,17 +774,23 @@ def train_rgan_torch(
                 and epoch % config.checkpoint_every == 0
             ):
                 ckpt_dir = Path(config.checkpoint_dir)
+                ckpt_path = ckpt_dir / "checkpoint_latest.pt"
+                log_step(f"Saving periodic checkpoint at epoch {epoch} to {ckpt_path}")
                 _save_checkpoint(
-                    ckpt_dir / "checkpoint_latest.pt", epoch,
+                    ckpt_path, epoch,
                     G, D, optG, optD, scaler_G, scaler_D,
                     best_val, best_state, bad_epochs, hist,
                     ema_shadow, current_batch_size, config,
                 )
 
     if best_state is not None:
+        log_step(f"Loading best model state (best_val={best_val:.6f})")
         G.load_state_dict(best_state)
+    else:
+        log_warn("No best state was saved (training may not have improved from initial state)")
 
     if use_ema and ema_shadow is not None:
+        log_step("Creating EMA model copy for final evaluation")
         G_ema = copy.deepcopy(G)
         _swap_params_with_shadow(G_ema, ema_shadow)
     else:
@@ -752,8 +798,12 @@ def train_rgan_torch(
 
     eval_bs = max(1, min(config.eval_batch_size, current_batch_size))
     eval_model = G_ema or G
+    log_step(f"Computing final train metrics (eval_bs={eval_bs}, samples={len(Xtr)})")
     train_stats, _ = compute_metrics(eval_model, Xtr, Ytr, batch_size=eval_bs)
+    log_step(f"Final train RMSE={train_stats.get('rmse', 'N/A'):.6f}")
+    log_step(f"Computing final test metrics (samples={len(Xte)})")
     test_stats, Y_pred = compute_metrics(eval_model, Xte, Yte, batch_size=eval_bs)
+    log_step(f"Final test RMSE={test_stats.get('rmse', 'N/A'):.6f}")
 
     return {
         "G": G,

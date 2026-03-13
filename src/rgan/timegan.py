@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Any, Optional, Tuple
 
-from .logging_utils import get_console, epoch_progress, update_epoch
+from .logging_utils import get_console, epoch_progress, update_epoch, log_info, log_step, log_debug
 from .metrics import error_stats
 
 
@@ -188,7 +188,7 @@ def train_timegan(
     dev = torch.device(device)
 
     n_samples, seq_len, feature_dim = real_data.shape
-    console.log(f"[TimeGAN] Training on {n_samples} sequences, seq_len={seq_len}, features={feature_dim}")
+    log_info(f"[TimeGAN] Training on {n_samples} sequences, seq_len={seq_len}, features={feature_dim}")
 
     # Normalize to [0, 1] for sigmoid activations
     data_min = real_data.min(axis=(0, 1), keepdims=True)
@@ -221,7 +221,7 @@ def train_timegan(
         return torch.from_numpy(real_normed[idx].astype(np.float32)).to(dev)
 
     # ── Phase 1: Autoencoder ──────────────────────────────────────
-    console.log("[TimeGAN] Phase 1: Autoencoder training")
+    log_info("[TimeGAN] Phase 1: Autoencoder training")
     with epoch_progress(epochs_ae, description="TimeGAN-AE") as (progress, task_id):
         for epoch in range(1, epochs_ae + 1):
             epoch_loss = 0.0
@@ -238,7 +238,7 @@ def train_timegan(
             update_epoch(progress, task_id, epoch, epochs_ae, {"AE Loss": avg})
 
     # ── Phase 2: Supervised ───────────────────────────────────────
-    console.log("[TimeGAN] Phase 2: Supervised training")
+    log_info("[TimeGAN] Phase 2: Supervised training")
     with epoch_progress(epochs_sup, description="TimeGAN-Sup") as (progress, task_id):
         for epoch in range(1, epochs_sup + 1):
             epoch_loss = 0.0
@@ -256,7 +256,7 @@ def train_timegan(
             update_epoch(progress, task_id, epoch, epochs_sup, {"Sup Loss": avg})
 
     # ── Phase 3: Joint training ───────────────────────────────────
-    console.log("[TimeGAN] Phase 3: Joint adversarial training")
+    log_info("[TimeGAN] Phase 3: Joint adversarial training")
     total_joint = epochs_joint
     with epoch_progress(total_joint, description="TimeGAN-Joint") as (progress, task_id):
         for epoch in range(1, total_joint + 1):
@@ -318,7 +318,7 @@ def train_timegan(
             update_epoch(progress, task_id, epoch, total_joint,
                          {"G": g_avg, "D": d_avg})
 
-    console.log("[TimeGAN] Training complete.")
+    log_info("[TimeGAN] Training complete.")
 
     # Generate a batch of synthetic data for evaluation
     synthetic = model.generate(n_samples, seq_len, device=dev)

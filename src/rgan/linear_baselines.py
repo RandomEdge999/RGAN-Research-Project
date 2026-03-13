@@ -17,7 +17,7 @@ import torch.nn as nn
 from typing import Dict, Any
 
 from .config import TrainConfig
-from .logging_utils import get_console, epoch_progress, update_epoch
+from .logging_utils import get_console, epoch_progress, update_epoch, log_info, log_step, log_debug
 from .metrics import error_stats
 
 
@@ -186,7 +186,7 @@ def train_linear_baseline(
             else:
                 bad_epochs += 1
                 if bad_epochs >= config.patience:
-                    console.log(f"[{tag}] Early stopping at epoch {epoch}.")
+                    log_info(f"[{tag}] Early stopping at epoch {epoch}. best_val={best_val:.6f}")
                     break
 
     if best_state is not None:

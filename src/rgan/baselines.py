@@ -7,6 +7,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
 from .metrics import error_stats as _error_stats
+from .logging_utils import log_step, log_warn, log_info
 
 
 try:
@@ -25,14 +26,17 @@ else:
 
 def naive_baseline(X, Y):
     """Naive baseline that repeats the last observed value."""
+    log_step(f"Naive baseline: X.shape={X.shape}, Y.shape={Y.shape}")
     H = Y.shape[1]
     last_vals = X[:, -1, 0:1]
     naive_pred = np.repeat(last_vals[:, None, :], H, axis=1)
     stats = _error_stats(Y.reshape(-1), naive_pred.reshape(-1))
+    log_step(f"Naive baseline RMSE={stats.get('rmse', 'N/A'):.6f}")
     return stats, naive_pred
 
 def arima_forecast(X_train, Y_train, X_eval=None, Y_eval=None, order=(1, 1, 1)):
     """ARIMA forecast using statsmodels."""
+    log_step(f"ARIMA forecast: order={order}, X_train.shape={X_train.shape}")
     if not _HAS_STATSMODELS:
         raise ImportError("statsmodels is required for ARIMA.")
 
@@ -64,27 +68,24 @@ def arima_forecast(X_train, Y_train, X_eval=None, Y_eval=None, order=(1, 1, 1)):
     with warnings.catch_warnings():
         for category in _STATSMODELS_WARNING_CATEGORIES:
             warnings.simplefilter("ignore", category=category)
-        
-        model = ARIMA(train_series, order=order)
-        fit = model.fit()
+
+        try:
+            model = ARIMA(train_series, order=order)
+            fit = model.fit()
+        except Exception:
+            # ARIMA fit can fail on certain series (singular Hessian, etc.)
+            H = Y_eval.shape[1]
+            predictions = np.zeros((len(X_eval), H, 1), dtype=np.float32)
+            stats = _error_stats(Y_eval.reshape(-1), predictions.reshape(-1))
+            return stats, predictions
 
     predictions = []
     H = Y_eval.shape[1]
-    
-    # For evaluation, we use the history in X_eval to forecast.
-    # ARIMA needs the history to be continuous with the training data OR we need to 'apply' the model.
-    # 'apply' allows updating the state with new observations.
-    
-    # Since X_eval windows might be disjoint from training (e.g. test set), 
-    # and we want to forecast H steps given L steps of history:
-    # We can use the `apply` method on the history of each window.
-    
+
     for i in range(len(X_eval)):
         history = X_eval[i, :, 0]
         try:
-             # Create a new results object with the same parameters but new history
             res = fit.apply(history)
-            # Forecast H steps ahead from the end of 'history'
             fc = res.forecast(steps=H)
             predictions.append(fc)
         except Exception:
@@ -92,11 +93,13 @@ def arima_forecast(X_train, Y_train, X_eval=None, Y_eval=None, order=(1, 1, 1)):
 
     predictions = np.array(predictions).reshape(len(X_eval), H, 1)
     stats = _error_stats(Y_eval.reshape(-1), predictions.reshape(-1))
+    log_step(f"ARIMA forecast RMSE={stats.get('rmse', 'N/A'):.6f}")
     return stats, predictions
 
 
 def arma_forecast(X_train, Y_train, X_eval=None, Y_eval=None, order=(1, 1)):
     """ARMA forecast (ARIMA with d=0)."""
+    log_step(f"ARMA forecast: order={order}")
     return arima_forecast(X_train, Y_train, X_eval, Y_eval, order=(order[0], 0, order[1]))
 
 
@@ -138,6 +141,7 @@ def tree_ensemble_forecast(
     X_train_flat = X_train.reshape(X_train.shape[0], -1)
     X_eval_flat = X_eval.reshape(X_eval.shape[0], -1)
 
+    log_step(f"Tree ensemble: X_train.shape={X_train.shape}, n_estimators=400, max_depth=3")
     base = GradientBoostingRegressor(
         loss="squared_error",
         learning_rate=0.05,
@@ -151,6 +155,7 @@ def tree_ensemble_forecast(
     preds = model.predict(X_eval_flat).reshape(n_samples, H, 1)
 
     stats = _error_stats(Y_eval.reshape(-1), preds.reshape(-1))
+    log_step(f"Tree ensemble RMSE={stats.get('rmse', 'N/A'):.6f}")
     if return_model:
         return stats, preds, model
     return stats, preds

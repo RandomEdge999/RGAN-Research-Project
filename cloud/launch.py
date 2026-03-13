@@ -5,6 +5,7 @@ Usage:
     python -m cloud.launch --csv data/binance/Binance_Data.csv --epochs 80
     python -m cloud.launch --csv data/binance/Binance_Data.csv --epochs 80 --spot false
     python -m cloud.launch --csv data/binance/Binance_Data.csv --job_name my-experiment
+    python -m cloud.launch --csv data/binance/Binance_Data.csv --resume_job rgan-20260312-160656
 
 This script:
   1. Ensures the S3 bucket exists
@@ -97,7 +98,9 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--gan_variant", default=None)
     ap.add_argument("--skip_classical", action="store_true")
+    ap.add_argument("--skip_noise_robustness", action="store_true")
     ap.add_argument("--max_train_windows", type=int, default=None)
+    ap.add_argument("--resume_job", default="", help="Resume from a previous job's checkpoints (pass the old job name)")
 
     args = ap.parse_args()
 
@@ -181,9 +184,13 @@ def main():
         "train_ratio": str(defaults.get("train_ratio", 0.8)),
         "weight_decay": str(defaults.get("weight_decay", 0.0)),
         "adv_weight": str(defaults.get("adv_weight", 1.0)),
+        "eval_every": str(defaults.get("eval_every", 5)),
+        "eval_batch_size": str(defaults.get("eval_batch_size", 2048)),
     }
-    if args.skip_classical:
+    if args.skip_classical or defaults.get("skip_classical", False):
         hyperparameters["skip_classical"] = "true"
+    if args.skip_noise_robustness or defaults.get("skip_noise_robustness", False):
+        hyperparameters["skip_noise_robustness"] = "true"
     if args.max_train_windows:
         hyperparameters["max_train_windows"] = str(args.max_train_windows)
 
@@ -198,6 +205,28 @@ def main():
         use_spot = args.spot.lower() in ("true", "1", "yes")
 
     image_uri = _get_pytorch_image_uri(region, sm_cfg["pytorch_version"], sm_cfg["python_version"])
+
+    # Copy checkpoints from a previous job if resuming
+    if args.resume_job:
+        old_prefix = f"checkpoints/{args.resume_job}/"
+        new_prefix = f"checkpoints/{job_name}/"
+        print(f"\n[*] Copying checkpoints from {args.resume_job} to {job_name}...")
+        paginator = s3.get_paginator("list_objects_v2")
+        copied = 0
+        for page in paginator.paginate(Bucket=bucket, Prefix=old_prefix):
+            for obj in page.get("Contents", []):
+                old_key = obj["Key"]
+                new_key = old_key.replace(old_prefix, new_prefix, 1)
+                s3.copy_object(
+                    Bucket=bucket,
+                    CopySource={"Bucket": bucket, "Key": old_key},
+                    Key=new_key,
+                )
+                copied += 1
+        if copied:
+            print(f"  Copied {copied} checkpoint file(s)")
+        else:
+            print(f"  WARNING: No checkpoints found for job {args.resume_job}")
 
     # 5. Launch training job via boto3
     print(f"\n[5/5] Launching SageMaker job: {job_name}")
