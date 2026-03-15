@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from itertools import combinations
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
 from contextlib import contextmanager
@@ -218,8 +218,8 @@ def main():
     ap.add_argument("--d_layers", type=int, default=2)
     ap.add_argument("--g_dense_activation", default="", help="Optional dense activation for the generator (PyTorch activation name).")
     ap.add_argument("--d_activation", default="sigmoid", help="Discriminator activation (PyTorch activation name).")
-    ap.add_argument("--lrG", type=float, default=5e-4)
-    ap.add_argument("--lrD", type=float, default=5e-4)
+    ap.add_argument("--lr_g", "--lrG", type=float, default=5e-4, dest="lr_g")
+    ap.add_argument("--lr_d", "--lrD", type=float, default=5e-4, dest="lr_d")
     ap.add_argument("--label_smooth", type=float, default=0.9)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--dropout", type=float, default=0.1)
@@ -353,6 +353,23 @@ def main():
         "--require_cuda",
         action="store_true",
         help="Exit immediately if CUDA is unavailable (helpful when you expect to use a GPU).",
+    )
+    ap.add_argument(
+        "--only_models",
+        default="",
+        help=(
+            "Comma-separated list of models to train (e.g. 'patchtst,itransformer'). "
+            "Models not listed will be loaded from --prior_results instead of trained. "
+            "Valid names: rgan, lstm, dlinear, nlinear, fits, patchtst, itransformer, autoformer, informer."
+        ),
+    )
+    ap.add_argument(
+        "--prior_results",
+        default="",
+        help=(
+            "Path to a prior results directory containing model weights (models/*.pt) "
+            "and metrics.json. Used with --only_models to load skipped models."
+        ),
     )
     ap.add_argument("--tune_csv", default="")
     ap.add_argument("--results_dir", default="./results/experiment")
@@ -527,6 +544,61 @@ def main():
             ) from exc
         raise
 
+    # ── Parse --only_models / --prior_results for selective retraining ──
+    ALL_NEURAL_MODELS = {"rgan", "lstm", "dlinear", "nlinear", "fits", "patchtst", "itransformer", "autoformer", "informer"}
+    if args.only_models:
+        _only_set = {m.strip().lower() for m in args.only_models.split(",") if m.strip()}
+        invalid = _only_set - ALL_NEURAL_MODELS
+        if invalid:
+            log_error(f"Unknown model names in --only_models: {invalid}. Valid: {sorted(ALL_NEURAL_MODELS)}")
+            sys.exit(1)
+        if not args.prior_results:
+            log_error("--only_models requires --prior_results (path to previous run's results dir with models/*.pt)")
+            sys.exit(1)
+        _prior_dir = Path(args.prior_results)
+        if not (_prior_dir / "models").is_dir():
+            log_error(f"--prior_results directory missing 'models/' subfolder: {_prior_dir}")
+            sys.exit(1)
+        log_info(f"Selective retraining: only training {sorted(_only_set)}, loading rest from {_prior_dir}")
+    else:
+        _only_set = ALL_NEURAL_MODELS  # train everything
+        _prior_dir = None
+
+    def _should_train(model_name: str) -> bool:
+        return model_name in _only_set
+
+    def _load_prior_model_and_predict(model_class, model_kwargs, pt_filename, data_dict, device):
+        """Load a model from prior results, run inference, return an *_out-style dict."""
+        pt_path = _prior_dir / "models" / pt_filename
+        if not pt_path.exists():
+            log_error(f"Prior model file not found: {pt_path}")
+            raise FileNotFoundError(pt_path)
+        model = model_class(**model_kwargs).to(device)
+        model.load_state_dict(torch.load(pt_path, map_location=device, weights_only=True))
+        model.eval()
+        Xtr, Ytr = data_dict["Xtr"], data_dict["Ytr"]
+        Xte, Yte = data_dict["Xte"], data_dict["Yte"]
+        eval_bs = max(1, min(1024, len(Xtr)))
+        def _batch_predict(X):
+            preds = []
+            with torch.no_grad():
+                for i in range(0, len(X), eval_bs):
+                    xb = torch.from_numpy(X[i:i+eval_bs]).to(device)
+                    preds.append(model(xb).cpu().numpy())
+            return np.concatenate(preds, axis=0)
+        tr = _batch_predict(Xtr)
+        te = _batch_predict(Xte)
+        train_stats = error_stats(Ytr.reshape(-1), tr.reshape(-1))
+        test_stats = error_stats(Yte.reshape(-1), te.reshape(-1))
+        return {
+            "model": model,
+            "history": {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []},
+            "train_stats": train_stats,
+            "test_stats": test_stats,
+            "pred_train": tr,
+            "pred_test": te,
+        }
+
     set_seed(args.seed)
 
     with log_phase(console, "Load dataset and standardize"):
@@ -624,8 +696,8 @@ def main():
         lambda_reg=args.lambda_reg,
         units_g=args.units_g,
         units_d=args.units_d,
-        lr_g=args.lrG,
-        lr_d=args.lrD,
+        lr_g=args.lr_g,
+        lr_d=args.lr_d,
         label_smooth=args.label_smooth,
         grad_clip=args.grad_clip,
         dropout=args.dropout,
@@ -672,7 +744,7 @@ def main():
         "GAN Variant": args.gan_variant,
         "D/G Steps": f"{args.d_steps}/{args.g_steps}",
         "Lambda": args.lambda_reg,
-        "Learning Rates (G/D)": f"{args.lrG}/{args.lrD}",
+        "Learning Rates (G/D)": f"{args.lr_g}/{args.lr_d}",
         "Dropout": args.dropout,
         "Layers (G/D)": f"{args.g_layers}/{args.d_layers}",
     })
@@ -700,11 +772,11 @@ def main():
                 shuffle=False,
             )
 
-            lr_candidates_g = sorted({max(1e-5, args.lrG * factor) for factor in (0.5, 1.0, 1.5)})
-            lr_candidates_g.append(max(1e-5, args.lrG))
+            lr_candidates_g = sorted({max(1e-5, args.lr_g * factor) for factor in (0.5, 1.0, 1.5)})
+            lr_candidates_g.append(max(1e-5, args.lr_g))
             lr_candidates_g = sorted(set(lr_candidates_g))
-            lr_candidates_d = sorted({max(1e-5, args.lrD * factor) for factor in (0.5, 1.0, 1.5)})
-            lr_candidates_d.append(max(1e-5, args.lrD))
+            lr_candidates_d = sorted({max(1e-5, args.lr_d * factor) for factor in (0.5, 1.0, 1.5)})
+            lr_candidates_d.append(max(1e-5, args.lr_d))
             lr_candidates_d = sorted(set(lr_candidates_d))
 
             dropout_candidates = sorted(
@@ -832,6 +904,8 @@ def main():
     def _run_classical_baselines():
         """Run CPU-only baselines (naive, ARIMA, ARMA, tree) in a background thread."""
         try:
+            import matplotlib
+            matplotlib.use("Agg")  # non-interactive backend safe for background threads
             log_info("BACKGROUND: Starting classical baselines on CPU (parallel with GPU training)")
 
             # Naive baseline (always runs)
@@ -893,6 +967,7 @@ def main():
             _classical_results["arima_train_stats"] = arima_train_stats_bg
             _classical_results["arima_test_stats"] = arima_test_stats_bg
             _classical_results["arima_curve_artifacts"] = arima_curve_bg
+            _classical_results["arima_test_pred"] = arima_test_pred_bg
             log_step(f"BACKGROUND: ARIMA done. Test RMSE={arima_test_stats_bg.get('rmse', 'N/A')}")
 
             # ARMA
@@ -919,6 +994,7 @@ def main():
             _classical_results["arma_train_stats"] = arma_train_stats_bg
             _classical_results["arma_test_stats"] = arma_test_stats_bg
             _classical_results["arma_curve_artifacts"] = arma_curve_bg
+            _classical_results["arma_test_pred"] = arma_test_pred_bg
             log_step(f"BACKGROUND: ARMA done. Test RMSE={arma_test_stats_bg.get('rmse', 'N/A')}")
 
             # Tree Ensemble
@@ -949,6 +1025,7 @@ def main():
             _classical_results["tree_train_stats"] = tree_train_stats_bg
             _classical_results["tree_test_stats"] = tree_test_stats_bg
             _classical_results["tree_curve_artifacts"] = tree_curve_bg
+            _classical_results["tree_test_pred"] = tree_test_pred_bg
             _classical_results["tree_model"] = tree_model_bg
             _classical_results["tree_config"] = {
                 "estimator": "GradientBoostingRegressor",
@@ -962,92 +1039,169 @@ def main():
             log_step(f"BACKGROUND: Tree Ensemble done. Test RMSE={tree_test_stats_bg.get('rmse', 'N/A')}")
 
             log_info("BACKGROUND: All classical baselines completed.")
+
+            # Persist results so resumed jobs can skip recomputation
+            _cache_path = results_dir / "classical_baselines_cache.pkl"
+            try:
+                import pickle
+                with open(_cache_path, "wb") as _f:
+                    pickle.dump(dict(_classical_results), _f, protocol=pickle.HIGHEST_PROTOCOL)
+                log_info(f"BACKGROUND: Classical baselines cached to {_cache_path}")
+            except Exception as _save_exc:
+                log_error(f"BACKGROUND: Failed to cache classical baselines — {_save_exc}")
+
         except Exception as exc:
             log_error(f"BACKGROUND: Classical baselines FAILED — {type(exc).__name__}: {exc}")
             _classical_results["error"] = exc
 
-    classical_thread = threading.Thread(target=_run_classical_baselines, name="classical-baselines", daemon=True)
-    classical_thread.start()
-    log_info("Classical baselines launched in background thread (running parallel with GPU training)")
+    # ── Try to load cached classical baselines (saves ~64 min on resume) ──
+    _classical_cache_loaded = False
+    _cache_search_dirs = [results_dir]
+    if args.resume_from:
+        # resume_from points to a checkpoint file; baselines cache lives in the results dir
+        _resume_dir = Path(args.resume_from).parent
+        _cache_search_dirs.insert(0, _resume_dir)
+        # Also check one level up (checkpoint might be in a subdirectory)
+        _cache_search_dirs.insert(1, _resume_dir.parent)
+    if base_config.checkpoint_dir:
+        _cache_search_dirs.insert(0, Path(base_config.checkpoint_dir))
 
-    with log_phase(console, "Train R-GAN (PyTorch)"):
-        log_step("Calling train_rgan_backend...")
-        rgan_out = train_rgan_backend(
-            base_config,
-            (G,D),
-            {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
-            str(results_dir),
-            tag="rgan"
-        )
+    for _search_dir in _cache_search_dirs:
+        _cache_file = _search_dir / "classical_baselines_cache.pkl"
+        if _cache_file.exists():
+            try:
+                import pickle
+                with open(_cache_file, "rb") as _f:
+                    _classical_results = pickle.load(_f)
+                log_info(f"Loaded cached classical baselines from {_cache_file} — skipping recomputation")
+                _classical_cache_loaded = True
+                break
+            except Exception as _load_exc:
+                log_error(f"Failed to load classical baselines cache from {_cache_file} — {_load_exc}")
 
-        log_step(f"R-GAN training completed. Train RMSE={rgan_out['train_stats'].get('rmse', 'N/A')}, Test RMSE={rgan_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("rgan_generator", rgan_out["G"])
-        _save_model("rgan_discriminator", rgan_out["D"])
-        if rgan_out.get("G_ema"):
-            _save_model("rgan_generator_ema", rgan_out["G_ema"])
-        log_step(f"Saved RGAN models to: {models_dir}")
+    if _classical_cache_loaded:
+        # Create a no-op thread that's already "done" so the join() later works
+        classical_thread = threading.Thread(target=lambda: None, name="classical-baselines", daemon=True)
+        classical_thread.start()
+    else:
+        classical_thread = threading.Thread(target=_run_classical_baselines, name="classical-baselines", daemon=True)
+        classical_thread.start()
+        log_info("Classical baselines launched in background thread (running parallel with GPU training)")
 
-    with log_phase(console, "Train supervised LSTM baseline"):
-        log_step("Calling train_lstm_backend...")
-        lstm_out = train_lstm_backend(
-            base_config,
-            {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
-            str(results_dir),
-            tag="lstm"
-        )
-        log_step(f"LSTM training completed. Train RMSE={lstm_out['train_stats'].get('rmse', 'N/A')}, Test RMSE={lstm_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("lstm", lstm_out["model"])
+    # ── Helper: load a baseline model from prior results ──
+    from rgan.linear_baselines import DLinear, NLinear
+    from rgan.fits import FITS
+    from rgan.patchtst import PatchTST
+    from rgan.itransformer import iTransformer as iTransformerModel
+    from rgan.autoformer import Autoformer
+    from rgan.informer import Informer
+
+    _MODEL_REGISTRY = {
+        "dlinear":      (DLinear,            {"L": base_config.L, "H": base_config.H}, "dlinear.pt"),
+        "nlinear":      (NLinear,            {"L": base_config.L, "H": base_config.H}, "nlinear.pt"),
+        "fits":         (FITS,               {"L": base_config.L, "H": base_config.H}, "fits.pt"),
+        "patchtst":     (PatchTST,           {"L": base_config.L, "H": base_config.H}, "patchtst.pt"),
+        "itransformer": (iTransformerModel,  {"L": base_config.L, "H": base_config.H}, "itransformer.pt"),
+        "autoformer":   (Autoformer,         {"L": base_config.L, "H": base_config.H}, "autoformer.pt"),
+        "informer":     (Informer,           {"L": base_config.L, "H": base_config.H}, "informer.pt"),
+    }
+
+    preferred = base_config.device
+    if preferred == "auto":
+        preferred = "cuda" if torch.cuda.is_available() else "cpu"
+    _load_device = torch.device(preferred)
+
+    def _load_or_skip(model_name):
+        """Load a skipped model from prior results. Returns *_out dict."""
+        cls, kwargs, pt_file = _MODEL_REGISTRY[model_name]
+        log_step(f"Loading {model_name} from prior results: {_prior_dir / 'models' / pt_file}")
+        return _load_prior_model_and_predict(cls, kwargs, pt_file, data_dict, _load_device)
+
+    # ── Train or load RGAN ──
+    if _should_train("rgan"):
+        with log_phase(console, "Train R-GAN (PyTorch)"):
+            log_step("Calling train_rgan_backend...")
+            rgan_out = train_rgan_backend(
+                base_config,
+                (G,D),
+                {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
+                str(results_dir),
+                tag="rgan"
+            )
+
+            log_step(f"R-GAN training completed. Train RMSE={rgan_out['train_stats'].get('rmse', 'N/A')}, Test RMSE={rgan_out['test_stats'].get('rmse', 'N/A')}")
+            _save_model("rgan_generator", rgan_out["G"])
+            _save_model("rgan_discriminator", rgan_out["D"])
+            if rgan_out.get("G_ema"):
+                _save_model("rgan_generator_ema", rgan_out["G_ema"])
+            log_step(f"Saved RGAN models to: {models_dir}")
+    else:
+        with log_phase(console, "Load R-GAN from prior results"):
+            pt_path = _prior_dir / "models" / "rgan_generator.pt"
+            log_step(f"Loading RGAN generator from: {pt_path}")
+            G.load_state_dict(torch.load(pt_path, map_location=_load_device, weights_only=True))
+            G.eval()
+            _, rgan_train_pred_loaded = compute_metrics_backend(G, Xtr, Ytr)
+            _, rgan_test_pred_loaded = compute_metrics_backend(G, Xte, Yte)
+            rgan_out = {
+                "G": G, "D": D,
+                "history": {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [], "D_loss": [], "G_loss": []},
+                "train_stats": error_stats(Ytr.reshape(-1), rgan_train_pred_loaded.reshape(-1)),
+                "test_stats": error_stats(Yte.reshape(-1), rgan_test_pred_loaded.reshape(-1)),
+                "pred_test": rgan_test_pred_loaded,
+            }
+            if (_prior_dir / "models" / "rgan_generator_ema.pt").exists():
+                _save_model("rgan_generator_ema", G)  # copy for consistency
+            log_step(f"RGAN loaded. Test RMSE={rgan_out['test_stats'].get('rmse', 'N/A')}")
+
+    # ── Train or load LSTM ──
+    if _should_train("lstm"):
+        with log_phase(console, "Train supervised LSTM baseline"):
+            log_step("Calling train_lstm_backend...")
+            lstm_out = train_lstm_backend(
+                base_config,
+                {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
+                str(results_dir),
+                tag="lstm"
+            )
+            log_step(f"LSTM training completed. Train RMSE={lstm_out['train_stats'].get('rmse', 'N/A')}, Test RMSE={lstm_out['test_stats'].get('rmse', 'N/A')}")
+            _save_model("lstm", lstm_out["model"])
+    else:
+        with log_phase(console, "Load LSTM from prior results"):
+            from rgan.lstm_supervised_torch import LSTMSupervised
+            lstm_out = _load_prior_model_and_predict(LSTMSupervised, {"L": base_config.L, "H": base_config.H, "n_in": Xtr.shape[-1], "units": base_config.units_g}, "lstm.pt", {"Xtr": Xtr, "Ytr": Ytr, "Xte": Xte, "Yte": Yte}, _load_device)
+            log_step(f"LSTM loaded. Test RMSE={lstm_out['test_stats'].get('rmse', 'N/A')}")
 
     data_dict = {"Xtr": Xtr, "Ytr": Ytr, "Xval": Xval, "Yval": Yval, "Xte": Xte, "Yte": Yte}
     log_step("data_dict prepared for baseline models")
 
-    with log_phase(console, "Train DLinear baseline"):
-        log_step("Calling train_linear_baseline(model_type='dlinear')...")
-        dlinear_out = train_linear_baseline(
-            base_config, data_dict, str(results_dir),
-            model_type="dlinear", tag="DLinear"
-        )
-        log_step(f"DLinear done. Test RMSE={dlinear_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("dlinear", dlinear_out["model"])
-
-    with log_phase(console, "Train NLinear baseline"):
-        log_step("Calling train_linear_baseline(model_type='nlinear')...")
-        nlinear_out = train_linear_baseline(
-            base_config, data_dict, str(results_dir),
-            model_type="nlinear", tag="NLinear"
-        )
-        log_step(f"NLinear done. Test RMSE={nlinear_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("nlinear", nlinear_out["model"])
-
-    with log_phase(console, "Train FITS baseline"):
-        log_step("Calling train_fits...")
-        fits_out = train_fits(base_config, data_dict, str(results_dir), tag="FITS")
-        log_step(f"FITS done. Test RMSE={fits_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("fits", fits_out["model"])
-
-    with log_phase(console, "Train PatchTST baseline"):
-        log_step("Calling train_patchtst...")
-        patchtst_out = train_patchtst(base_config, data_dict, str(results_dir), tag="PatchTST")
-        log_step(f"PatchTST done. Test RMSE={patchtst_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("patchtst", patchtst_out["model"])
-
-    with log_phase(console, "Train iTransformer baseline"):
-        log_step("Calling train_itransformer...")
-        itransformer_out = train_itransformer(base_config, data_dict, str(results_dir), tag="iTransformer")
-        log_step(f"iTransformer done. Test RMSE={itransformer_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("itransformer", itransformer_out["model"])
-
-    with log_phase(console, "Train Autoformer baseline"):
-        log_step("Calling train_autoformer...")
-        autoformer_out = train_autoformer(base_config, data_dict, str(results_dir), tag="Autoformer")
-        log_step(f"Autoformer done. Test RMSE={autoformer_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("autoformer", autoformer_out["model"])
-
-    with log_phase(console, "Train Informer baseline"):
-        log_step("Calling train_informer...")
-        informer_out = train_informer(base_config, data_dict, str(results_dir), tag="Informer")
-        log_step(f"Informer done. Test RMSE={informer_out['test_stats'].get('rmse', 'N/A')}")
-        _save_model("informer", informer_out["model"])
+    # ── Train or load remaining baselines ──
+    for _mname, _train_fn, _train_args, _label, _pt_name in [
+        ("dlinear",      lambda: train_linear_baseline(base_config, data_dict, str(results_dir), model_type="dlinear", tag="DLinear"),   None, "DLinear",      "dlinear"),
+        ("nlinear",      lambda: train_linear_baseline(base_config, data_dict, str(results_dir), model_type="nlinear", tag="NLinear"),   None, "NLinear",      "nlinear"),
+        ("fits",         lambda: train_fits(base_config, data_dict, str(results_dir), tag="FITS"),                                       None, "FITS",         "fits"),
+        ("patchtst",     lambda: train_patchtst(base_config, data_dict, str(results_dir), tag="PatchTST"),                               None, "PatchTST",     "patchtst"),
+        ("itransformer", lambda: train_itransformer(base_config, data_dict, str(results_dir), tag="iTransformer"),                       None, "iTransformer", "itransformer"),
+        ("autoformer",   lambda: train_autoformer(base_config, data_dict, str(results_dir), tag="Autoformer"),                           None, "Autoformer",   "autoformer"),
+        ("informer",     lambda: train_informer(base_config, data_dict, str(results_dir), tag="Informer"),                               None, "Informer",     "informer"),
+    ]:
+        if _should_train(_mname):
+            with log_phase(console, f"Train {_label} baseline"):
+                _out = _train_fn()
+                log_step(f"{_label} done. Test RMSE={_out['test_stats'].get('rmse', 'N/A')}")
+                _save_model(_pt_name, _out["model"])
+        else:
+            with log_phase(console, f"Load {_label} from prior results"):
+                _out = _load_or_skip(_mname)
+                log_step(f"{_label} loaded. Test RMSE={_out['test_stats'].get('rmse', 'N/A')}")
+        # Assign to the expected variable names
+        if _mname == "dlinear":      dlinear_out = _out
+        elif _mname == "nlinear":    nlinear_out = _out
+        elif _mname == "fits":       fits_out = _out
+        elif _mname == "patchtst":   patchtst_out = _out
+        elif _mname == "itransformer": itransformer_out = _out
+        elif _mname == "autoformer": autoformer_out = _out
+        elif _mname == "informer":   informer_out = _out
 
     log_step(f"All model weights saved to: {models_dir}")
 
@@ -1158,6 +1312,9 @@ def main():
     naive_test_stats = _classical_results["naive_test_stats"]
     naive_curve_artifacts = _classical_results["naive_curve_artifacts"]
 
+    # Extract prediction arrays (needed for plots and Diebold-Mariano tests)
+    naive_test_pred = _classical_results.get("naive_test_pred")
+
     if _classical_results.get("skip_classical", False):
         arima_train_stats = _blank_stats()
         arima_test_stats = _blank_stats()
@@ -1169,18 +1326,24 @@ def main():
         tree_test_stats = _blank_stats()
         tree_curve_artifacts = {"static": "", "interactive": ""}
         tree_config = {}
+        arima_test_pred = None
+        arma_test_pred = None
+        tree_test_pred = None
     else:
         arima_train_stats = _classical_results["arima_train_stats"]
         arima_test_stats = _classical_results["arima_test_stats"]
         arima_curve_artifacts = _classical_results["arima_curve_artifacts"]
+        arima_test_pred = _classical_results.get("arima_test_pred")
         arma_train_stats = _classical_results["arma_train_stats"]
         arma_test_stats = _classical_results["arma_test_stats"]
         arma_curve_artifacts = _classical_results["arma_curve_artifacts"]
+        arma_test_pred = _classical_results.get("arma_test_pred")
         tree_train_stats = _classical_results["tree_train_stats"]
         tree_test_stats = _classical_results["tree_test_stats"]
         tree_curve_artifacts = _classical_results["tree_curve_artifacts"]
-        tree_model = _classical_results["tree_model"]
-        tree_config = _classical_results["tree_config"]
+        tree_test_pred = _classical_results.get("tree_test_pred")
+        tree_model = _classical_results.get("tree_model", None)  # may be absent from cache
+        tree_config = _classical_results.get("tree_config", {})
 
     # ── Parallel bootstrap uncertainty for all models (train + test) ────
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1593,7 +1756,7 @@ def main():
 
     plot_predictions(
         predictions_dict,
-        save_path=os.path.join(args.results_dir, "predictions_comparison")
+        save_path=os.path.join(str(results_dir), "predictions_comparison")
     )
 
     predictions_test = {
@@ -1606,8 +1769,9 @@ def main():
         "iTransformer": itransformer_out["pred_test"],
         "Autoformer": autoformer_out["pred_test"],
         "Informer": informer_out["pred_test"],
-        "Naïve Baseline": naive_test_pred,
     }
+    if "naive_test_pred" in locals() and naive_test_pred is not None:
+         predictions_test["Naïve Baseline"] = naive_test_pred
     if "tree_test_pred" in locals() and tree_test_pred is not None:
          predictions_test["Tree Ensemble"] = tree_test_pred
     if "arima_test_pred" in locals() and arima_test_pred is not None:
@@ -1833,7 +1997,7 @@ def main():
         ),
         environment=env_info,
         scaling={"target_mean": float(target_mean), "target_std": float(target_std)},
-        created=datetime.utcnow().isoformat(),
+        created=datetime.now(timezone.utc).isoformat(),
     )
     # Sanitize metrics to ensure valid JSON (replace NaN/Infinity with None)
     def sanitize_for_json(obj):
@@ -1899,9 +2063,9 @@ def main():
         "models_saved": [f.name for f in (results_dir / "models").glob("*.pt")],
         "compute": {
             "wall_clock_seconds": round(total_elapsed, 1),
-            "est_spot_cost_usd": round((total_elapsed / 3600) * 0.34, 3),
-            "est_ondemand_cost_usd": round((total_elapsed / 3600) * 1.01, 3),
+            "est_cost_usd": round((total_elapsed / 3600) * 1.006, 3),
             "instance_type": "g5.xlarge",
+            "pricing": "on-demand",
         },
     }
     with open(results_dir / "run_summary.json", "w") as f:
@@ -1920,20 +2084,17 @@ def main():
         print(f"  {i+1:>2}. {name:<20} {rmse:.6f}{marker}", flush=True)
     print("=" * 60, flush=True)
 
-    # Cost estimate (spot pricing for g5.xlarge us-east-1)
-    spot_rate = 0.34  # $/hr approximate
-    ondemand_rate = 1.01  # $/hr approximate
-    spot_cost = (total_elapsed / 3600) * spot_rate
-    ondemand_cost = (total_elapsed / 3600) * ondemand_rate
+    # Cost estimate (on-demand pricing for g5.xlarge us-east-1)
+    od_rate = 1.006  # $/hr on-demand
+    od_cost = (total_elapsed / 3600) * od_rate
     print(flush=True)
     print("COMPUTE SUMMARY:", flush=True)
     print(f"  Wall-clock time:  {elapsed_str} ({total_elapsed:.0f}s)", flush=True)
-    print(f"  Est. spot cost:   ${spot_cost:.3f} (g5.xlarge @ ${spot_rate}/hr)", flush=True)
-    print(f"  Est. on-demand:   ${ondemand_cost:.3f} (g5.xlarge @ ${ondemand_rate}/hr)", flush=True)
+    print(f"  Est. cost:        ${od_cost:.3f} (g5.xlarge on-demand @ ${od_rate}/hr)", flush=True)
     print("=" * 60, flush=True)
 
     log_info(f"Run completed successfully in {elapsed_str}")
-    log_info(f"Estimated spot cost: ${spot_cost:.3f} | On-demand: ${ondemand_cost:.3f}")
+    log_info(f"Estimated cost: ${od_cost:.3f} (on-demand)")
     log_info(f"Results saved to: {results_dir.resolve()}")
     close_log_file()
 

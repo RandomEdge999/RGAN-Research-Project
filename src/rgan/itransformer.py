@@ -13,6 +13,7 @@ Interface:
 
 from __future__ import annotations
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -119,17 +120,27 @@ class iTransformer(nn.Module):
 
 
 def _predict_in_batches(
-    model: nn.Module, data: np.ndarray, device: torch.device, batch_size: int
+    model: nn.Module, data: np.ndarray, device: torch.device, batch_size: int,
+    use_amp: bool = False,
 ) -> np.ndarray:
     if len(data) == 0:
         return np.empty((0, model.H, 1), dtype=np.float32)
     preds = []
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast(device.type, enabled=use_amp):
         for start in range(0, len(data), batch_size):
             xb = torch.from_numpy(data[start:start + batch_size]).to(device)
-            preds.append(model(xb).cpu().numpy())
+            preds.append(model(xb).float().cpu().numpy())
     return np.concatenate(preds, axis=0)
+
+
+def _make_loader(X, Y, batch_size, shuffle=True, device=None):
+    """Create a DataLoader with pin_memory when using CUDA."""
+    from torch.utils.data import TensorDataset, DataLoader
+    ds = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(Y).float())
+    pin = (device is not None and device.type == 'cuda')
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      pin_memory=pin, num_workers=0, drop_last=False)
 
 
 def train_itransformer(
@@ -151,6 +162,7 @@ def train_itransformer(
     if preferred == "auto":
         preferred = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(preferred)
+    use_amp = config.amp and device.type == 'cuda'
 
     model = iTransformer(
         L=config.L, H=config.H,
@@ -159,8 +171,10 @@ def train_itransformer(
         d_ff=d_ff, dropout=dropout,
     ).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=config.lr_g, weight_decay=1e-5)
+    lr = min(config.lr_g, 1e-4)  # Transformers need lower LR than GAN default
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     loss_fn = nn.MSELoss()
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}
     best_val, best_state = float("inf"), None
@@ -171,30 +185,38 @@ def train_itransformer(
     Xte, Yte = data_splits["Xte"], data_splits["Yte"]
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
 
+    train_loader = _make_loader(Xtr, Ytr, batch_size, shuffle=True, device=device)
+
     N = len(Xtr)
-    steps = max(1, int(np.ceil(N / batch_size)))
 
     with epoch_progress(config.epochs, description=tag) as (progress, task_id):
         for epoch in range(1, config.epochs + 1):
-            perm = np.random.permutation(N)
             model.train()
-            for s in range(steps):
-                b0 = s * batch_size
-                b1 = min((s + 1) * batch_size, N)
-                idx = perm[b0:b1]
-                Xb = torch.from_numpy(Xtr[idx]).to(device)
-                Yb = torch.from_numpy(Ytr[idx]).to(device)
+            nan_break = False
+            for Xb, Yb in train_loader:
+                Xb = Xb.to(device, non_blocking=True)
+                Yb = Yb.to(device, non_blocking=True)
                 opt.zero_grad()
-                pred = model(Xb)
-                loss = loss_fn(pred, Yb)
-                loss.backward()
+                with torch.amp.autocast(device.type, enabled=use_amp):
+                    pred = model(Xb)
+                    loss = loss_fn(pred, Yb)
+                if torch.isnan(loss):
+                    log_info(f"[{tag}] NaN loss at epoch {epoch}, stopping training.")
+                    nan_break = True
+                    break
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
+
+            if nan_break:
+                break
 
             eval_bs = max(1, min(batch_size, 1024))
-            tr = _predict_in_batches(model, Xtr, device, eval_bs)
-            te = _predict_in_batches(model, Xte, device, eval_bs)
-            va = _predict_in_batches(model, Xval, device, eval_bs)
+            tr = _predict_in_batches(model, Xtr, device, eval_bs, use_amp=use_amp)
+            te = _predict_in_batches(model, Xte, device, eval_bs, use_amp=use_amp)
+            va = _predict_in_batches(model, Xval, device, eval_bs, use_amp=use_amp)
 
             tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
             te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
@@ -210,7 +232,7 @@ def train_itransformer(
 
             if va_rmse < best_val - 1e-7:
                 best_val = va_rmse
-                best_state = model.state_dict()
+                best_state = copy.deepcopy(model.state_dict())
                 bad_epochs = 0
             else:
                 bad_epochs += 1
@@ -222,8 +244,8 @@ def train_itransformer(
         model.load_state_dict(best_state)
 
     eval_bs = max(1, min(config.batch_size, 1024))
-    tr = _predict_in_batches(model, Xtr, device, eval_bs)
-    te = _predict_in_batches(model, Xte, device, eval_bs)
+    tr = _predict_in_batches(model, Xtr, device, eval_bs, use_amp=use_amp)
+    te = _predict_in_batches(model, Xte, device, eval_bs, use_amp=use_amp)
     train_stats = error_stats(Ytr.reshape(-1), tr.reshape(-1))
     test_stats = error_stats(Yte.reshape(-1), te.reshape(-1))
 

@@ -115,6 +115,9 @@ def main():
         "SM_HP_ADV_WEIGHT": "--adv_weight",
         "SM_HP_EVAL_EVERY": "--eval_every",
         "SM_HP_EVAL_BATCH_SIZE": "--eval_batch_size",
+        # Selective retraining
+        "SM_HP_ONLY_MODELS": "--only_models",
+        "SM_HP_PRIOR_RESULTS": "--prior_results",
     }
 
     # Boolean flags (--flag, no value)

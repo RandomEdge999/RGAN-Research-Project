@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,7 +29,8 @@ class LSTMSupervised(nn.Module):
 
 
 def _predict_in_batches(
-    model: nn.Module, data: np.ndarray, device: torch.device, batch_size: int
+    model: nn.Module, data: np.ndarray, device: torch.device, batch_size: int,
+    use_amp: bool = False,
 ) -> np.ndarray:
     """Run model inference on ``data`` without exhausting GPU memory."""
 
@@ -42,12 +44,21 @@ def _predict_in_batches(
 
     preds = []
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast(device.type, enabled=use_amp):
         for start in range(0, len(data), batch_size):
             stop = start + batch_size
             xb = torch.from_numpy(data[start:stop]).to(device)
-            preds.append(model(xb).cpu().numpy())
+            preds.append(model(xb).float().cpu().numpy())
     return np.concatenate(preds, axis=0)
+
+
+def _make_loader(X, Y, batch_size, shuffle=True, device=None):
+    """Create a DataLoader with pin_memory when using CUDA."""
+    from torch.utils.data import TensorDataset, DataLoader
+    ds = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(Y).float())
+    pin = (device is not None and device.type == 'cuda')
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      pin_memory=pin, num_workers=0, drop_last=False)
 
 
 def train_lstm_supervised_torch(
@@ -69,6 +80,7 @@ def train_lstm_supervised_torch(
     def _train_on_device(device: torch.device) -> Dict[str, Any]:
         L, H = config.L, config.H
         n_in = data_splits["Xtr"].shape[-1]
+        use_amp = config.amp and device.type == 'cuda'
         log_step(f"Building LSTM: L={L}, H={H}, n_in={n_in}, units={config.units_g}")
 
         # Note: 'units_g' is used as the hidden size for the LSTM
@@ -78,6 +90,7 @@ def train_lstm_supervised_torch(
         log_shape("Ytr", data_splits["Ytr"])
         opt = torch.optim.Adam(model.parameters(), lr=config.lr_g)
         loss_fn = torch.nn.MSELoss()
+        scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
         hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}
         best_val, best_state = float("inf"), None
@@ -91,31 +104,31 @@ def train_lstm_supervised_torch(
         Xval = data_splits["Xval"]
         Yval = data_splits["Yval"]
 
+        train_loader = _make_loader(Xtr, Ytr, batch_size, shuffle=True, device=device)
+
         N = len(Xtr)
-        steps = max(1, int(np.ceil(N / batch_size)))
 
         with epoch_progress(config.epochs, description="LSTM (Torch)") as (progress, task_id):
             for epoch in range(1, config.epochs + 1):
-                perm = np.random.permutation(N)
                 model.train()
-                for s in range(steps):
-                    b0 = s * batch_size
-                    b1 = min((s + 1) * batch_size, N)
-                    idx = perm[b0:b1]
-                    Xb = torch.from_numpy(Xtr[idx]).to(device)
-                    Yb = torch.from_numpy(Ytr[idx]).to(device)
+                for Xb, Yb in train_loader:
+                    Xb = Xb.to(device, non_blocking=True)
+                    Yb = Yb.to(device, non_blocking=True)
                     opt.zero_grad()
-                    pred = model(Xb)
-                    loss = loss_fn(pred, Yb)
-                    loss.backward()
+                    with torch.amp.autocast(device.type, enabled=use_amp):
+                        pred = model(Xb)
+                        loss = loss_fn(pred, Yb)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_value_(model.parameters(), config.grad_clip)
-                    opt.step()
+                    scaler.step(opt)
+                    scaler.update()
 
                 model.eval()
                 eval_batch_size = max(1, min(batch_size, 1024))
-                tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
-                te = _predict_in_batches(model, Xte, device, eval_batch_size)
-                va = _predict_in_batches(model, Xval, device, eval_batch_size)
+                tr = _predict_in_batches(model, Xtr, device, eval_batch_size, use_amp=use_amp)
+                te = _predict_in_batches(model, Xte, device, eval_batch_size, use_amp=use_amp)
+                va = _predict_in_batches(model, Xval, device, eval_batch_size, use_amp=use_amp)
                 
                 tr_rmse = float(np.sqrt(np.mean((tr.reshape(-1) - Ytr.reshape(-1)) ** 2)))
                 te_rmse = float(np.sqrt(np.mean((te.reshape(-1) - Yte.reshape(-1)) ** 2)))
@@ -136,7 +149,7 @@ def train_lstm_supervised_torch(
 
                 if va_rmse < best_val - 1e-7:
                     best_val = va_rmse
-                    best_state = model.state_dict()
+                    best_state = copy.deepcopy(model.state_dict())
                     bad_epochs = 0
                     log_debug(f"LSTM epoch {epoch}: new best val_rmse={va_rmse:.6f}")
                 else:
@@ -153,8 +166,8 @@ def train_lstm_supervised_torch(
 
         eval_batch_size = max(1, min(config.batch_size, 1024))
         log_step(f"Computing final LSTM metrics (eval_batch_size={eval_batch_size})")
-        tr = _predict_in_batches(model, Xtr, device, eval_batch_size)
-        te = _predict_in_batches(model, Xte, device, eval_batch_size)
+        tr = _predict_in_batches(model, Xtr, device, eval_batch_size, use_amp=use_amp)
+        te = _predict_in_batches(model, Xte, device, eval_batch_size, use_amp=use_amp)
         train_stats = error_stats(Ytr.reshape(-1), tr.reshape(-1))
         test_stats = error_stats(Yte.reshape(-1), te.reshape(-1))
         log_step(f"LSTM final: train_rmse={train_stats.get('rmse', 'N/A'):.6f}, test_rmse={test_stats.get('rmse', 'N/A'):.6f}")

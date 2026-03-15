@@ -11,6 +11,7 @@ Both models follow the same interface as LSTMSupervised:
 
 from __future__ import annotations
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -181,7 +182,7 @@ def train_linear_baseline(
 
             if va_rmse < best_val - 1e-7:
                 best_val = va_rmse
-                best_state = model.state_dict()
+                best_state = copy.deepcopy(model.state_dict())
                 bad_epochs = 0
             else:
                 bad_epochs += 1

@@ -101,6 +101,8 @@ def main():
     ap.add_argument("--skip_noise_robustness", action="store_true")
     ap.add_argument("--max_train_windows", type=int, default=None)
     ap.add_argument("--resume_job", default="", help="Resume from a previous job's checkpoints (pass the old job name)")
+    ap.add_argument("--only_models", default="", help="Comma-separated models to retrain (e.g. 'patchtst,itransformer'). Requires --prior_results.")
+    ap.add_argument("--prior_results", default="", help="Path to prior results dir for loading skipped models.")
 
     args = ap.parse_args()
 
@@ -193,6 +195,10 @@ def main():
         hyperparameters["skip_noise_robustness"] = "true"
     if args.max_train_windows:
         hyperparameters["max_train_windows"] = str(args.max_train_windows)
+    if args.only_models:
+        hyperparameters["only_models"] = args.only_models
+    if args.prior_results:
+        hyperparameters["prior_results"] = args.prior_results
 
     # Job name
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")

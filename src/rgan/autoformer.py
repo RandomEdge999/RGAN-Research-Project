@@ -12,6 +12,7 @@ Interface:
 
 from __future__ import annotations
 
+import copy
 import math
 import numpy as np
 import torch
@@ -333,7 +334,7 @@ def train_autoformer(
 
             if va_rmse < best_val - 1e-7:
                 best_val = va_rmse
-                best_state = model.state_dict()
+                best_state = copy.deepcopy(model.state_dict())
                 bad_epochs = 0
             else:
                 bad_epochs += 1

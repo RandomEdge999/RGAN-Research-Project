@@ -11,6 +11,7 @@ Interface matches the project convention:
 
 from __future__ import annotations
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -86,6 +87,15 @@ def _predict_in_batches(
     return np.concatenate(preds, axis=0)
 
 
+def _make_loader(X, Y, batch_size, shuffle=True, device=None):
+    """Create a DataLoader with pin_memory when using CUDA."""
+    from torch.utils.data import TensorDataset, DataLoader
+    ds = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(Y).float())
+    pin = (device is not None and device.type == 'cuda')
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      pin_memory=pin, num_workers=0, drop_last=False)
+
+
 def train_fits(
     config: TrainConfig,
     data_splits: Dict[str, np.ndarray],
@@ -125,19 +135,15 @@ def train_fits(
     Xte, Yte = data_splits["Xte"], data_splits["Yte"]
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
 
+    train_loader = _make_loader(Xtr, Ytr, batch_size, shuffle=True, device=device)
+
     N = len(Xtr)
-    steps = max(1, int(np.ceil(N / batch_size)))
 
     with epoch_progress(config.epochs, description=tag) as (progress, task_id):
         for epoch in range(1, config.epochs + 1):
-            perm = np.random.permutation(N)
             model.train()
-            for s in range(steps):
-                b0 = s * batch_size
-                b1 = min((s + 1) * batch_size, N)
-                idx = perm[b0:b1]
-                Xb = torch.from_numpy(Xtr[idx]).to(device)
-                Yb = torch.from_numpy(Ytr[idx]).to(device)
+            for Xb, Yb in train_loader:
+                Xb, Yb = Xb.to(device, non_blocking=True), Yb.to(device, non_blocking=True)
                 opt.zero_grad()
                 pred = model(Xb)
                 loss = loss_fn(pred, Yb)
@@ -165,7 +171,7 @@ def train_fits(
 
             if va_rmse < best_val - 1e-7:
                 best_val = va_rmse
-                best_state = model.state_dict()
+                best_state = copy.deepcopy(model.state_dict())
                 bad_epochs = 0
             else:
                 bad_epochs += 1

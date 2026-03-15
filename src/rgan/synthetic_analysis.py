@@ -120,6 +120,7 @@ def variance_difference(real_samples, fake_samples):
 def _extract_time_series_features(samples):
     """
     Extract rich features from time series for classification.
+    Fully vectorized — no per-sample Python loop.
 
     Args:
         samples: np.ndarray of shape (n_samples, sequence_length, features) or (n_samples, sequence_length)
@@ -127,47 +128,56 @@ def _extract_time_series_features(samples):
     Returns:
         np.ndarray of shape (n_samples, n_features)
     """
+    from scipy.stats import skew as sp_skew, kurtosis as sp_kurtosis
+
     if samples.ndim == 3:
         samples = samples.squeeze()  # Remove feature dimension if it's 1
 
-    n_samples = samples.shape[0]
-    features_list = []
+    # samples: (n_samples, seq_len)
+    n_samples, seq_len = samples.shape
 
-    for i in range(n_samples):
-        seq = samples[i].flatten()
+    # Basic statistics — vectorized across all samples
+    mean = np.mean(samples, axis=1)
+    std = np.std(samples, axis=1)
+    min_val = np.min(samples, axis=1)
+    max_val = np.max(samples, axis=1)
+    skewness = sp_skew(samples, axis=1)
+    kurt = sp_kurtosis(samples, axis=1)
 
-        # Statistical features
-        mean = np.mean(seq)
-        std = np.std(seq)
-        min_val = np.min(seq)
-        max_val = np.max(seq)
-        skew = float(pd.Series(seq).skew())
-        kurtosis = float(pd.Series(seq).kurtosis())
+    # Trend (linear regression slope) — vectorized via least-squares formula
+    x = np.arange(seq_len, dtype=samples.dtype)
+    x_mean = x.mean()
+    x_centered = x - x_mean
+    samples_centered = samples - mean[:, None]
+    trend = (samples_centered @ x_centered) / (x_centered @ x_centered)
 
-        # Trend (linear regression slope)
-        x = np.arange(len(seq))
-        z = np.polyfit(x, seq, 1)
-        trend = z[0]
+    # Autocorrelation at lag 1 — vectorized
+    s_prev = samples[:, :-1]  # (n, seq_len-1)
+    s_next = samples[:, 1:]   # (n, seq_len-1)
+    prev_mean = s_prev.mean(axis=1, keepdims=True)
+    next_mean = s_next.mean(axis=1, keepdims=True)
+    prev_std = s_prev.std(axis=1) + 1e-12
+    next_std = s_next.std(axis=1) + 1e-12
+    acf_val = np.mean((s_prev - prev_mean) * (s_next - next_mean), axis=1) / (prev_std * next_std)
 
-        # Autocorrelation at lag 1
-        if len(seq) > 1:
-            acf_val = np.corrcoef(seq[:-1], seq[1:])[0, 1]
-        else:
-            acf_val = 0
+    # Energy (sum of squares)
+    energy = np.sum(samples ** 2, axis=1)
 
-        # Energy (sum of squares)
-        energy = np.sum(seq ** 2)
+    # Spectral features — batched FFT
+    fft_mag = np.abs(np.fft.fft(samples, axis=1))  # (n, seq_len)
+    freq_idx = np.arange(seq_len, dtype=samples.dtype)
+    fft_sum = fft_mag.sum(axis=1, keepdims=True) + 1e-12
+    fft_norm = fft_mag / fft_sum  # normalized weights
+    spectral_centroid = (fft_norm * freq_idx[None, :]).sum(axis=1)
+    spectral_spread = np.sqrt((fft_norm * (freq_idx[None, :] - spectral_centroid[:, None]) ** 2).sum(axis=1))
 
-        # Spectral features (using FFT)
-        fft = np.abs(np.fft.fft(seq))
-        spectral_centroid = np.average(np.arange(len(fft)), weights=fft)
-        spectral_spread = np.sqrt(np.average((np.arange(len(fft)) - spectral_centroid) ** 2, weights=fft))
+    # Stack all features: (n_samples, 11)
+    features = np.column_stack([
+        mean, std, min_val, max_val, skewness, kurt,
+        trend, acf_val, energy, spectral_centroid, spectral_spread,
+    ])
 
-        features = [mean, std, min_val, max_val, skew, kurtosis, trend, acf_val, energy,
-                   spectral_centroid, spectral_spread]
-        features_list.append(features)
-
-    return np.array(features_list)
+    return features
 
 
 def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
