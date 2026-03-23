@@ -44,7 +44,8 @@ def _predict_in_batches(
 
     preds = []
     model.eval()
-    with torch.no_grad(), torch.amp.autocast(device.type, enabled=use_amp):
+    from .rgan_torch import AMP
+    with torch.no_grad(), AMP.autocast(device.type, enabled=use_amp):
         for start in range(0, len(data), batch_size):
             stop = start + batch_size
             xb = torch.from_numpy(data[start:stop]).to(device)
@@ -90,7 +91,8 @@ def train_lstm_supervised_torch(
         log_shape("Ytr", data_splits["Ytr"])
         opt = torch.optim.Adam(model.parameters(), lr=config.lr_g)
         loss_fn = torch.nn.MSELoss()
-        scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+        from .rgan_torch import AMP
+        scaler = AMP.make_scaler(enabled=use_amp)
 
         hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}
         best_val, best_state = float("inf"), None
@@ -108,6 +110,7 @@ def train_lstm_supervised_torch(
 
         N = len(Xtr)
 
+        nan_break = False
         with epoch_progress(config.epochs, description="LSTM (Torch)") as (progress, task_id):
             for epoch in range(1, config.epochs + 1):
                 model.train()
@@ -115,14 +118,21 @@ def train_lstm_supervised_torch(
                     Xb = Xb.to(device, non_blocking=True)
                     Yb = Yb.to(device, non_blocking=True)
                     opt.zero_grad()
-                    with torch.amp.autocast(device.type, enabled=use_amp):
+                    with AMP.autocast(device.type, enabled=use_amp):
                         pred = model(Xb)
                         loss = loss_fn(pred, Yb)
+                    if torch.isnan(loss):
+                        log_info(f"[LSTM] NaN loss at epoch {epoch}, stopping training.")
+                        nan_break = True
+                        break
                     scaler.scale(loss).backward()
                     scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_value_(model.parameters(), config.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
                     scaler.step(opt)
                     scaler.update()
+
+                if nan_break:
+                    break
 
                 model.eval()
                 eval_batch_size = max(1, min(batch_size, 1024))

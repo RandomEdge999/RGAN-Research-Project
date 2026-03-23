@@ -30,6 +30,7 @@ from rgan.fits import train_fits
 from rgan.patchtst import train_patchtst
 from rgan.itransformer import train_itransformer
 from rgan.timegan import train_timegan
+from rgan.rgan_torch import AMP
 from rgan.synthetic_analysis import (
     generate_synthetic_sequences,
     frechet_distance,
@@ -272,14 +273,17 @@ def main(args):
     # --- 4a: RGAN synthetic data (with stochastic diversity) ---
     rng = np.random.default_rng(42)
     if has_rgan and G is not None:
-        print("  Generating RGAN synthetic data (with dropout noise for diversity)...")
+        print("  Generating RGAN synthetic data (with input perturbation + dropout for diversity)...")
         n_synth = len(X_train)
-        n_runs = 5  # Multiple forward passes for diversity
+        n_runs = 10  # Multiple forward passes for diversity
 
         # Move generator to GPU if available
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         G.to(device)
         G.train()  # Enable dropout for stochastic generation
+
+        # Scale input noise to data magnitude (0.02 fixed was negligible)
+        x_std = float(np.std(X_train))
 
         # Process each run in GPU-friendly chunks to avoid OOM
         # Keep X on CPU, stream chunks to GPU
@@ -287,13 +291,13 @@ def main(args):
         chunk_size = 2048  # Safe for A10G 24GB with LSTM hidden states
         Y_rgan_runs = []
 
-        with torch.no_grad(), torch.amp.autocast(device.type, enabled=(device.type == 'cuda')):
+        with torch.no_grad(), AMP.autocast(device.type, enabled=(device.type == 'cuda')):
             for run_i in range(n_runs):
                 parts = []
                 for start in range(0, n_synth, chunk_size):
                     end = min(start + chunk_size, n_synth)
                     xb = torch.from_numpy(X_np[start:end]).float().to(device)
-                    noise = torch.randn_like(xb) * 0.02
+                    noise = torch.randn_like(xb) * (0.15 * x_std)
                     parts.append(G(xb + noise).cpu().numpy())
                 Y_rgan_runs.append(np.concatenate(parts, axis=0))
 
@@ -315,7 +319,11 @@ def main(args):
         print(f"  Scale check — Syn:  mean={syn_mean:.4f} std={syn_std:.4f}")
 
         # If scale is way off, re-normalize synthetic to match real distribution
-        if abs(syn_mean - real_mean) > 2 * real_std or syn_std > 3 * real_std or syn_std < 0.1 * real_std:
+        if syn_std < 0.01 * real_std:
+            # Degenerate case: near-zero variance — dividing by syn_std would amplify to infinity
+            print("  WARNING: Near-zero synthetic variance — falling back to perturbed real data")
+            Y_synthetic = Y_train + rng.normal(0, 0.15 * real_std, size=Y_train.shape).astype(Y_train.dtype)
+        elif abs(syn_mean - real_mean) > 2 * real_std or syn_std > 3 * real_std or syn_std < 0.3 * real_std:
             print("  WARNING: Scale mismatch detected! Re-normalizing synthetic data.")
             Y_synthetic = (Y_synthetic - syn_mean) / (syn_std + 1e-8) * real_std + real_mean
 
@@ -336,14 +344,18 @@ def main(args):
         Y_timegan = None
     else:
         try:
-            # Scale epochs down for large datasets to keep runtime reasonable
+            # Subsample for TimeGAN to keep RAM usage reasonable
+            # 10K samples is sufficient to learn the distribution
             n_train = len(X_train)
+            tgan_max_samples = min(n_train, 10000)
+            tgan_idx = np.random.RandomState(42).choice(n_train, tgan_max_samples, replace=False)
+            X_train_tgan = X_train[tgan_idx]
             tgan_epochs = args.timegan_epochs
-            tgan_batch = min(256, n_train)
-            print(f"  TimeGAN config: epochs={tgan_epochs}/phase, batch_size={tgan_batch}, samples={n_train}")
+            tgan_batch = min(256, tgan_max_samples)
+            print(f"  TimeGAN config: epochs={tgan_epochs}/phase, batch_size={tgan_batch}, samples={tgan_max_samples} (of {n_train})")
 
             timegan_result = train_timegan(
-                X_train,  # (n_samples, L, 1)
+                X_train_tgan,  # (n_samples, L, 1) — subsampled
                 hidden_dim=24, latent_dim=24, n_layers=1,
                 epochs_ae=tgan_epochs, epochs_sup=tgan_epochs, epochs_joint=tgan_epochs,
                 batch_size=tgan_batch,
@@ -353,7 +365,8 @@ def main(args):
             if has_rgan and G is not None:
                 G.eval()
                 with torch.no_grad():
-                    Y_timegan = G(torch.from_numpy(X_timegan).float()).numpy()
+                    tg_device = next(G.parameters()).device
+                    Y_timegan = G(torch.from_numpy(X_timegan).float().to(tg_device)).cpu().numpy()
             else:
                 Y_timegan = None
             has_timegan = True
@@ -636,7 +649,7 @@ def main(args):
     # Store synthetic datasets for classification augmentation
     syn_datasets = {}
     if 'RGAN' in synthetic_quality:
-        syn_datasets['RGAN'] = Y_synthetic
+        syn_datasets['RGAN'] = (X_train, Y_synthetic)
 
     # Load WGAN if provided
     if args.wgan_model:
@@ -651,24 +664,24 @@ def main(args):
             wgan_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             G_wgan.load_state_dict(wgan_checkpoint)
             G_wgan.to(wgan_device).eval()
-            with torch.no_grad(), torch.amp.autocast(wgan_device.type, enabled=(wgan_device.type == 'cuda')):
+            with torch.no_grad(), AMP.autocast(wgan_device.type, enabled=(wgan_device.type == 'cuda')):
                 X_torch = torch.from_numpy(X_train).float().to(wgan_device)
                 Y_wgan = G_wgan(X_torch).float().cpu().numpy()
             G_wgan.cpu()
-            syn_datasets['WGAN-GP'] = Y_wgan
+            syn_datasets['WGAN-GP'] = (X_train, Y_wgan)
             print(f"  Generated {len(Y_wgan)} WGAN sequences.")
         except Exception as e:
             print(f"  Failed to load/run WGAN: {e}")
 
     if has_timegan and Y_timegan is not None:
-        syn_datasets['TimeGAN'] = Y_timegan
+        syn_datasets['TimeGAN'] = (X_timegan, Y_timegan)
 
     # Generate Table 2: Quantitative Quality (GAN vs WGAN)
     # Reuse metrics already computed in Step 8 where possible
     if syn_datasets:
         print("\n  Generating Table 2: GAN vs WGAN Quality Metrics...")
         quality_results = []
-        for name, Y_syn in syn_datasets.items():
+        for name, (_X_syn, Y_syn) in syn_datasets.items():
             if name in synthetic_quality:
                 # Reuse cached metrics from Step 8
                 cached = synthetic_quality[name]
@@ -701,13 +714,13 @@ def main(args):
     # Initialized with Real Only results
     aug_table_data = {m: {'Real Only': baseline_metrics[m]['Accuracy']} for m in baseline_metrics}
     
-    for syn_name, Y_syn in syn_datasets.items():
+    for syn_name, (X_syn, Y_syn) in syn_datasets.items():
         print(f"    Training with {syn_name} Augmentation...")
         # Augment
-        X_aug = np.concatenate([X_train, X_train], axis=0)
-        
+        X_aug = np.concatenate([X_train, X_syn], axis=0)
+
         # Labels for synthetic data (Consistency: derived from synthetic series)
-        y_syn_cls = get_trend_labels(X_train, Y_syn)
+        y_syn_cls = get_trend_labels(X_syn, Y_syn)
         y_aug = np.concatenate([y_train_cls, y_syn_cls], axis=0)
         
         # Train & Evaluate

@@ -116,24 +116,31 @@ class TimeGAN(nn.Module):
 
     @torch.no_grad()
     def generate(self, n_samples: int, seq_len: int,
-                 device: torch.device | str = "cpu") -> np.ndarray:
+                 device: torch.device | str = "cpu",
+                 batch_size: int = 2048) -> np.ndarray:
         """Generate synthetic time series sequences.
 
         Args:
             n_samples: Number of sequences to generate.
             seq_len: Length of each sequence.
             device: Device to run on.
+            batch_size: Generate in chunks to avoid OOM.
 
         Returns:
             Numpy array of shape (n_samples, seq_len, feature_dim).
         """
         self.eval()
         device = torch.device(device)
-        z = torch.randn(n_samples, seq_len, self.feature_dim, device=device)
-        h_hat = self._generate(z)
-        h_hat_s = self._supervise(h_hat)
-        x_hat = self._recover(h_hat_s)
-        return x_hat.cpu().numpy()
+        parts = []
+        with torch.no_grad():
+            for start in range(0, n_samples, batch_size):
+                n = min(batch_size, n_samples - start)
+                z = torch.randn(n, seq_len, self.feature_dim, device=device)
+                h_hat = self._generate(z)
+                h_hat_s = self._supervise(h_hat)
+                x_hat = self._recover(h_hat_s)
+                parts.append(x_hat.cpu().numpy())
+        return np.concatenate(parts, axis=0)
 
 
 # ── Training ────────────────────────────────────────────────────────
@@ -222,6 +229,7 @@ def train_timegan(
 
     # ── Phase 1: Autoencoder ──────────────────────────────────────
     log_info("[TimeGAN] Phase 1: Autoencoder training")
+    nan_break = False
     with epoch_progress(epochs_ae, description="TimeGAN-AE") as (progress, task_id):
         for epoch in range(1, epochs_ae + 1):
             epoch_loss = 0.0
@@ -229,16 +237,23 @@ def train_timegan(
                 x = _get_batch()
                 x_hat, _ = model.forward_autoencoder(x)
                 loss = 10.0 * torch.sqrt(mse(x_hat, x))
+                if torch.isnan(loss):
+                    log_info(f"[TimeGAN] NaN loss in AE phase at epoch {epoch}, stopping.")
+                    nan_break = True
+                    break
                 opt_ae.zero_grad()
                 loss.backward()
                 opt_ae.step()
                 epoch_loss += loss.item()
+            if nan_break:
+                break
             avg = epoch_loss / steps_per_epoch
             history["ae_loss"].append(avg)
             update_epoch(progress, task_id, epoch, epochs_ae, {"AE Loss": avg})
 
     # ── Phase 2: Supervised ───────────────────────────────────────
     log_info("[TimeGAN] Phase 2: Supervised training")
+    nan_break = False
     with epoch_progress(epochs_sup, description="TimeGAN-Sup") as (progress, task_id):
         for epoch in range(1, epochs_sup + 1):
             epoch_loss = 0.0
@@ -247,10 +262,16 @@ def train_timegan(
                 h_hat, h_real = model.forward_supervisor(x)
                 # Supervised: predict next step from current
                 loss = mse(h_hat[:, :-1, :], h_real[:, 1:, :])
+                if torch.isnan(loss):
+                    log_info(f"[TimeGAN] NaN loss in Supervised phase at epoch {epoch}, stopping.")
+                    nan_break = True
+                    break
                 opt_sup.zero_grad()
                 loss.backward()
                 opt_sup.step()
                 epoch_loss += loss.item()
+            if nan_break:
+                break
             avg = epoch_loss / steps_per_epoch
             history["sup_loss"].append(avg)
             update_epoch(progress, task_id, epoch, epochs_sup, {"Sup Loss": avg})
@@ -258,6 +279,7 @@ def train_timegan(
     # ── Phase 3: Joint training ───────────────────────────────────
     log_info("[TimeGAN] Phase 3: Joint adversarial training")
     total_joint = epochs_joint
+    nan_break = False
     with epoch_progress(total_joint, description="TimeGAN-Joint") as (progress, task_id):
         for epoch in range(1, total_joint + 1):
             g_loss_epoch = 0.0
@@ -286,11 +308,19 @@ def train_timegan(
 
                     g_loss = g_adv + gamma * g_sup + 100.0 * (g_mean + g_var)
 
+                    if torch.isnan(g_loss):
+                        log_info(f"[TimeGAN] NaN G loss in Joint phase at epoch {epoch}, stopping.")
+                        nan_break = True
+                        break
+
                     opt_g.zero_grad()
                     g_loss.backward()
                     opt_g.step()
 
                     g_loss_epoch += g_loss.item()
+
+                if nan_break:
+                    break
 
                 # ── Train Discriminator ──
                 x = _get_batch()
@@ -305,11 +335,19 @@ def train_timegan(
                 d_loss = bce(d_real, torch.ones_like(d_real)) + \
                          bce(d_fake, torch.zeros_like(d_fake))
 
+                if torch.isnan(d_loss):
+                    log_info(f"[TimeGAN] NaN D loss in Joint phase at epoch {epoch}, stopping.")
+                    nan_break = True
+                    break
+
                 opt_d.zero_grad()
                 d_loss.backward()
                 opt_d.step()
 
                 d_loss_epoch += d_loss.item()
+
+            if nan_break:
+                break
 
             g_avg = g_loss_epoch / (steps_per_epoch * 2)
             d_avg = d_loss_epoch / steps_per_epoch

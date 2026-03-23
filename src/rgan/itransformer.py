@@ -127,7 +127,8 @@ def _predict_in_batches(
         return np.empty((0, model.H, 1), dtype=np.float32)
     preds = []
     model.eval()
-    with torch.no_grad(), torch.amp.autocast(device.type, enabled=use_amp):
+    from .rgan_torch import AMP
+    with torch.no_grad(), AMP.autocast(device.type, enabled=use_amp):
         for start in range(0, len(data), batch_size):
             xb = torch.from_numpy(data[start:start + batch_size]).to(device)
             preds.append(model(xb).float().cpu().numpy())
@@ -174,7 +175,8 @@ def train_itransformer(
     lr = min(config.lr_g, 1e-4)  # Transformers need lower LR than GAN default
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     loss_fn = nn.MSELoss()
-    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    from .rgan_torch import AMP as _AMP
+    scaler = _AMP.make_scaler(enabled=use_amp)
 
     hist = {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}
     best_val, best_state = float("inf"), None
@@ -197,7 +199,7 @@ def train_itransformer(
                 Xb = Xb.to(device, non_blocking=True)
                 Yb = Yb.to(device, non_blocking=True)
                 opt.zero_grad()
-                with torch.amp.autocast(device.type, enabled=use_amp):
+                with _AMP.autocast(device.type, enabled=use_amp):
                     pred = model(Xb)
                     loss = loss_fn(pred, Yb)
                 if torch.isnan(loss):

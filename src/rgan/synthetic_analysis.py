@@ -177,6 +177,9 @@ def _extract_time_series_features(samples):
         trend, acf_val, energy, spectral_centroid, spectral_spread,
     ])
 
+    # Sanitize NaN/Inf from degenerate inputs (e.g. zero-variance samples)
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
     return features
 
 
@@ -207,7 +210,15 @@ def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
     
     X = np.vstack([real_features, fake_features])
     y = np.hstack([np.zeros(len(real_features)), np.ones(len(fake_features))])
-    
+
+    # Check for degenerate inputs (zero variance in fake features)
+    if np.all(np.std(fake_features, axis=0) < 1e-10):
+        print("WARNING: Fake samples have near-zero feature variance — trivially distinguishable")
+        results = {}
+        for name in ['Random Forest', 'SVM (RBF)', 'MLP']:
+            results[name] = {'accuracy': 1.0, 'f1': 1.0, 'precision': 1.0, 'recall': 1.0}
+        return results
+
     classifiers = {
         'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
         'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=42)),
@@ -228,7 +239,8 @@ def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
                 'recall': float(recall_score(y, y_pred, zero_division=0))
             }
         except Exception as e:
-            print(f"Classifier {name} failed: {e}")
+            import traceback
+            print(f"Classifier {name} failed: {e}\n{traceback.format_exc()}")
             results[name] = {'accuracy': 0, 'f1': 0, 'precision': 0, 'recall': 0}
             
     return results
