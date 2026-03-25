@@ -75,8 +75,6 @@ TSLIB_DATASETS: Dict[str, dict] = {
 
 def _download_hf(name: str, data_dir: str) -> Path:
     """Download a dataset from HuggingFace and cache as CSV."""
-    from datasets import load_dataset as hf_load
-
     info = TSLIB_DATASETS[name]
     out_dir = Path(data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +82,14 @@ def _download_hf(name: str, data_dir: str) -> Path:
 
     if local_path.exists():
         return local_path
+
+    try:
+        from datasets import load_dataset as hf_load
+    except ImportError:
+        raise ImportError(
+            "The 'datasets' package is required for benchmark downloads. "
+            "Install it with: pip install -e '.[benchmark]'"
+        )
 
     print(f"Downloading {name} from HuggingFace (thuml/Time-Series-Library) ...")
     ds = hf_load("thuml/Time-Series-Library", info["hf_name"], split="train")

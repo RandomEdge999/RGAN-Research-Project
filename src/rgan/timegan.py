@@ -117,7 +117,8 @@ class TimeGAN(nn.Module):
     @torch.no_grad()
     def generate(self, n_samples: int, seq_len: int,
                  device: torch.device | str = "cpu",
-                 batch_size: int = 2048) -> np.ndarray:
+                 batch_size: int = 2048,
+                 generator: Optional[torch.Generator] = None) -> np.ndarray:
         """Generate synthetic time series sequences.
 
         Args:
@@ -135,7 +136,7 @@ class TimeGAN(nn.Module):
         with torch.no_grad():
             for start in range(0, n_samples, batch_size):
                 n = min(batch_size, n_samples - start)
-                z = torch.randn(n, seq_len, self.feature_dim, device=device)
+                z = torch.randn(n, seq_len, self.feature_dim, device=device, generator=generator)
                 h_hat = self._generate(z)
                 h_hat_s = self._supervise(h_hat)
                 x_hat = self._recover(h_hat_s)
@@ -146,9 +147,23 @@ class TimeGAN(nn.Module):
 # ── Training ────────────────────────────────────────────────────────
 
 def _random_noise(batch_size: int, seq_len: int, dim: int,
-                  device: torch.device) -> torch.Tensor:
+                  device: torch.device,
+                  generator: Optional[torch.Generator] = None) -> torch.Tensor:
     """Generate random noise for the generator."""
-    return torch.randn(batch_size, seq_len, dim, device=device)
+    return torch.randn(batch_size, seq_len, dim, device=device, generator=generator)
+
+
+def _make_torch_generator(device: torch.device, seed: Optional[int]) -> Optional[torch.Generator]:
+    """Create a device-aware torch RNG where supported."""
+    if seed is None or device.type == "mps":
+        return None
+
+    try:
+        generator = torch.Generator(device=device.type)
+    except (TypeError, RuntimeError):
+        generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
 
 
 def train_timegan(
@@ -163,6 +178,7 @@ def train_timegan(
     lr: float = 1e-3,
     device: str = "auto",
     gamma: float = 1.0,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Train TimeGAN on real time series data.
 
@@ -179,6 +195,7 @@ def train_timegan(
         lr: Learning rate.
         device: "auto", "cpu", "cuda", or "mps".
         gamma: Weight for supervised loss in joint phase.
+        seed: Optional seed for reproducible model init, batching, and synthetic generation.
 
     Returns:
         Dict with model, history, and generated samples.
@@ -193,6 +210,10 @@ def train_timegan(
         else:
             device = "cpu"
     dev = torch.device(device)
+    if seed is not None:
+        torch.manual_seed(int(seed))
+        if dev.type == "cuda":
+            torch.cuda.manual_seed_all(int(seed))
 
     n_samples, seq_len, feature_dim = real_data.shape
     log_info(f"[TimeGAN] Training on {n_samples} sequences, seq_len={seq_len}, features={feature_dim}")
@@ -219,12 +240,14 @@ def train_timegan(
 
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
+    rng = np.random.default_rng(seed)
+    noise_generator = _make_torch_generator(dev, seed)
 
     history = {"ae_loss": [], "sup_loss": [], "g_loss": [], "d_loss": []}
     steps_per_epoch = max(1, n_samples // batch_size)
 
     def _get_batch() -> torch.Tensor:
-        idx = np.random.randint(0, n_samples, size=batch_size)
+        idx = rng.integers(0, n_samples, size=batch_size)
         return torch.from_numpy(real_normed[idx].astype(np.float32)).to(dev)
 
     # ── Phase 1: Autoencoder ──────────────────────────────────────
@@ -289,7 +312,7 @@ def train_timegan(
                 # ── Train Generator (2 steps per D step) ──
                 for _ in range(2):
                     x = _get_batch()
-                    z = _random_noise(batch_size, seq_len, feature_dim, dev)
+                    z = _random_noise(batch_size, seq_len, feature_dim, dev, generator=noise_generator)
 
                     # Forward passes
                     h_real = model._embed(x)
@@ -324,7 +347,7 @@ def train_timegan(
 
                 # ── Train Discriminator ──
                 x = _get_batch()
-                z = _random_noise(batch_size, seq_len, feature_dim, dev)
+                z = _random_noise(batch_size, seq_len, feature_dim, dev, generator=noise_generator)
 
                 h_real = model._embed(x).detach()
                 h_fake = model._generate(z).detach()
@@ -359,7 +382,7 @@ def train_timegan(
     log_info("[TimeGAN] Training complete.")
 
     # Generate a batch of synthetic data for evaluation
-    synthetic = model.generate(n_samples, seq_len, device=dev)
+    synthetic = model.generate(n_samples, seq_len, device=dev, generator=noise_generator)
     # Denormalize
     synthetic = synthetic * data_range + data_min
 

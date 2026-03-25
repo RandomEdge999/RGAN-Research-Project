@@ -13,6 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.model_selection import cross_val_predict
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from scipy.linalg import sqrtm
@@ -20,7 +21,8 @@ import warnings
 
 from .plots import _PALETTE, _style_axes, _finalise_static, _write_interactive, _HAS_PLOTLY, _ensure_path
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
 # Try to import plotly for interactive charts
 try:
@@ -75,10 +77,12 @@ def frechet_distance(real_samples, fake_samples):
     # Compute sqrt of matrix product
     try:
         sigma_prod = sqrtm(sigma_real @ sigma_fake)
+        if np.iscomplexobj(sigma_prod):
+            sigma_prod = sigma_prod.real
         cov_trace = np.trace(sigma_real + sigma_fake - 2 * sigma_prod)
-    except:
-        # Fallback if matrix sqrt fails
-        cov_trace = np.trace(sigma_real) + np.trace(sigma_fake)
+    except (np.linalg.LinAlgError, ValueError) as e:
+        warnings.warn(f"Matrix sqrt failed in Frechet distance ({e}); result marked NaN")
+        return float("nan")
 
     fd = mean_diff + cov_trace
     return float(np.real(fd))
@@ -183,7 +187,7 @@ def _extract_time_series_features(samples):
     return features
 
 
-def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
+def evaluate_discriminators(real_samples, fake_samples, n_folds=5, seed=42):
     """
     Train multiple binary classifiers (RF, SVM, MLP) to distinguish real from synthetic.
     
@@ -191,6 +195,7 @@ def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
         real_samples: np.ndarray
         fake_samples: np.ndarray
         n_folds: int
+        seed: int
         
     Returns:
         dict: {
@@ -220,9 +225,9 @@ def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
         return results
 
     classifiers = {
-        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
-        'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=42)),
-        'MLP': make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42))
+        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=seed),
+        'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=seed)),
+        'MLP': make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=seed))
     }
     
     results = {}
@@ -240,15 +245,17 @@ def evaluate_discriminators(real_samples, fake_samples, n_folds=5):
             }
         except Exception as e:
             import traceback
-            print(f"Classifier {name} failed: {e}\n{traceback.format_exc()}")
-            results[name] = {'accuracy': 0, 'f1': 0, 'precision': 0, 'recall': 0}
+            warnings.warn(f"Classifier {name} failed: {e}\n{traceback.format_exc()}")
+            results[name] = {'accuracy': float('nan'), 'f1': float('nan'),
+                             'precision': float('nan'), 'recall': float('nan'),
+                             'error': str(e)}
             
     return results
 
 
-def discrimination_score(real_samples, fake_samples, n_folds=5):
+def discrimination_score(real_samples, fake_samples, n_folds=5, seed=42):
     """Legacy wrapper for backward compatibility."""
-    res = evaluate_discriminators(real_samples, fake_samples, n_folds)
+    res = evaluate_discriminators(real_samples, fake_samples, n_folds, seed=seed)
     return res.get('Random Forest', {})
 
 
@@ -273,7 +280,6 @@ def generate_synthetic_sequences(generator, X_real, n_synthetic=None, device='cp
     generator.to(device)
     generator.eval()
 
-    # Convert to tensor if needed
     if isinstance(X_real, np.ndarray):
         X_real_tensor = torch.from_numpy(X_real).float().to(device)
     else:
@@ -282,36 +288,30 @@ def generate_synthetic_sequences(generator, X_real, n_synthetic=None, device='cp
     if n_synthetic is None:
         n_synthetic = len(X_real)
 
-    # Determine horizon length from generator
     L = X_real_tensor.shape[1]
-    n_features = X_real_tensor.shape[2] if X_real_tensor.ndim == 3 else 1
+    noise_dim = getattr(generator, 'noise_dim', 0)
 
-    # Generate in batches
     Y_synthetic_list = []
 
     with torch.no_grad():
         for i in range(0, n_synthetic, batch_size):
             batch_size_curr = min(batch_size, n_synthetic - i)
 
-            # Sample random noise
-            noise = torch.randn(batch_size_curr, L, device=device)
-
             # Get corresponding X samples (cycle through real data if n_synthetic > len(X_real))
             idx = i % len(X_real)
             idx_end = min(idx + batch_size_curr, len(X_real))
             X_batch = X_real_tensor[idx:idx_end]
 
-            # Pad if batch is smaller than batch_size_curr
             if len(X_batch) < batch_size_curr:
                 pad_size = batch_size_curr - len(X_batch)
                 X_batch = torch.cat([X_batch, X_real_tensor[:pad_size]], dim=0)
 
-            # Generate
-            try:
-                Y_batch = generator(X_batch, noise)
-            except TypeError:
-                # If generator doesn't take noise, try without it
-                Y_batch = generator(X_batch)
+            # Generate with latent noise for diversity
+            if noise_dim > 0:
+                z = torch.randn(X_batch.size(0), L, noise_dim, device=device)
+            else:
+                z = None
+            Y_batch = generator(X_batch, z)
 
             Y_synthetic_list.append(Y_batch.cpu().numpy())
 
@@ -480,52 +480,156 @@ def plot_real_vs_synthetic_sequences(real_seqs, synthetic_seqs, out_path, n_samp
     }
 
 
-def plot_real_vs_synthetic_distributions(real_seqs, synthetic_seqs, out_path, bins=30):
+def plot_real_vs_synthetic_kde(real_seqs, synthetic_seqs, out_path, n_subsample=5000, seed=42):
     """
-    Create histogram comparing value distributions.
+    KDE overlay comparing real vs synthetic value distributions.
+    Lightweight replacement for histogram (avoids 33MB HTML files).
 
     Args:
         real_seqs: np.ndarray of shape (n_samples, sequence_length, features) or (n_samples, sequence_length)
         synthetic_seqs: np.ndarray of same shape
         out_path: str, path to save visualizations
-        bins: int, number of histogram bins
+        n_subsample: int, max points to use for KDE (performance)
+        seed: int, RNG seed used for deterministic subsampling
+
+    Returns:
+        dict: {'static': path_to_png, 'interactive': path_to_html}
+    """
+    from scipy.stats import gaussian_kde
+
+    out_path = _ensure_path(out_path)
+    real_flat = real_seqs.flatten()
+    synthetic_flat = synthetic_seqs.flatten()
+
+    # Subsample for performance
+    rng = np.random.default_rng(seed)
+    if len(real_flat) > n_subsample:
+        real_flat = rng.choice(real_flat, n_subsample, replace=False)
+    if len(synthetic_flat) > n_subsample:
+        synthetic_flat = rng.choice(synthetic_flat, n_subsample, replace=False)
+
+    # Compute KDE
+    x_min = min(real_flat.min(), synthetic_flat.min())
+    x_max = max(real_flat.max(), synthetic_flat.max())
+    margin = (x_max - x_min) * 0.05
+    x_grid = np.linspace(x_min - margin, x_max + margin, 500)
+
+    kde_real = gaussian_kde(real_flat)
+    kde_syn = gaussian_kde(synthetic_flat)
+    y_real = kde_real(x_grid)
+    y_syn = kde_syn(x_grid)
+
+    # Static matplotlib plot
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(x_grid, y_real, label='Real', color=_PALETTE[0], linewidth=2)
+    ax.fill_between(x_grid, y_real, alpha=0.2, color=_PALETTE[0])
+    ax.plot(x_grid, y_syn, label='Synthetic', color=_PALETTE[1], linewidth=2)
+    ax.fill_between(x_grid, y_syn, alpha=0.2, color=_PALETTE[1])
+    ax.set_xlabel('Value')
+    ax.set_ylabel('Density')
+    ax.set_title('Distribution Comparison: Real vs Synthetic (KDE)')
+    ax.legend()
+    _style_axes(ax)
+    static_path = _finalise_static(fig, out_path)
+
+    # Interactive plotly plot
+    interactive_path = None
+    if _HAS_PLOTLY:
+        fig_i = go.Figure()
+        fig_i.add_trace(go.Scatter(
+            x=x_grid, y=y_real, name='Real', mode='lines',
+            line=dict(color=_PALETTE[0], width=2),
+            fill='tozeroy', fillcolor=f'rgba(99,102,241,0.15)',
+        ))
+        fig_i.add_trace(go.Scatter(
+            x=x_grid, y=y_syn, name='Synthetic', mode='lines',
+            line=dict(color=_PALETTE[1], width=2),
+            fill='tozeroy', fillcolor=f'rgba(236,72,153,0.15)',
+        ))
+        fig_i.update_layout(
+            title='Distribution Comparison: Real vs Synthetic (KDE)',
+            xaxis_title='Value', yaxis_title='Density',
+            template='plotly_white', height=450, width=800,
+        )
+        interactive_path = _write_interactive(fig_i, out_path)
+
+    return {'static': static_path, 'interactive': interactive_path}
+
+
+def plot_synthetic_quality_heatmap(synthetic_quality, out_path):
+    """
+    Heatmap comparing GAN variants on quality metrics.
+
+    Args:
+        synthetic_quality: dict like {"RGAN": {"frechet_distance": float,
+            "variance_difference": {"rel_diff": float},
+            "all_discrimination": {"Random Forest": {"accuracy": float}, ...}}, ...}
+        out_path: str, path to save visualizations
 
     Returns:
         dict: {'static': path_to_png, 'interactive': path_to_html}
     """
     out_path = _ensure_path(out_path)
-    real_flat = real_seqs.flatten()
-    synthetic_flat = synthetic_seqs.flatten()
 
-    # Static matplotlib plot
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.hist(real_flat, bins=bins, alpha=0.6, label='Real', color=_PALETTE[0], density=True)
-    ax.hist(synthetic_flat, bins=bins, alpha=0.6, label='Synthetic', color=_PALETTE[1], density=True)
-    ax.set_xlabel('Value')
-    ax.set_ylabel('Density')
-    ax.set_title('Distribution Comparison: Real vs Synthetic')
-    ax.legend()
-    _style_axes(ax)
+    gan_names = list(synthetic_quality.keys())
+    metric_labels = ["Fréchet Distance", "Variance Diff (%)", "RF Accuracy", "SVM Accuracy", "MLP Accuracy"]
 
+    matrix = []
+    for gan in gan_names:
+        sq = synthetic_quality[gan]
+        fd = sq.get("frechet_distance", np.nan)
+        var_diff = sq.get("variance_difference", {}).get("rel_diff", np.nan)
+        disc = sq.get("all_discrimination", {})
+        rf_acc = disc.get("Random Forest", {}).get("accuracy", np.nan)
+        svm_acc = disc.get("SVM (RBF)", {}).get("accuracy", np.nan)
+        mlp_acc = disc.get("MLP", {}).get("accuracy", np.nan)
+        matrix.append([fd, var_diff, rf_acc, svm_acc, mlp_acc])
+
+    matrix = np.array(matrix).T  # (n_metrics, n_gans)
+
+    fig, ax = plt.subplots(figsize=(max(5, len(gan_names) * 2.5), 5))
+    im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn_r")
+
+    ax.set_xticks(range(len(gan_names)))
+    ax.set_xticklabels(gan_names, fontsize=11)
+    ax.set_yticks(range(len(metric_labels)))
+    ax.set_yticklabels(metric_labels, fontsize=10)
+
+    # Cell annotations
+    for i in range(len(metric_labels)):
+        for j in range(len(gan_names)):
+            val = matrix[i, j]
+            if np.isnan(val):
+                continue
+            if abs(val) > 10:
+                fmt = f"{val:.1f}"
+            else:
+                fmt = f"{val:.4f}"
+            row_thresh = np.nanpercentile(matrix[i, :], 60)
+            text_color = "white" if val > row_thresh else "black"
+            ax.text(j, i, fmt, ha="center", va="center", fontsize=10, color=text_color)
+
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_title("Synthetic Data Quality Comparison", fontsize=13)
     static_path = _finalise_static(fig, out_path)
 
-    # Interactive plotly plot
+    interactive_path = None
     if _HAS_PLOTLY:
-        fig_i = go.Figure()
-        fig_i.add_trace(go.Histogram(x=real_flat, name='Real', opacity=0.7,
-                                     marker=dict(color=_PALETTE[0]), nbinsx=bins))
-        fig_i.add_trace(go.Histogram(x=synthetic_flat, name='Synthetic', opacity=0.7,
-                                     marker=dict(color=_PALETTE[1]), nbinsx=bins))
-        fig_i.update_layout(barmode='overlay', title='Distribution Comparison: Real vs Synthetic',
-                           xaxis_title='Value', yaxis_title='Count', template='plotly_white')
+        fig_i = go.Figure(data=go.Heatmap(
+            z=matrix.tolist(),
+            x=gan_names,
+            y=metric_labels,
+            colorscale="RdYlGn_r",
+            text=[[f"{v:.4f}" if not np.isnan(v) else "" for v in row] for row in matrix],
+            texttemplate="%{text}",
+        ))
+        fig_i.update_layout(
+            title="Synthetic Data Quality Comparison",
+            template="plotly_white", height=400, width=max(400, len(gan_names) * 200),
+        )
         interactive_path = _write_interactive(fig_i, out_path)
-    else:
-        interactive_path = None
 
-    return {
-        'static': static_path,
-        'interactive': interactive_path
-    }
+    return {'static': static_path, 'interactive': interactive_path}
 
 
 def plot_data_augmentation_comparison(augmentation_results, out_path):

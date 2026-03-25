@@ -26,7 +26,6 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import boto3
 import yaml
 
 
@@ -34,6 +33,74 @@ def _load_config() -> dict:
     config_path = Path(__file__).parent / "config.yaml"
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def _coalesce_override(cli_value, default_value):
+    """Prefer explicit CLI values while allowing empty-string fallbacks for text args."""
+    if cli_value is None:
+        return default_value
+    if isinstance(cli_value, str) and cli_value == "":
+        return default_value
+    return cli_value
+
+
+def _build_hyperparameters(args, defaults: dict) -> dict[str, str]:
+    """Build SageMaker hyperparameters from CLI args and config defaults."""
+    hyperparameters = {
+        "epochs": str(_coalesce_override(args.epochs, defaults["epochs"])),
+        "batch_size": str(_coalesce_override(args.batch_size, defaults["batch_size"])),
+        "L": str(_coalesce_override(args.L, defaults["L"])),
+        "H": str(_coalesce_override(args.H, defaults["H"])),
+        "noise_levels": str(_coalesce_override(args.noise_levels, defaults["noise_levels"])),
+        "checkpoint_every": str(_coalesce_override(args.checkpoint_every, defaults["checkpoint_every"])),
+        "target": args.target,
+        "time_col": args.time_col,
+        "resample": str(_coalesce_override(args.resample, defaults.get("resample", ""))),
+        "agg": str(_coalesce_override(args.agg, defaults.get("agg", "last"))),
+        "units_g": str(defaults.get("units_g", 128)),
+        "units_d": str(defaults.get("units_d", 128)),
+        "g_layers": str(defaults.get("g_layers", 2)),
+        "d_layers": str(defaults.get("d_layers", 2)),
+        "lrG": str(defaults.get("lrG", 0.0005)),
+        "lrD": str(defaults.get("lrD", 0.0005)),
+        "lambda_reg": str(defaults.get("lambda_reg", 0.5)),
+        "gan_variant": str(_coalesce_override(args.gan_variant, defaults.get("gan_variant", "wgan-gp"))),
+        "wgan_gp_lambda": str(defaults.get("wgan_gp_lambda", 10.0)),
+        "d_steps": str(defaults.get("d_steps", 3)),
+        "g_steps": str(defaults.get("g_steps", 1)),
+        "grad_clip": str(defaults.get("grad_clip", 1.0)),
+        "dropout": str(defaults.get("dropout", 0.1)),
+        "ema_decay": str(defaults.get("ema_decay", 0.999)),
+        "supervised_warmup_epochs": str(defaults.get("supervised_warmup_epochs", 10)),
+        "patience": str(defaults.get("patience", 25)),
+        "bootstrap_samples": str(defaults.get("bootstrap_samples", 300)),
+        "num_workers": str(defaults.get("num_workers", 2)),
+        "seed": str(args.seed if args.seed is not None else defaults.get("seed", 42)),
+        "train_ratio": str(defaults.get("train_ratio", 0.8)),
+        "weight_decay": str(defaults.get("weight_decay", 0.0)),
+        "adv_weight": str(defaults.get("adv_weight", 1.0)),
+        "eval_every": str(defaults.get("eval_every", 5)),
+        "eval_batch_size": str(defaults.get("eval_batch_size", 2048)),
+        "compile_mode": str(_coalesce_override(args.compile_mode, defaults.get("compile_mode", "off"))),
+        "preload_to_device": str(_coalesce_override(args.preload_to_device, defaults.get("preload_to_device", "never"))),
+        "critic_reg_interval": str(
+            _coalesce_override(args.critic_reg_interval, defaults.get("critic_reg_interval", 1))
+        ),
+        "critic_arch": str(_coalesce_override(args.critic_arch, defaults.get("critic_arch", "tcn"))),
+    }
+    if args.skip_classical or defaults.get("skip_classical", False):
+        hyperparameters["skip_classical"] = "true"
+    if args.skip_noise_robustness or defaults.get("skip_noise_robustness", False):
+        hyperparameters["skip_noise_robustness"] = "true"
+    if args.deterministic:
+        hyperparameters["deterministic"] = "true"
+    if args.max_train_windows:
+        hyperparameters["max_train_windows"] = str(args.max_train_windows)
+    if args.only_models:
+        hyperparameters["only_models"] = args.only_models
+    if args.prior_results:
+        hyperparameters["prior_results"] = args.prior_results
+    return hyperparameters
 
 
 def _create_source_tarball(project_root: Path, tmp_dir: str) -> str:
@@ -83,10 +150,13 @@ def _get_pytorch_image_uri(region: str, pt_version: str, py_version: str) -> str
 def main():
     ap = argparse.ArgumentParser(description="Launch RGAN training on SageMaker")
     ap.add_argument("--csv", required=True, help="Local path to CSV dataset")
-    ap.add_argument("--target", default="index_value", help="Target column name")
+    ap.add_argument("--target", default="auto", help="Target column name")
+    ap.add_argument("--time_col", default="auto", help="Time column name")
     ap.add_argument("--job_name", default="", help="Custom job name (auto-generated if empty)")
     ap.add_argument("--instance_type", default="", help="Override instance type from config")
     ap.add_argument("--spot", default="", help="Use spot instances (true/false, default from config)")
+    ap.add_argument("--resample", default=None, help="Override the configured resampling frequency (e.g. '1min')")
+    ap.add_argument("--agg", default=None, help="Override the configured resampling aggregation")
 
     # Training hyperparameters (override config defaults)
     ap.add_argument("--epochs", type=int, default=None)
@@ -97,9 +167,14 @@ def main():
     ap.add_argument("--checkpoint_every", type=int, default=None)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--gan_variant", default=None)
+    ap.add_argument("--deterministic", action="store_true", help="Enable deterministic CUDA mode in the training job.")
     ap.add_argument("--skip_classical", action="store_true")
     ap.add_argument("--skip_noise_robustness", action="store_true")
     ap.add_argument("--max_train_windows", type=int, default=None)
+    ap.add_argument("--compile_mode", choices=["off", "reduce-overhead"], default=None)
+    ap.add_argument("--preload_to_device", choices=["auto", "always", "never"], default=None)
+    ap.add_argument("--critic_reg_interval", type=int, default=None)
+    ap.add_argument("--critic_arch", choices=["lstm", "tcn"], default=None)
     ap.add_argument("--resume_job", default="", help="Resume from a previous job's checkpoints (pass the old job name)")
     ap.add_argument("--only_models", default="", help="Comma-separated models to retrain (e.g. 'patchtst,itransformer'). Requires --prior_results.")
     ap.add_argument("--prior_results", default="", help="Path to prior results dir for loading skipped models.")
@@ -124,6 +199,8 @@ def main():
     bucket = cfg["s3"]["bucket"]
     sm_cfg = cfg["sagemaker"]
     defaults = cfg["defaults"]
+
+    import boto3
 
     s3 = boto3.client("s3", region_name=region)
     sm = boto3.client("sagemaker", region_name=region)
@@ -151,54 +228,7 @@ def main():
 
     # 4. Build hyperparameters — merge CLI overrides with config defaults
     print("\n[4/5] Configuring training job...")
-    hyperparameters = {
-        "epochs": str(args.epochs or defaults["epochs"]),
-        "batch_size": str(args.batch_size or defaults["batch_size"]),
-        "L": str(args.L or defaults["L"]),
-        "H": str(args.H or defaults["H"]),
-        "noise_levels": args.noise_levels or defaults["noise_levels"],
-        "checkpoint_every": str(args.checkpoint_every or defaults["checkpoint_every"]),
-        "target": args.target,
-        # Data preprocessing
-        "resample": str(defaults.get("resample", "")),
-        "agg": str(defaults.get("agg", "last")),
-        # Model architecture
-        "units_g": str(defaults.get("units_g", 128)),
-        "units_d": str(defaults.get("units_d", 128)),
-        "g_layers": str(defaults.get("g_layers", 2)),
-        "d_layers": str(defaults.get("d_layers", 2)),
-        # Training dynamics
-        "lrG": str(defaults.get("lrG", 0.0005)),
-        "lrD": str(defaults.get("lrD", 0.0005)),
-        "lambda_reg": str(defaults.get("lambda_reg", 0.5)),
-        "gan_variant": args.gan_variant or str(defaults.get("gan_variant", "wgan-gp")),
-        "wgan_gp_lambda": str(defaults.get("wgan_gp_lambda", 10.0)),
-        "d_steps": str(defaults.get("d_steps", 3)),
-        "g_steps": str(defaults.get("g_steps", 1)),
-        "grad_clip": str(defaults.get("grad_clip", 1.0)),
-        "dropout": str(defaults.get("dropout", 0.1)),
-        "ema_decay": str(defaults.get("ema_decay", 0.999)),
-        "supervised_warmup_epochs": str(defaults.get("supervised_warmup_epochs", 10)),
-        "patience": str(defaults.get("patience", 25)),
-        "bootstrap_samples": str(defaults.get("bootstrap_samples", 300)),
-        "num_workers": str(defaults.get("num_workers", 2)),
-        "seed": str(args.seed if args.seed is not None else defaults.get("seed", 42)),
-        "train_ratio": str(defaults.get("train_ratio", 0.8)),
-        "weight_decay": str(defaults.get("weight_decay", 0.0)),
-        "adv_weight": str(defaults.get("adv_weight", 1.0)),
-        "eval_every": str(defaults.get("eval_every", 5)),
-        "eval_batch_size": str(defaults.get("eval_batch_size", 2048)),
-    }
-    if args.skip_classical or defaults.get("skip_classical", False):
-        hyperparameters["skip_classical"] = "true"
-    if args.skip_noise_robustness or defaults.get("skip_noise_robustness", False):
-        hyperparameters["skip_noise_robustness"] = "true"
-    if args.max_train_windows:
-        hyperparameters["max_train_windows"] = str(args.max_train_windows)
-    if args.only_models:
-        hyperparameters["only_models"] = args.only_models
-    if args.prior_results:
-        hyperparameters["prior_results"] = args.prior_results
+    hyperparameters = _build_hyperparameters(args, defaults)
 
     # Job name
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -67,37 +67,60 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--metrics", required=True)
     ap.add_argument("--out", default="research_paper.tex")
+    ap.add_argument("--template", default="", help="Optional path to a LaTeX template file.")
     args = ap.parse_args()
-    m = json.loads(Path(args.metrics).read_text())
+    metrics_path = Path(args.metrics)
+    m = json.loads(metrics_path.read_text())
 
     # template.tex lives in papers/ at the project root
     _project_root = Path(__file__).resolve().parents[3]
-    template = _project_root / "papers" / "template.tex"
+    template = Path(args.template) if args.template else (_project_root / "papers" / "template.tex")
+    if not template.exists():
+        print(f"[build_paper] ERROR: LaTeX template not found at {template}", file=sys.stderr)
+        print("[build_paper] Create papers/template.tex or pass --template <path>.", file=sys.stderr)
+        sys.exit(1)
 
-    learning_curve_plot = m["learning_curves"].get("plot", "") or m["compare_plots"]["test"]
+    # Support both current schema ("charts") and legacy ("learning_curves"/"compare_plots")
+    charts = m.get("charts", {})
+    compare_plots = m.get("compare_plots", {})
+    learning_curves = m.get("learning_curves", {})
+
+    # Resolve learning curve: current schema uses charts.training_curves_overlay
+    learning_curve_plot = (
+        charts.get("training_curves_overlay", "")
+        or learning_curves.get("plot", "")
+    )
 
     def _check(path_str: str) -> str:
         if not path_str:
             return ""
         path_obj = Path(path_str)
-        if not path_obj.exists():
-            print(f"[build_paper] Warning: referenced figure not found: {path_obj}", file=sys.stderr)
-            return ""
-        return path_str
+        candidates = [path_obj]
+        if not path_obj.is_absolute():
+            candidates.append(metrics_path.parent / path_obj.name)
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        print(f"[build_paper] Warning: referenced figure not found: {path_obj}", file=sys.stderr)
+        return ""
+
+    # Build substitution dict supporting both schemas
+    ranked_bars = charts.get("ranked_model_bars", "")
+    overlay = charts.get("training_curves_overlay", "")
 
     filled = template.read_text() % dict(
-        rgan_curve=_check(m["rgan"]["curve"]),
-        lstm_curve=_check(m["lstm"]["curve"]),
-        naive_curve=_check(m["naive_baseline"].get("curve") or m["rgan"]["curve"]),
-        tree_ensemble_curve=_check(m.get("tree_ensemble", {}).get("curve") or m["lstm"]["curve"]),
-        compare_test=_check(m["compare_plots"]["test"]),
-        compare_train=_check(m["compare_plots"]["train"]),
-        naive_comparison=_check(m["compare_plots"].get("naive_comparison", m["compare_plots"]["test"])),
-        classical_curve=_check(m["classical"].get("curves") or m["compare_plots"]["test"]),
+        rgan_curve=_check(m.get("rgan", {}).get("curve", "")),
+        lstm_curve=_check(m.get("lstm", {}).get("curve", "")),
+        naive_curve=_check(m.get("naive_baseline", {}).get("curve", "")),
+        tree_ensemble_curve=_check(m.get("tree_ensemble", {}).get("curve", "")),
+        compare_test=_check(ranked_bars or compare_plots.get("test", "")),
+        compare_train=_check(ranked_bars or compare_plots.get("train", "")),
+        naive_comparison=_check(ranked_bars or compare_plots.get("naive_comparison", "")),
+        classical_curve=_check(overlay),
         learning_curve=_check(learning_curve_plot),
-        generator_arch=to_itemize(m["rgan"]["architecture"]["generator"]),
-        discriminator_arch=to_itemize(m["rgan"]["architecture"]["discriminator"]),
-        rgan_hparams=hyperparam_summary(m["rgan"]["config"]),
+        generator_arch=to_itemize(m.get("rgan", {}).get("architecture", {}).get("generator", [])),
+        discriminator_arch=to_itemize(m.get("rgan", {}).get("architecture", {}).get("discriminator", [])),
+        rgan_hparams=hyperparam_summary(m.get("rgan", {}).get("config", {})),
         error_table_rows=build_error_rows(m),
     )
 

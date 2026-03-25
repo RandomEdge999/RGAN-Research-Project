@@ -114,7 +114,8 @@ def main():
     ap.add_argument("--csv", required=True, help="Local path to CSV dataset")
     ap.add_argument("--results_from", required=True,
                     help="Local path to training results directory (contains models/ and metrics.json)")
-    ap.add_argument("--target_col", default="index_value", help="Target column name")
+    ap.add_argument("--target_col", default="auto", help="Target column name")
+    ap.add_argument("--time_col", default="auto", help="Time column name")
     ap.add_argument("--job_name", default="", help="Custom job name (auto-generated if empty)")
     ap.add_argument("--instance_type", default="", help="Override instance type from config")
     ap.add_argument("--spot", default="", help="Use spot instances (true/false)")
@@ -208,6 +209,7 @@ def main():
 
     hyperparameters = {
         "target_col": args.target_col,
+        "time_col": args.time_col,
         "nn_epochs": str(args.nn_epochs),
         "nn_patience": str(args.nn_patience),
         "timegan_epochs": str(args.timegan_epochs),

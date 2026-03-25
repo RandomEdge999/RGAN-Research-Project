@@ -96,6 +96,7 @@ def main():
         "SM_HP_PATIENCE": "--patience",
         "SM_HP_SEED": "--seed",
         "SM_HP_TARGET": "--target",
+        "SM_HP_TIME_COL": "--time_col",
         "SM_HP_TRAIN_RATIO": "--train_ratio",
         "SM_HP_EMA_DECAY": "--ema_decay",
         "SM_HP_BOOTSTRAP_SAMPLES": "--bootstrap_samples",
@@ -115,6 +116,10 @@ def main():
         "SM_HP_ADV_WEIGHT": "--adv_weight",
         "SM_HP_EVAL_EVERY": "--eval_every",
         "SM_HP_EVAL_BATCH_SIZE": "--eval_batch_size",
+        "SM_HP_PRELOAD_TO_DEVICE": "--preload_to_device",
+        "SM_HP_COMPILE_MODE": "--compile_mode",
+        "SM_HP_CRITIC_REG_INTERVAL": "--critic_reg_interval",
+        "SM_HP_CRITIC_ARCH": "--critic_arch",
         # Selective retraining
         "SM_HP_ONLY_MODELS": "--only_models",
         "SM_HP_PRIOR_RESULTS": "--prior_results",
@@ -125,6 +130,7 @@ def main():
         "SM_HP_SKIP_CLASSICAL": "--skip_classical",
         "SM_HP_REQUIRE_CUDA": "--require_cuda",
         "SM_HP_SKIP_NOISE_ROBUSTNESS": "--skip_noise_robustness",
+        "SM_HP_DETERMINISTIC": "--deterministic",
     }
 
     for env_key, cli_flag in hp_mapping.items():

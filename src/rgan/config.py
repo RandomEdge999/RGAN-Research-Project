@@ -29,6 +29,7 @@ class ModelConfig:
     g_dense_activation: Optional[str] = None
     d_activation: str = "sigmoid"
     use_spectral_norm: bool = False
+    critic_arch: str = "tcn"
 
 @dataclass
 class TrainConfig:
@@ -85,6 +86,10 @@ class TrainConfig:
     persistent_workers: bool = True
     pin_memory: bool = True
     seed: int = 42
+    preload_to_device: str = "never"
+    compile_mode: str = "off"
+    critic_reg_interval: int = 1
+    critic_arch: str = "tcn"
     
     # Model Params
     L: int = 60
@@ -97,6 +102,10 @@ class TrainConfig:
     g_dense_activation: Optional[str] = None
     d_activation: str = "sigmoid"
     
+    # Noise & Diversity (RCGAN-style stochastic generation)
+    noise_dim: int = 16
+    lambda_diversity: float = 0.1
+
     # Advanced Training Options
     supervised_warmup_epochs: int = 10
     lambda_reg_start: Optional[float] = None
@@ -126,6 +135,24 @@ class TrainConfig:
             self.lambda_reg_start = self.lambda_reg
         if self.lambda_reg_end is None:
             self.lambda_reg_end = self.lambda_reg
+        if self.d_steps < 1:
+            raise ValueError("d_steps must be >= 1.")
+        if self.preload_to_device not in {"auto", "always", "never"}:
+            raise ValueError(
+                f"Unsupported preload_to_device='{self.preload_to_device}'. "
+                "Expected one of: auto, always, never."
+            )
+        if self.compile_mode not in {"off", "reduce-overhead"}:
+            raise ValueError(
+                f"Unsupported compile_mode='{self.compile_mode}'. "
+                "Expected one of: off, reduce-overhead."
+            )
+        if self.critic_reg_interval < 1:
+            raise ValueError("critic_reg_interval must be >= 1.")
+        if self.critic_arch not in {"lstm", "tcn"}:
+            raise ValueError(
+                f"Unsupported critic_arch='{self.critic_arch}'. Expected one of: lstm, tcn."
+            )
 
 @dataclass
 class DataConfig:

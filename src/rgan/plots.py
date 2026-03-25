@@ -18,17 +18,44 @@ except Exception:  # pragma: no cover - optional dependency
     _HAS_PLOTLY = False
 
 
-_PALETTE = [
-    "#6366F1",
-    "#EC4899",
-    "#22D3EE",
-    "#F59E0B",
-    "#10B981",
-    "#8B5CF6",
-    "#F97316",
-]
+# ---------------------------------------------------------------------------
+# Unified model style registry — consistent colors, linestyles, markers
+# across all charts. Kept in display-order (GAN first, neural, classical).
+# ---------------------------------------------------------------------------
+_MODEL_STYLES = {
+    "RGAN":           {"color": "#E74C3C", "ls": "-",  "marker": "o"},
+    "LSTM":           {"color": "#3498DB", "ls": "--", "marker": "s"},
+    "DLinear":        {"color": "#2ECC71", "ls": "-.", "marker": "^"},
+    "NLinear":        {"color": "#9B59B6", "ls": ":",  "marker": "d"},
+    "FITS":           {"color": "#F39C12", "ls": "-.", "marker": "v"},
+    "PatchTST":       {"color": "#1ABC9C", "ls": "--", "marker": "P"},
+    "iTransformer":   {"color": "#E67E22", "ls": "-",  "marker": "X"},
+    "Autoformer":     {"color": "#C0392B", "ls": "--", "marker": "H"},
+    "Informer":       {"color": "#2C3E50", "ls": "-.", "marker": "p"},
+    "Naive":          {"color": "#95A5A6", "ls": ":",  "marker": "*"},
+    "ARIMA":          {"color": "#7F8C8D", "ls": "--", "marker": ">"},
+    "ARMA":           {"color": "#BDC3C7", "ls": "-.", "marker": "<"},
+    "Tree Ensemble":  {"color": "#27AE60", "ls": ":",  "marker": "D"},
+    "Naïve Baseline": {"color": "#95A5A6", "ls": ":",  "marker": "*"},
+}
+
+# Flat palette derived from styles (for bar charts etc.)
+_PALETTE = [s["color"] for s in _MODEL_STYLES.values()]
+
+# Map from noise_results dict keys → display names
+_NOISE_KEY_MAP = {
+    "rgan": "RGAN", "lstm": "LSTM", "dlinear": "DLinear", "nlinear": "NLinear",
+    "fits": "FITS", "patchtst": "PatchTST", "itransformer": "iTransformer",
+    "autoformer": "Autoformer", "informer": "Informer", "naive_baseline": "Naive",
+    "arima": "ARIMA", "arma": "ARMA", "tree_ensemble": "Tree Ensemble",
+}
+
+_DASH_MAP = {"-": "solid", "--": "dash", "-.": "dashdot", ":": "dot"}
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def _ensure_path(path) -> Path:
     return path if isinstance(path, Path) else Path(path)
 
@@ -43,9 +70,10 @@ def _rgba(hex_color: str, alpha: float) -> str:
 
 def _finalise_static(fig, out_path: Path) -> str:
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    png_path = out_path.with_suffix(".png")
+    fig.savefig(png_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
-    return str(out_path)
+    return str(png_path)
 
 
 def _write_interactive(fig, out_path: Path) -> str:
@@ -64,284 +92,474 @@ def _style_axes(ax) -> None:
             ax.spines[spine].set_visible(False)
 
 
-def plot_single_train_test(curve_epoch, train_rmse, test_rmse, title, out_path, ylabel="RMSE") -> Dict[str, str]:
+def _get_style(model_name: str) -> dict:
+    """Get style for a model, with fallback for unknown models."""
+    return _MODEL_STYLES.get(model_name, {"color": "#333333", "ls": "-", "marker": "o"})
+
+
+# ---------------------------------------------------------------------------
+# 1. Training Curves Overlay (replaces 13 individual per-model charts)
+# ---------------------------------------------------------------------------
+def plot_training_curves_overlay(
+    model_histories: Dict[str, Dict[str, list]],
+    classical_baselines: Dict[str, float],
+    out_path: str,
+    metric: str = "test_rmse",
+    ylabel: str = "Test RMSE",
+) -> Dict[str, str]:
+    """All neural model training curves on one chart, classical baselines as hlines.
+
+    Args:
+        model_histories: {model_name: {"epoch": [...], "train_rmse": [...], "test_rmse": [...]}}.
+        classical_baselines: {model_name: final_test_rmse}.
+        out_path: Save path (without extension).
+        metric: Key in history dict to plot (default "test_rmse").
+        ylabel: Y-axis label.
+    """
     out_path = _ensure_path(out_path)
-    fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    ax.plot(curve_epoch, train_rmse, label="Train RMSE", color=_PALETTE[0], linewidth=2.2, marker="o")
-    ax.plot(curve_epoch, test_rmse, label="Test RMSE", color=_PALETTE[1], linewidth=2.2, marker="o")
-    ax.set_title(title)
-    ax.set_xlabel("Epochs")
-    ax.set_ylabel(ylabel)
-    ax.legend(frameon=False)
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Neural model curves
+    for name, hist in model_histories.items():
+        epochs = hist.get("epoch", [])
+        values = hist.get(metric, [])
+        if not epochs or not values:
+            continue
+        s = _get_style(name)
+        ax.plot(epochs, values, label=name, color=s["color"], linestyle=s["ls"],
+                marker=s["marker"], markersize=4, linewidth=1.8, markevery=max(1, len(epochs) // 10))
+
+    # Classical baselines as horizontal dashed lines
+    for name, val in classical_baselines.items():
+        if val is None:
+            continue
+        s = _get_style(name)
+        ax.axhline(y=val, color=s["color"], linestyle=":", linewidth=1.2, alpha=0.7)
+        ax.annotate(f"{name} ({val:.6f})", xy=(1.01, val), xycoords=("axes fraction", "data"),
+                    fontsize=7, color=s["color"], va="center")
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title("Training Convergence: All Models", fontsize=13)
+    ax.legend(loc="upper right", fontsize=8, ncol=2, frameon=False)
     _style_axes(ax)
     static_path = _finalise_static(fig, out_path)
 
     html_path = ""
     if _HAS_PLOTLY:
         fig_i = go.Figure()
-        fig_i.add_trace(
-            go.Scatter(
-                x=list(curve_epoch),
-                y=list(train_rmse),
-                name="Train RMSE",
-                mode="lines+markers",
-                line=dict(color=_PALETTE[0], width=3),
-                marker=dict(size=8),
-            )
-        )
-        fig_i.add_trace(
-            go.Scatter(
-                x=list(curve_epoch),
-                y=list(test_rmse),
-                name="Test RMSE",
-                mode="lines+markers",
-                line=dict(color=_PALETTE[1], width=3),
-                marker=dict(size=8),
-            )
-        )
+        for name, hist in model_histories.items():
+            epochs = hist.get("epoch", [])
+            values = hist.get(metric, [])
+            if not epochs or not values:
+                continue
+            s = _get_style(name)
+            fig_i.add_trace(go.Scatter(
+                x=list(epochs), y=list(values), name=name, mode="lines+markers",
+                line=dict(color=s["color"], dash=_DASH_MAP.get(s["ls"], "solid"), width=2),
+                marker=dict(size=4),
+            ))
+        for name, val in classical_baselines.items():
+            if val is None:
+                continue
+            s = _get_style(name)
+            fig_i.add_hline(y=val, line_dash="dot", line_color=s["color"],
+                            annotation_text=f"{name} ({val:.6f})",
+                            annotation_position="right")
         fig_i.update_layout(
-            title=dict(text=title, x=0.05),
-            xaxis=dict(title="Epochs"),
-            yaxis=dict(title=ylabel),
-            template="plotly_white",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-            margin=dict(l=60, r=30, t=70, b=60),
-        )
-        fig_i.update_traces(hovertemplate="Epoch %{x}<br>%{y:.6f}")
-        html_path = _write_interactive(fig_i, out_path)
-
-    return {"static": static_path, "interactive": html_path}
-
-
-def plot_constant_train_test(train_value, test_value, title, out_path, ylabel="RMSE") -> Dict[str, str]:
-    out_path = _ensure_path(out_path)
-    steps = [0, 1]
-    fig, ax = plt.subplots(figsize=(8.0, 4.4))
-    ax.plot(steps, [train_value, train_value], label=f"Train {ylabel}", color=_PALETTE[0], linewidth=2.4)
-    ax.plot(steps, [test_value, test_value], label=f"Test {ylabel}", color=_PALETTE[1], linewidth=2.4)
-    ax.set_title(title)
-    ax.set_xlabel("Epochs")
-    ax.set_ylabel(ylabel)
-    ax.set_xticks(steps, ["Start", "End"])
-    ax.legend(frameon=False)
-    _style_axes(ax)
-    static_path = _finalise_static(fig, out_path)
-
-    html_path = ""
-    if _HAS_PLOTLY:
-        fig_i = go.Figure()
-        fig_i.add_trace(
-            go.Scatter(
-                x=steps,
-                y=[train_value, train_value],
-                name=f"Train {ylabel}",
-                mode="lines",
-                line=dict(color=_PALETTE[0], width=4),
-            )
-        )
-        fig_i.add_trace(
-            go.Scatter(
-                x=steps,
-                y=[test_value, test_value],
-                name=f"Test {ylabel}",
-                mode="lines",
-                line=dict(color=_PALETTE[1], width=4),
-            )
-        )
-        fig_i.update_layout(
-            title=dict(text=title, x=0.05),
-            xaxis=dict(title="Epochs", tickmode="array", tickvals=steps, ticktext=["Start", "End"]),
-            yaxis=dict(title=ylabel),
-            template="plotly_white",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-            margin=dict(l=60, r=30, t=70, b=60),
+            title="Training Convergence: All Models",
+            xaxis_title="Epoch", yaxis_title=ylabel,
+            template="plotly_white", height=550, width=1000,
+            legend=dict(font=dict(size=9)),
         )
         html_path = _write_interactive(fig_i, out_path)
 
     return {"static": static_path, "interactive": html_path}
 
 
-def plot_compare_models_bars(train_errors: dict, test_errors: dict, out_test_path: str, out_train_path: str) -> Dict[str, Dict[str, str]]:
-    models = list(test_errors.keys())
-    test_vals = [test_errors[m] for m in models]
-    train_vals = [train_errors[m] for m in models]
+# ---------------------------------------------------------------------------
+# 2. Ranked Model Bars with CI (replaces plot_compare_models_bars)
+# ---------------------------------------------------------------------------
+def plot_ranked_model_bars(
+    model_stats: Dict[str, Dict[str, float]],
+    out_path: str,
+    metric: str = "rmse_orig",
+    title: str = "Model Comparison: Test RMSE (95% CI)",
+) -> Dict[str, str]:
+    """Horizontal bar chart sorted by metric, with bootstrap CI error bars.
 
-    # Static plots
-    fig_test, ax_test = plt.subplots(figsize=(7.4, 4.4))
-    bars_test = ax_test.bar(models, test_vals, color=_PALETTE[: len(models)])
-    ax_test.set_title("Test Error by Model")
-    ax_test.set_xlabel("Models")
-    ax_test.set_ylabel("RMSE")
-    for bar, value in zip(bars_test, test_vals):
-        ax_test.annotate(f"{value:.6f}", xy=(bar.get_x() + bar.get_width() / 2, value), xytext=(0, 6),
-                         textcoords="offset points", ha="center", fontsize=9, color="#1f2937")
-    _style_axes(ax_test)
-    static_test = _finalise_static(fig_test, _ensure_path(out_test_path))
-
-    fig_train, ax_train = plt.subplots(figsize=(7.4, 4.4))
-    bars_train = ax_train.bar(models, train_vals, color=_PALETTE[: len(models)])
-    ax_train.set_title("Train Error by Model")
-    ax_train.set_xlabel("Models")
-    ax_train.set_ylabel("RMSE")
-    for bar, value in zip(bars_train, train_vals):
-        ax_train.annotate(f"{value:.6f}", xy=(bar.get_x() + bar.get_width() / 2, value), xytext=(0, 6),
-                          textcoords="offset points", ha="center", fontsize=9, color="#1f2937")
-    _style_axes(ax_train)
-    static_train = _finalise_static(fig_train, _ensure_path(out_train_path))
-
-    # Interactive plots
-    html_test = html_train = ""
-    if _HAS_PLOTLY:
-        fig_i_test = go.Figure()
-        fig_i_test.add_trace(
-            go.Bar(x=models, y=test_vals, marker_color=_PALETTE[: len(models)], name="Test RMSE")
-        )
-        fig_i_test.update_layout(
-            title="Test Error by Model",
-            xaxis_title="Models",
-            yaxis_title="RMSE",
-            template="plotly_white",
-            margin=dict(l=60, r=30, t=70, b=60),
-        )
-        html_test = _write_interactive(fig_i_test, _ensure_path(out_test_path))
-
-        fig_i_train = go.Figure()
-        fig_i_train.add_trace(
-            go.Bar(x=models, y=train_vals, marker_color=_PALETTE[: len(models)], name="Train RMSE")
-        )
-        fig_i_train.update_layout(
-            title="Train Error by Model",
-            xaxis_title="Models",
-            yaxis_title="RMSE",
-            template="plotly_white",
-            margin=dict(l=60, r=30, t=70, b=60),
-        )
-        html_train = _write_interactive(fig_i_train, _ensure_path(out_train_path))
-
-    return {
-        "test": {"static": static_test, "interactive": html_test},
-        "train": {"static": static_train, "interactive": html_train},
-    }
-
-
-def plot_classical_curves(sizes, ets_curve, arima_curve, out_path) -> Optional[Dict[str, str]]:
-    if sizes is None:
-        return None
-
+    Args:
+        model_stats: {model_name: {"rmse_orig": float, "rmse_orig_ci_low": float, ...}}.
+        out_path: Save path (without extension).
+        metric: Metric key to sort and display.
+        title: Chart title.
+    """
     out_path = _ensure_path(out_path)
-    fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    ax.plot(sizes, ets_curve, marker="o", label="ETS (RMSE)", color=_PALETTE[0], linewidth=2.2)
-    ax.plot(sizes, arima_curve, marker="o", label="ARIMA (RMSE)", color=_PALETTE[1], linewidth=2.2)
-    ax.set_title("Classical Models: Error vs Number of Samples")
-    ax.set_xlabel("Number of Samples")
-    ax.set_ylabel("RMSE")
-    ax.legend(frameon=False)
+
+    # Build sorted data
+    items = []
+    for name, stats in model_stats.items():
+        val = stats.get(metric)
+        if val is None:
+            continue
+        ci_low = stats.get(f"{metric}_ci_low")
+        ci_high = stats.get(f"{metric}_ci_high")
+        items.append((name, val, ci_low, ci_high))
+
+    items.sort(key=lambda x: x[1])  # ascending (best at top in horizontal)
+
+    names = [it[0] for it in items]
+    values = [it[1] for it in items]
+    colors = [_get_style(n)["color"] for n in names]
+
+    # Compute error bar arrays (asymmetric)
+    xerr_low = []
+    xerr_high = []
+    has_ci = False
+    for _, val, ci_low, ci_high in items:
+        if ci_low is not None and ci_high is not None:
+            xerr_low.append(val - ci_low)
+            xerr_high.append(ci_high - val)
+            has_ci = True
+        else:
+            xerr_low.append(0)
+            xerr_high.append(0)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(items) * 0.45)))
+    y_pos = np.arange(len(items))
+
+    if has_ci:
+        ax.barh(y_pos, values, color=colors, xerr=[xerr_low, xerr_high],
+                capsize=3, ecolor="#555555", height=0.6)
+    else:
+        ax.barh(y_pos, values, color=colors, height=0.6)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(names, fontsize=10)
+    ax.set_xlabel(metric.replace("_orig", "").upper(), fontsize=12)
+    ax.set_title(title, fontsize=13)
+    ax.invert_yaxis()  # Best at top
+
+    # Value annotations
+    for i, (_, val, _, _) in enumerate(items):
+        ax.annotate(f"{val:.6f}", xy=(val, i), xytext=(6, 0),
+                    textcoords="offset points", va="center", fontsize=8, color="#333")
+
     _style_axes(ax)
     static_path = _finalise_static(fig, out_path)
 
     html_path = ""
     if _HAS_PLOTLY:
         fig_i = go.Figure()
-        fig_i.add_trace(
-            go.Scatter(
-                x=list(sizes),
-                y=list(ets_curve),
-                name="ETS (RMSE)",
-                mode="lines+markers",
-                line=dict(color=_PALETTE[0], width=3),
-                marker=dict(size=8),
-            )
-        )
-        fig_i.add_trace(
-            go.Scatter(
-                x=list(sizes),
-                y=list(arima_curve),
-                name="ARIMA (RMSE)",
-                mode="lines+markers",
-                line=dict(color=_PALETTE[1], width=3),
-                marker=dict(size=8),
-            )
-        )
+        fig_i.add_trace(go.Bar(
+            y=names, x=values, orientation="h",
+            marker_color=colors,
+            error_x=dict(type="data", symmetric=False,
+                         array=xerr_high, arrayminus=xerr_low) if has_ci else None,
+            text=[f"{v:.6f}" for v in values],
+            textposition="outside",
+        ))
         fig_i.update_layout(
-            title="Classical Models: Error vs Number of Samples",
-            xaxis_title="Number of Samples",
-            yaxis_title="RMSE",
-            template="plotly_white",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-            margin=dict(l=60, r=30, t=70, b=60),
+            title=title, xaxis_title=metric.replace("_orig", "").upper(),
+            template="plotly_white", height=max(400, len(items) * 40), width=900,
+            yaxis=dict(autorange="reversed"),
+            margin=dict(l=120, r=80, t=70, b=50),
         )
         html_path = _write_interactive(fig_i, out_path)
 
     return {"static": static_path, "interactive": html_path}
 
 
-def plot_learning_curves(sizes, curves: dict, out_path, curve_stds: dict = None, ylabel="RMSE") -> Optional[Dict[str, str]]:
-    if sizes is None or len(sizes) == 0:
-        return None
+# ---------------------------------------------------------------------------
+# 3. Noise Robustness Heatmap (NEW)
+# ---------------------------------------------------------------------------
+def plot_noise_robustness_heatmap(
+    noise_results: List[dict],
+    out_path: str,
+    normalize: bool = True,
+) -> Dict[str, str]:
+    """Heatmap: models (rows) x noise levels (cols), color = degradation % or raw RMSE.
 
+    Args:
+        noise_results: List of dicts from run_training.
+        out_path: Save path (without extension).
+        normalize: If True, show % degradation from clean baseline.
+    """
     out_path = _ensure_path(out_path)
-    fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    for idx, (label, values) in enumerate(curves.items()):
-        color = _PALETTE[idx % len(_PALETTE)]
-        ax.plot(sizes, values, marker="o", label=label, color=color, linewidth=2.2)
-        if curve_stds and label in curve_stds:
-            std_vals = curve_stds[label]
-            if len(std_vals) == len(values):
-                upper = np.array(values) + np.array(std_vals)
-                lower = np.array(values) - np.array(std_vals)
-                ax.fill_between(sizes, lower, upper, color=color, alpha=0.15)
-    ax.set_title("Model RMSE vs Training Sample Size")
-    ax.set_xlabel("Number of Training Windows")
-    ax.set_ylabel(ylabel)
-    ax.legend(frameon=False)
-    _style_axes(ax)
+    sds = [r["sd"] for r in noise_results]
+
+    # Build matrix
+    model_names = []
+    matrix = []
+    for key, label in _NOISE_KEY_MAP.items():
+        row = []
+        baseline = None
+        for nr in noise_results:
+            stats = nr.get(key, {})
+            rmse = stats.get("rmse_orig", stats.get("rmse")) if stats else None
+            if nr["sd"] == 0.0 and rmse is not None:
+                baseline = rmse
+            row.append(rmse)
+
+        if all(v is None for v in row):
+            continue
+
+        if normalize and baseline and baseline > 0:
+            row = [(((v - baseline) / baseline) * 100 if v is not None else np.nan) for v in row]
+        else:
+            row = [(v if v is not None else np.nan) for v in row]
+
+        model_names.append(label)
+        matrix.append(row)
+
+    matrix = np.array(matrix)
+
+    # Sort by degradation at highest noise level (best robustness at top)
+    sort_col = matrix[:, -1] if matrix.shape[1] > 0 else matrix[:, 0]
+    sort_idx = np.argsort(sort_col)
+    matrix = matrix[sort_idx]
+    model_names = [model_names[i] for i in sort_idx]
+
+    # Static
+    fig, ax = plt.subplots(figsize=(max(8, len(sds) * 1.5), max(5, len(model_names) * 0.45)))
+    cmap = "YlOrRd" if normalize else "viridis"
+    im = ax.imshow(matrix, aspect="auto", cmap=cmap)
+
+    ax.set_xticks(range(len(sds)))
+    ax.set_xticklabels([f"σ={s}" for s in sds], fontsize=10)
+    ax.set_yticks(range(len(model_names)))
+    ax.set_yticklabels(model_names, fontsize=10)
+
+    # Cell annotations
+    for i in range(len(model_names)):
+        for j in range(len(sds)):
+            val = matrix[i, j]
+            if np.isnan(val):
+                continue
+            fmt = f"{val:+.0f}%" if normalize else f"{val:.4f}"
+            text_color = "white" if val > np.nanpercentile(matrix, 70) else "black"
+            ax.text(j, i, fmt, ha="center", va="center", fontsize=8, color=text_color)
+
+    label = "RMSE Degradation (%)" if normalize else "Test RMSE"
+    fig.colorbar(im, ax=ax, label=label, shrink=0.8)
+    ax.set_title("Noise Robustness Heatmap", fontsize=13)
+    static_path = _finalise_static(fig, out_path)
+
+    html_path = ""
+    if _HAS_PLOTLY:
+        fmt = ".0f" if normalize else ".4f"
+        suffix = "%" if normalize else ""
+        fig_i = go.Figure(data=go.Heatmap(
+            z=matrix.tolist(),
+            x=[f"σ={s}" for s in sds],
+            y=model_names,
+            colorscale="YlOrRd" if normalize else "Viridis",
+            text=[[f"{v:{fmt}}{suffix}" if not np.isnan(v) else "" for v in row] for row in matrix],
+            texttemplate="%{text}",
+            colorbar=dict(title=label),
+        ))
+        fig_i.update_layout(
+            title="Noise Robustness Heatmap",
+            template="plotly_white", height=max(400, len(model_names) * 40), width=700,
+        )
+        html_path = _write_interactive(fig_i, out_path)
+
+    return {"static": static_path, "interactive": html_path}
+
+
+# ---------------------------------------------------------------------------
+# 4. Multi-Metric Radar Chart (NEW)
+# ---------------------------------------------------------------------------
+def plot_multi_metric_radar(
+    model_stats: Dict[str, Dict[str, float]],
+    out_path: str,
+    metrics: List[str] = None,
+    models: List[str] = None,
+) -> Dict[str, str]:
+    """Radar chart comparing models across multiple metrics.
+
+    Args:
+        model_stats: {model_name: {metric_key: value}}.
+        out_path: Save path (without extension).
+        metrics: Metric keys to plot. Default: rmse_orig, mae_orig, smape_orig, maape_orig, mase_orig.
+        models: Model names to include. Default: top 5 by RMSE + RGAN.
+    """
+    out_path = _ensure_path(out_path)
+
+    if metrics is None:
+        metrics = ["rmse_orig", "mae_orig", "smape_orig", "maape_orig", "mase_orig"]
+
+    metric_labels = [m.replace("_orig", "").upper() for m in metrics]
+
+    # Select models
+    if models is None:
+        # Top 5 by RMSE + ensure RGAN is included
+        sorted_models = sorted(
+            [(n, s.get("rmse_orig", float("inf"))) for n, s in model_stats.items()],
+            key=lambda x: x[1]
+        )
+        top_names = [n for n, _ in sorted_models[:5]]
+        if "RGAN" not in top_names and "RGAN" in model_stats:
+            top_names.append("RGAN")
+        models = top_names
+
+    # Build normalized values (lower is better → invert so larger area = better)
+    raw = {}
+    for name in models:
+        stats = model_stats.get(name, {})
+        raw[name] = [stats.get(m) for m in metrics]
+
+    # Find min/max per metric for normalization
+    all_vals = {m: [] for m in metrics}
+    for name, vals in raw.items():
+        for i, v in enumerate(vals):
+            if v is not None:
+                all_vals[metrics[i]].append(v)
+
+    mins = {m: min(vs) if vs else 0 for m, vs in all_vals.items()}
+    maxs = {m: max(vs) if vs else 1 for m, vs in all_vals.items()}
+
+    normalized = {}
+    for name, vals in raw.items():
+        norm = []
+        for i, v in enumerate(vals):
+            m = metrics[i]
+            rng = maxs[m] - mins[m]
+            if v is None or rng == 0:
+                norm.append(0.5)
+            else:
+                norm.append(1.0 - (v - mins[m]) / rng)  # invert: higher = better
+        normalized[name] = norm
+
+    N = len(metrics)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]  # close polygon
+
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+
+    for name, vals in normalized.items():
+        s = _get_style(name)
+        vals_closed = vals + vals[:1]
+        ax.plot(angles, vals_closed, color=s["color"], linewidth=2, label=name)
+        ax.fill(angles, vals_closed, color=s["color"], alpha=0.1)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metric_labels, fontsize=10)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+    ax.set_yticklabels(["worst", "", "", "best"], fontsize=8, color="#666")
+    ax.set_title("Multi-Metric Model Comparison", fontsize=13, pad=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
     static_path = _finalise_static(fig, out_path)
 
     html_path = ""
     if _HAS_PLOTLY:
         fig_i = go.Figure()
-        for idx, (label, values) in enumerate(curves.items()):
-            color = _PALETTE[idx % len(_PALETTE)]
-            fig_i.add_trace(
-                go.Scatter(
-                    x=list(sizes),
-                    y=list(values),
-                    name=label,
-                    mode="lines+markers",
-                    line=dict(color=color, width=3),
-                    marker=dict(size=8),
-                )
-            )
-            if curve_stds and label in curve_stds:
-                std_vals = curve_stds[label]
-                if len(std_vals) == len(values):
-                    upper = np.array(values) + np.array(std_vals)
-                    lower = np.array(values) - np.array(std_vals)
-                    fig_i.add_trace(
-                        go.Scatter(
-                            x=list(sizes) + list(reversed(list(sizes))),
-                            y=list(upper) + list(reversed(list(lower))),
-                            fill="toself",
-                            fillcolor=_rgba(color, 0.18),
-                            line=dict(color="rgba(0,0,0,0)"),
-                            hoverinfo="skip",
-                            showlegend=False,
-                            name=f"{label} ±1σ",
-                        )
+        for name, vals in normalized.items():
+            s = _get_style(name)
+            fig_i.add_trace(go.Scatterpolar(
+                r=vals + vals[:1],
+                theta=metric_labels + metric_labels[:1],
+                name=name,
+                line=dict(color=s["color"], width=2),
+                fill="toself",
+                fillcolor=_rgba(s["color"], 0.1),
+            ))
+        fig_i.update_layout(
+            title="Multi-Metric Model Comparison",
+            polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+            template="plotly_white", height=600, width=700,
+        )
+        html_path = _write_interactive(fig_i, out_path)
+
+    return {"static": static_path, "interactive": html_path}
+
+
+# ---------------------------------------------------------------------------
+# 5. Predictions Comparison (KEPT as-is)
+# ---------------------------------------------------------------------------
+def plot_predictions(predictions_dict: Dict[str, np.ndarray], save_path: str, n_samples: int = 4):
+    """Plot ground truth vs model predictions for a few samples."""
+    if not predictions_dict:
+        return
+
+    available_samples = 0
+    for k, v in predictions_dict.items():
+        if v is not None:
+            available_samples = len(v)
+            break
+
+    n_samples = min(n_samples, available_samples)
+    if n_samples <= 0:
+        return
+
+    fig, axes = plt.subplots(n_samples, 1, figsize=(10, 3 * n_samples), sharex=True)
+    if n_samples == 1:
+        axes = [axes]
+
+    for i in range(n_samples):
+        ax = axes[i]
+        for model_name, preds in predictions_dict.items():
+            if preds is None:
+                continue
+            try:
+                if len(preds) <= i:
+                    continue
+                y = preds[i].flatten()
+            except Exception:
+                continue
+
+            if model_name == "True":
+                ax.plot(y, "k-", label="Ground Truth", alpha=1.0, linewidth=2.0)
+            else:
+                s = _get_style(model_name)
+                ax.plot(y, label=model_name, color=s["color"], alpha=0.7, linewidth=1.5)
+
+        ax.set_title(f"Sample {i}")
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.legend(fontsize=7, ncol=3)
+
+    plt.tight_layout()
+    _finalise_static(fig, Path(save_path))
+
+    if _HAS_PLOTLY:
+        try:
+            fig_go = make_subplots(rows=n_samples, cols=1,
+                                   subplot_titles=[f"Sample {i}" for i in range(n_samples)])
+            for i in range(n_samples):
+                for model_name, preds in predictions_dict.items():
+                    if preds is None:
+                        continue
+                    try:
+                        if len(preds) <= i:
+                            continue
+                        y = preds[i].flatten()
+                    except Exception:
+                        continue
+
+                    line_dict = dict(width=2)
+                    if model_name == "True":
+                        line_dict["color"] = "black"
+                    else:
+                        s = _get_style(model_name)
+                        line_dict["color"] = s["color"]
+
+                    fig_go.add_trace(
+                        go.Scatter(y=y, mode="lines",
+                                   name=model_name if i == 0 else None,
+                                   line=line_dict, showlegend=(i == 0)),
+                        row=i + 1, col=1
                     )
-        fig_i.update_layout(
-            title="Model RMSE vs Training Sample Size",
-            xaxis_title="Number of Training Windows",
-            yaxis_title=ylabel,
-            template="plotly_white",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-            margin=dict(l=60, r=30, t=70, b=60),
-        )
-        html_path = _write_interactive(fig_i, out_path)
-
-    return {"static": static_path, "interactive": html_path}
+            fig_go.update_layout(height=300 * n_samples, title_text="Predictions Comparison")
+            _write_interactive(fig_go, Path(save_path))
+        except Exception:
+            pass
 
 
+# ---------------------------------------------------------------------------
+# 6. Error Metrics Table (KEPT as-is)
+# ---------------------------------------------------------------------------
 def create_error_metrics_table(model_results: dict, out_path: str = None):
     data = []
 
@@ -360,33 +578,29 @@ def create_error_metrics_table(model_results: dict, out_path: str = None):
             std = stats.get(f"{key}_orig_std", stats.get(f"{key}_std"))
             if std is None:
                 return "-"
-            return f"±{std:.8f}"
+            return f"\u00b1{std:.8f}"
         return f"[{low:.8f}, {high:.8f}]"
 
     for model_name, results in model_results.items():
         if "train" in results and "test" in results:
-            data.append(
-                {
-                    "Model": f"{model_name} (Train)",
-                    "RMSE": _fmt(_extract(results["train"], "rmse")),
-                    "RMSE_CI": _fmt_ci(results["train"], "rmse"),
-                    "MSE": _fmt(_extract(results["train"], "mse")),
-                    "BIAS": _fmt(_extract(results["train"], "bias")),
-                    "MAE": _fmt(_extract(results["train"], "mae")),
-                    "MAE_CI": _fmt_ci(results["train"], "mae"),
-                }
-            )
-            data.append(
-                {
-                    "Model": f"{model_name} (Test)",
-                    "RMSE": _fmt(_extract(results["test"], "rmse")),
-                    "RMSE_CI": _fmt_ci(results["test"], "rmse"),
-                    "MSE": _fmt(_extract(results["test"], "mse")),
-                    "BIAS": _fmt(_extract(results["test"], "bias")),
-                    "MAE": _fmt(_extract(results["test"], "mae")),
-                    "MAE_CI": _fmt_ci(results["test"], "mae"),
-                }
-            )
+            data.append({
+                "Model": f"{model_name} (Train)",
+                "RMSE": _fmt(_extract(results["train"], "rmse")),
+                "RMSE_CI": _fmt_ci(results["train"], "rmse"),
+                "MSE": _fmt(_extract(results["train"], "mse")),
+                "BIAS": _fmt(_extract(results["train"], "bias")),
+                "MAE": _fmt(_extract(results["train"], "mae")),
+                "MAE_CI": _fmt_ci(results["train"], "mae"),
+            })
+            data.append({
+                "Model": f"{model_name} (Test)",
+                "RMSE": _fmt(_extract(results["test"], "rmse")),
+                "RMSE_CI": _fmt_ci(results["test"], "rmse"),
+                "MSE": _fmt(_extract(results["test"], "mse")),
+                "BIAS": _fmt(_extract(results["test"], "bias")),
+                "MAE": _fmt(_extract(results["test"], "mae")),
+                "MAE_CI": _fmt_ci(results["test"], "mae"),
+            })
     df = pd.DataFrame(data)
     if out_path:
         df.to_csv(out_path, index=False)
@@ -394,136 +608,15 @@ def create_error_metrics_table(model_results: dict, out_path: str = None):
     return df
 
 
-def plot_predictions(predictions_dict: Dict[str, np.ndarray], save_path: str, n_samples: int = 4):
-    """
-    Plot ground truth vs model predictions for a few samples.
-    
-    Args:
-        predictions_dict: Dictionary {model_name: predictions_array}
-                          predictions_array shape: (N, H, 1) or (N, H)
-        save_path: Path to save the plot (without extension)
-        n_samples: Number of samples to plot
-    """
-    if not predictions_dict:
-        return
-
-    # keys = list(predictions_dict.keys())
-    # num_models = len(keys)
-    
-    # Get ground truth if available for reference
-    truth = predictions_dict.get('True')
-    
-    # Check available samples
-    available_samples = 0
-    for k, v in predictions_dict.items():
-        if v is not None:
-            available_samples = len(v)
-            break
-            
-    n_samples = min(n_samples, available_samples)
-    if n_samples <= 0:
-        return
-
-    # Create figure
-    fig, axes = plt.subplots(n_samples, 1, figsize=(10, 3 * n_samples), sharex=True)
-    if n_samples == 1:
-        axes = [axes]
-    
-    for i in range(n_samples):
-        ax = axes[i]
-        for model_name, preds in predictions_dict.items():
-            if preds is None:
-                continue
-            
-            # Handle shapes (N, H, 1) or (N, H)
-            try:
-                if len(preds) <= i: continue
-                y = preds[i].flatten()
-            except:
-                continue
-            
-            style = '-'
-            alpha = 0.7
-            width = 1.5
-            color = None
-            
-            if model_name == 'True':
-                style = 'k-'
-                alpha = 1.0
-                width = 2.0
-                label = 'Ground Truth'
-            else:
-                label = model_name
-                
-            ax.plot(y, style, label=label, alpha=alpha, linewidth=width)
-            
-        ax.set_title(f"Sample {i}")
-        ax.grid(True, alpha=0.3)
-        if i == 0:
-            ax.legend()
-            
-    plt.tight_layout()
-    _finalise_static(fig, Path(save_path))
-    
-    # Interactive plot if possible
-    if _HAS_PLOTLY:
-        try:
-            fig_go = make_subplots(rows=n_samples, cols=1, subplot_titles=[f"Sample {i}" for i in range(n_samples)])
-            
-            for i in range(n_samples):
-                for model_name, preds in predictions_dict.items():
-                    if preds is None:
-                        continue
-                    try:
-                        if len(preds) <= i: continue
-                        y = preds[i].flatten()
-                    except: continue
-
-                    line_dict = dict(width=2)
-                    if model_name == 'True':
-                        line_dict['color'] = 'black'
-                        line_dict['dash'] = 'solid'
-                    
-                    fig_go.add_trace(
-                        go.Scatter(y=y, mode='lines', name=model_name if i == 0 else None,
-                                  line=line_dict, showlegend=(i==0)),
-                        row=i+1, col=1
-                    )
-            
-            fig_go.update_layout(height=300*n_samples, title_text="Predictions Comparison")
-            _write_interactive(fig_go, Path(save_path))
-        except Exception:
-            pass
-
-
+# ---------------------------------------------------------------------------
+# 7. Noise Robustness Table (FIXED — added Autoformer, Informer)
+# ---------------------------------------------------------------------------
 def create_noise_robustness_table(
     noise_results: List[dict],
     out_path: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Build a noise robustness table: RMSE per model at each noise level.
-
-    Args:
-        noise_results: List of dicts from run_training, one per noise level.
-            Each dict has keys like 'sd', 'rgan', 'lstm', ... where each model
-            value is a stats dict with 'rmse_orig' (or 'rmse').
-        out_path: Optional CSV path.
-
-    Returns:
-        DataFrame with models as rows, noise levels as columns, values = RMSE.
-    """
-    model_keys = [
-        ("rgan", "RGAN"),
-        ("lstm", "LSTM"),
-        ("dlinear", "DLinear"),
-        ("nlinear", "NLinear"),
-        ("fits", "FITS"),
-        ("patchtst", "PatchTST"),
-        ("itransformer", "iTransformer"),
-        ("naive_baseline", "Naive"),
-        ("arima", "ARIMA"),
-        ("arma", "ARMA"),
-        ("tree_ensemble", "Tree Ensemble"),
-    ]
+    """Build a noise robustness table: RMSE per model at each noise level."""
+    model_keys = list(_NOISE_KEY_MAP.items())  # all 13 models
 
     sds = [r["sd"] for r in noise_results]
 
@@ -535,14 +628,13 @@ def create_noise_robustness_table(
             sd = nr["sd"]
             stats = nr.get(key, {})
             if not stats:
-                row[f"σ={sd}"] = None
+                row[f"\u03c3={sd}"] = None
                 continue
             rmse = stats.get("rmse_orig", stats.get("rmse"))
-            row[f"σ={sd}"] = rmse
+            row[f"\u03c3={sd}"] = rmse
             if sd == 0.0 and rmse is not None:
                 baseline_rmse = rmse
 
-        # Compute degradation (% increase from clean to noisiest)
         if baseline_rmse and len(sds) > 1:
             noisiest = noise_results[-1]
             noisy_stats = noisiest.get(key, {})
@@ -562,35 +654,20 @@ def create_noise_robustness_table(
     return df
 
 
+# ---------------------------------------------------------------------------
+# 8. Noise Robustness Line Plot (FIXED — all 13 models via _MODEL_STYLES)
+# ---------------------------------------------------------------------------
 def plot_noise_robustness(
     noise_results: List[dict],
     out_path: str,
 ) -> Dict[str, str]:
-    """Plot RMSE vs noise level for all models — the core paper figure.
-
-    Args:
-        noise_results: List of dicts from run_training.
-        out_path: Save path (without extension).
-
-    Returns:
-        Dict with 'static' and 'interactive' paths.
-    """
-    model_keys = [
-        ("rgan", "RGAN", "#E74C3C", "-", "o"),
-        ("lstm", "LSTM", "#3498DB", "--", "s"),
-        ("dlinear", "DLinear", "#2ECC71", "-.", "^"),
-        ("nlinear", "NLinear", "#9B59B6", ":", "d"),
-        ("fits", "FITS", "#F39C12", "-.", "v"),
-        ("patchtst", "PatchTST", "#1ABC9C", "--", "P"),
-        ("itransformer", "iTransformer", "#E67E22", "-", "X"),
-        ("naive_baseline", "Naive", "#95A5A6", ":", "*"),
-    ]
-
+    """Plot RMSE vs noise level for all models — the core paper figure."""
     sds = [r["sd"] for r in noise_results]
+    out = _ensure_path(out_path)
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    for key, label, color, ls, marker in model_keys:
+    for key, label in _NOISE_KEY_MAP.items():
         rmses = []
         for nr in noise_results:
             stats = nr.get(key, {})
@@ -603,24 +680,23 @@ def plot_noise_robustness(
         if all(np.isnan(v) for v in rmses):
             continue
 
-        ax.plot(sds, rmses, label=label, color=color, linestyle=ls,
-                marker=marker, markersize=6, linewidth=2)
+        s = _MODEL_STYLES.get(label, {"color": "#333", "ls": "-", "marker": "o"})
+        ax.plot(sds, rmses, label=label, color=s["color"], linestyle=s["ls"],
+                marker=s["marker"], markersize=6, linewidth=2)
 
-    ax.set_xlabel("Noise Standard Deviation (σ)", fontsize=12)
+    ax.set_xlabel("Noise Standard Deviation (\u03c3)", fontsize=12)
     ax.set_ylabel("Test RMSE (original scale)", fontsize=12)
     ax.set_title("Noise Robustness: RMSE Degradation Under Input Perturbation", fontsize=13)
-    ax.legend(loc="upper left", fontsize=9, ncol=2)
+    ax.legend(loc="upper left", fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=-0.005)
     plt.tight_layout()
-
-    out = Path(out_path)
     static_path = _finalise_static(fig, out)
 
     html_path = ""
     if _HAS_PLOTLY:
         fig_i = go.Figure()
-        for key, label, color, ls, marker in model_keys:
+        for key, label in _NOISE_KEY_MAP.items():
             rmses = []
             for nr in noise_results:
                 stats = nr.get(key, {})
@@ -631,15 +707,15 @@ def plot_noise_robustness(
                 rmses.append(rmse)
             if all(v is None for v in rmses):
                 continue
-            dash_map = {"-": "solid", "--": "dash", "-.": "dashdot", ":": "dot"}
+            s = _MODEL_STYLES.get(label, {"color": "#333", "ls": "-"})
             fig_i.add_trace(go.Scatter(
                 x=sds, y=rmses, name=label,
-                line=dict(color=color, dash=dash_map.get(ls, "solid"), width=2),
+                line=dict(color=s["color"], dash=_DASH_MAP.get(s["ls"], "solid"), width=2),
                 mode="lines+markers",
             ))
         fig_i.update_layout(
             title="Noise Robustness: RMSE Degradation Under Input Perturbation",
-            xaxis_title="Noise Standard Deviation (σ)",
+            xaxis_title="Noise Standard Deviation (\u03c3)",
             yaxis_title="Test RMSE (original scale)",
             template="plotly_white",
             height=500, width=900,
@@ -647,4 +723,3 @@ def plot_noise_robustness(
         html_path = _write_interactive(fig_i, out)
 
     return {"static": static_path, "interactive": html_path}
-

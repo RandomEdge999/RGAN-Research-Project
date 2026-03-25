@@ -28,6 +28,11 @@ RGAN trains an LSTM generator and LSTM discriminator adversarially to forecast t
 pip install -e .
 ```
 
+For TSLib benchmarks (requires HuggingFace `datasets`):
+```bash
+pip install -e ".[benchmark]"
+```
+
 For AWS/SageMaker cloud training:
 ```bash
 pip install -e ".[cloud]"
@@ -54,9 +59,12 @@ rgan-train --csv data/binance/Binance_Data.csv --target index_value \
   --noise_levels 0,0.01,0.05,0.1,0.2
 
 # Data augmentation experiment
-rgan-augment --csv data/binance/Binance_Data.csv
+rgan-augment --csv data/binance/Binance_Data.csv --results_from results/experiment
 
-# TSLib benchmarks
+# Explicit non-RGAN augmentation baseline
+rgan-augment --csv data/binance/Binance_Data.csv --allow_gaussian_baseline
+
+# TSLib benchmarks (requires: pip install -e ".[benchmark]")
 rgan-benchmark --datasets ETTh1 --pred_lens 96,192,336,720
 ```
 
@@ -109,7 +117,8 @@ Results are saved to `--results_dir` (default: `results/`):
 
 - `metrics.json` — all metrics, architecture summaries, artifact paths
 - `noise_robustness_table.csv` — RMSE per model per noise level
-- `augmentation_results.csv` — downstream forecasting with synthetic data
+- `metrics_augmentation.json` — augmentation summary and synthetic-quality metrics
+- `classification_metrics_table.csv`, `synthetic_quality_table.csv`, `data_augmentation_table.csv` — augmentation CSV summaries
 - PNG/HTML plots for all figures
 
 ---

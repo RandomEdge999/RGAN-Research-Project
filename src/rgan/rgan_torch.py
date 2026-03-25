@@ -72,10 +72,84 @@ class _AmpAdapters:
 
 
 AMP = _AmpAdapters()
+_DEFAULT_PRELOAD_LIMIT_BYTES = 1024 ** 3
+
+
+def _select_eval_generator(
+    generator: nn.Module,
+    generator_ema: Optional[nn.Module] = None,
+) -> nn.Module:
+    """Return the generator checkpoint that should be used for evaluation."""
+    return generator_ema if generator_ema is not None else generator
+
+
+def _tensor_nbytes(arr: Union[np.ndarray, torch.Tensor]) -> int:
+    """Return the byte size of a numpy array or torch tensor."""
+    if torch.is_tensor(arr):
+        return int(arr.element_size() * arr.numel())
+    return int(arr.nbytes)
+
+
+def _estimate_split_bytes(data_splits: Dict[str, Union[np.ndarray, torch.Tensor]]) -> int:
+    """Estimate the total footprint of the provided data split tensors."""
+    total = 0
+    for key in ("Xtr", "Ytr", "Xval", "Yval", "Xte", "Yte"):
+        if key in data_splits:
+            total += _tensor_nbytes(data_splits[key])
+    return total
+
+
+def _should_preload_to_device(
+    preload_to_device: str,
+    device: torch.device,
+    total_bytes: int,
+    limit_bytes: int = _DEFAULT_PRELOAD_LIMIT_BYTES,
+) -> bool:
+    """Decide whether dataset tensors should be moved to the target device once."""
+    if device.type != "cuda":
+        return False
+    if preload_to_device == "always":
+        return True
+    if preload_to_device == "auto":
+        return total_bytes <= limit_bytes
+    return False
+
+
+def _should_apply_critic_regularizer(critic_step: int, interval: int) -> bool:
+    """Return True when critic regularization should fire on this step."""
+    if interval <= 1:
+        return True
+    return critic_step % interval == 0
+
+
+def _prepare_batch_tensor(
+    batch: Union[np.ndarray, torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Move an array/tensor batch to the target device if needed."""
+    if torch.is_tensor(batch):
+        if batch.device == device:
+            return batch
+        return batch.to(device=device, non_blocking=True)
+    return torch.from_numpy(batch).to(device=device, non_blocking=True)
+
+
+def _preload_splits_to_device(
+    data_splits: Dict[str, np.ndarray],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Preload all data splits to the target device."""
+    preloaded: Dict[str, torch.Tensor] = {}
+    for key, value in data_splits.items():
+        preloaded[key] = torch.from_numpy(value).to(device=device)
+    return preloaded
 
 
 def compute_metrics(
-    G: nn.Module, X: np.ndarray, Y: np.ndarray, batch_size: int = 512
+    G: nn.Module,
+    X: Union[np.ndarray, torch.Tensor],
+    Y: Union[np.ndarray, torch.Tensor],
+    batch_size: int = 512,
 ) -> Tuple[Dict[str, float], np.ndarray]:
     """Run the generator in evaluation mode and compute error statistics.
 
@@ -96,7 +170,16 @@ def compute_metrics(
 
     n_samples = len(X)
     bs = max(1, int(batch_size))
-    Yp = np.empty_like(Y)
+    if torch.is_tensor(Y):
+        Y_shape = tuple(Y.shape)
+        Y_dtype = np.float32
+        Y_ref = Y.detach().cpu().numpy()
+    else:
+        Y_shape = Y.shape
+        Y_dtype = Y.dtype
+        Y_ref = Y
+
+    Yp = np.empty(Y_shape, dtype=Y_dtype)
 
     while True:
         try:
@@ -104,7 +187,7 @@ def compute_metrics(
             with torch.inference_mode():
                 while idx < n_samples:
                     end = min(idx + bs, n_samples)
-                    Xb = torch.from_numpy(X[idx:end]).to(device=device)
+                    Xb = _prepare_batch_tensor(X[idx:end], device)
                     with AMP.autocast(
                         device.type, enabled=(device.type == "cuda" and AMP.available)
                     ):
@@ -121,7 +204,7 @@ def compute_metrics(
                 raise
             bs = max(1, bs // 2)
 
-    stats = error_stats(Y.reshape(-1), Yp.reshape(-1))
+    stats = error_stats(Y_ref.reshape(-1), Yp.reshape(-1))
     return stats, Yp
 
 
@@ -298,6 +381,7 @@ def _load_checkpoint(
         "history": ckpt["history"],
         "ema_shadow": ckpt.get("ema_shadow"),
         "current_batch_size": ckpt.get("current_batch_size", 64),
+        "config_dict": ckpt.get("config_dict", {}),
     }
 
 
@@ -355,6 +439,29 @@ def train_rgan_torch(
     G.to(device)
     D.to(device)
 
+    compile_requested = config.compile_mode == "reduce-overhead"
+    G_train = G
+    D_train = D
+    compile_enabled = False
+    if compile_requested:
+        if config.gan_variant.lower() == "wgan-gp":
+            log_warn("torch.compile disabled for WGAN-GP: gradient penalty requires double backward, "
+                     "which aot_autograd does not support.")
+        else:
+            compile_fn = getattr(torch, "compile", None)
+            if compile_fn is None:
+                log_warn("torch.compile requested but unavailable in this PyTorch build; falling back to eager mode.")
+            else:
+                try:
+                    G_train = compile_fn(G, mode="reduce-overhead")
+                    D_train = compile_fn(D, mode="reduce-overhead")
+                    compile_enabled = True
+                    log_step("torch.compile enabled for RGAN training modules (mode=reduce-overhead).")
+                except Exception as exc:
+                    G_train = G
+                    D_train = D
+                    log_warn(f"torch.compile setup failed; continuing in eager mode. Reason: {exc}")
+
     Xtr, Ytr = data_splits["Xtr"], data_splits["Ytr"]
     Xval, Yval = data_splits["Xval"], data_splits["Yval"]
     Xte, Yte = data_splits["Xte"], data_splits["Yte"]
@@ -364,6 +471,30 @@ def train_rgan_torch(
     log_shape("Yval", Yval)
     log_shape("Xte", Xte)
     log_shape("Yte", Yte)
+
+    split_bytes = _estimate_split_bytes(data_splits)
+    preload_mode = config.preload_to_device
+    preload_selected = _should_preload_to_device(preload_mode, device, split_bytes)
+    preloaded_splits: Optional[Dict[str, torch.Tensor]] = None
+    if preload_selected:
+        try:
+            preloaded_splits = _preload_splits_to_device(data_splits, device)
+            log_step(
+                f"Preloaded data splits to {device} ({split_bytes / (1024 ** 2):.1f} MB, mode={preload_mode})."
+            )
+        except torch.cuda.OutOfMemoryError:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if preload_mode == "always":
+                raise
+            preloaded_splits = None
+            log_warn(
+                "Automatic GPU preloading ran out of memory; falling back to DataLoader-based eager batching."
+            )
+    else:
+        reason = "non-CUDA device" if device.type != "cuda" else f"dataset exceeds {(_DEFAULT_PRELOAD_LIMIT_BYTES / (1024 ** 3)):.0f} GB auto threshold"
+        if preload_mode != "never":
+            log_step(f"Skipping dataset preloading ({reason}, mode={preload_mode}).")
 
     log_step(f"Creating Adam optimizers: lr_g={config.lr_g}, lr_d={config.lr_d}, weight_decay={config.weight_decay}")
     optG = torch.optim.Adam(G.parameters(), lr=config.lr_g, weight_decay=config.weight_decay)
@@ -380,13 +511,9 @@ def train_rgan_torch(
 
     bce_loss = nn.BCEWithLogitsLoss() if use_logits else nn.BCELoss()
 
-    default_d_steps = 5 if gan_variant in {"wgan", "wgan-gp"} else 1
-    d_steps = max(1, config.d_steps)
-    if gan_variant in {"wgan", "wgan-gp"} and config.d_steps <= 1:
-        d_steps = default_d_steps
-        console.log(
-            f"[R-GAN Torch] Using {d_steps} discriminator steps per batch for {gan_variant.upper()} stability."
-        )
+    d_steps = int(config.d_steps)
+    if d_steps < 1:
+        raise ValueError("d_steps must be >= 1.")
     g_steps = max(1, config.g_steps)
     eval_batch_size = max(1, int(config.eval_batch_size))
     config.d_steps = d_steps
@@ -399,11 +526,12 @@ def train_rgan_torch(
     lambda_reg_start = config.lambda_reg_start if config.lambda_reg_start is not None else config.lambda_reg
     lambda_reg_end = config.lambda_reg_end if config.lambda_reg_end is not None else config.lambda_reg
     lambda_reg_warmup = max(1, config.lambda_reg_warmup_epochs)
-    
+
     adv_weight = config.adv_weight
     instance_noise_std = config.instance_noise_std
     instance_noise_decay = config.instance_noise_decay
     gp_lambda = config.wgan_gp_lambda
+    critic_reg_interval = max(1, int(config.critic_reg_interval))
     ema_decay = config.ema_decay
     track_logits = config.track_discriminator_outputs
 
@@ -474,6 +602,11 @@ def train_rgan_torch(
     use_ema = 0.0 < ema_decay < 1.0
     ema_shadow: Optional[Dict[str, torch.Tensor]] = _init_ema(G) if use_ema else None
 
+    noise_dim = getattr(G, "noise_dim", 0)
+    lambda_diversity = getattr(config, "lambda_diversity", 0.0)
+    if noise_dim > 0:
+        log_step(f"Noise dim: {noise_dim}, lambda_diversity={lambda_diversity}")
+
     hist: Dict[str, List[float]] = {
         "epoch": [],
         "train_rmse": [],
@@ -483,6 +616,7 @@ def train_rgan_torch(
         "G_loss": [],
         "G_adv": [],
         "G_reg": [],
+        "G_div": [],
         "grad_norm_G": [],
         "grad_norm_D": [],
         "batch_size": [],
@@ -495,13 +629,25 @@ def train_rgan_torch(
     log_step(f"Instance noise: std={instance_noise_std}, decay={instance_noise_decay}")
     log_step(f"EMA: decay={ema_decay}, enabled={use_ema}")
     log_step(f"Lambda reg: start={lambda_reg_start}, end={lambda_reg_end}, warmup={lambda_reg_warmup}")
+    log_step(
+        f"Execution path: preload_to_device={preload_mode}, preloaded={preloaded_splits is not None}, "
+        f"compile_mode={config.compile_mode}, compile_enabled={compile_enabled}, critic_reg_interval={critic_reg_interval}"
+    )
+    lambda_reg = lambda_reg_end
 
     # --- Checkpoint resume ---
+    resumed_from_epoch = 0
     if config.resume_from and os.path.isfile(config.resume_from):
         log_step(f"Loading checkpoint from: {config.resume_from}")
         restored = _load_checkpoint(
             Path(config.resume_from), G, D, optG, optD, scaler_G, scaler_D, device
         )
+        resumed_from_epoch = int(restored["epoch"])
+        if resumed_from_epoch > config.epochs:
+            raise ValueError(
+                f"Resume checkpoint is already at epoch {resumed_from_epoch}, "
+                f"but --epochs={config.epochs}. Increase --epochs to continue."
+            )
         start_epoch = restored["epoch"] + 1
         best_val = restored["best_val"]
         best_state = restored["best_state"]
@@ -510,21 +656,44 @@ def train_rgan_torch(
         if restored["ema_shadow"] is not None:
             ema_shadow = restored["ema_shadow"]
         current_batch_size = restored["current_batch_size"]
+        remaining_epochs = max(0, config.epochs - resumed_from_epoch)
+        log_step(
+            f"Resume target semantics: checkpoint_epoch={resumed_from_epoch}, "
+            f"target_epochs={config.epochs}, remaining_epochs={remaining_epochs}"
+        )
+        if remaining_epochs == 0:
+            log_step("Checkpoint already reached target epochs; skipping RGAN epoch loop and materializing final outputs.")
 
     num_workers = config.num_workers
     prefetch_factor = max(1, config.prefetch_factor)
     persistent_workers = bool(config.persistent_workers and num_workers > 0)
     pin_memory = bool(config.pin_memory and device.type == "cuda")
 
-    log_step(f"DataLoader config: num_workers={num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}, prefetch_factor={prefetch_factor}")
-    train_ds = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(Ytr))
-    log_step(f"TensorDataset created: {len(train_ds)} samples")
+    log_step(
+        f"DataLoader config: num_workers={num_workers}, pin_memory={pin_memory}, "
+        f"persistent_workers={persistent_workers}, prefetch_factor={prefetch_factor}"
+    )
+    train_ds = None
+    if preloaded_splits is None:
+        train_ds = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(Ytr))
+        log_step(f"TensorDataset created: {len(train_ds)} samples")
+    else:
+        log_step(f"Using preloaded tensor batches for {len(Xtr)} training samples.")
+
+    def _effective_batch_size(bs: int) -> int:
+        return max(1, min(int(bs), len(Xtr)))
+
+    def _drop_last_for_compile(bs: int) -> bool:
+        return bool(compile_enabled and len(Xtr) > bs and (len(Xtr) % bs) != 0)
 
     def make_loader(bs: int) -> DataLoader:
+        if train_ds is None:
+            raise RuntimeError("DataLoader requested even though training tensors were preloaded to device.")
+        effective_bs = _effective_batch_size(bs)
         kwargs = dict(
-            batch_size=bs,
+            batch_size=effective_bs,
             shuffle=True,
-            drop_last=False,
+            drop_last=_drop_last_for_compile(effective_bs),
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
@@ -532,12 +701,32 @@ def train_rgan_torch(
         if num_workers > 0:
             kwargs["prefetch_factor"] = prefetch_factor
         return DataLoader(train_ds, **kwargs)
+    
+    def _iter_preloaded_batches(bs: int):
+        effective_bs = _effective_batch_size(bs)
+        drop_last = _drop_last_for_compile(effective_bs)
+        order = torch.randperm(len(Xtr), device=device)
+        if drop_last:
+            usable = (len(order) // effective_bs) * effective_bs
+            order = order[:usable]
+        for start in range(0, len(order), effective_bs):
+            idx = order[start:start + effective_bs]
+            if idx.numel() == 0:
+                continue
+            if drop_last and idx.numel() < effective_bs:
+                break
+            yield (
+                preloaded_splits["Xtr"].index_select(0, idx),
+                preloaded_splits["Ytr"].index_select(0, idx),
+            )
 
-    train_loader = make_loader(current_batch_size)
+    current_batch_size = _effective_batch_size(current_batch_size)
+    train_loader = make_loader(current_batch_size) if train_ds is not None else None
 
     with epoch_progress(config.epochs, description="R-GAN (Torch)") as (progress, task_id):
         if start_epoch > 1 and progress is not None:
             progress.update(task_id, completed=start_epoch - 1)
+        critic_step = 0
         for epoch in range(start_epoch, config.epochs + 1):
             supervised_only = epoch <= warmup_epochs
             lambda_reg = lambda_reg_end
@@ -549,6 +738,7 @@ def train_rgan_torch(
             epoch_G_losses: List[float] = []
             epoch_adv: List[float] = []
             epoch_reg: List[float] = []
+            epoch_div: List[float] = []
             epoch_grad_G: List[float] = []
             epoch_grad_D: List[float] = []
             epoch_D_real: List[float] = []
@@ -558,20 +748,28 @@ def train_rgan_torch(
 
             G.train()
             D.train()
+            if G_train is not G:
+                G_train.train()
+            if D_train is not D:
+                D_train.train()
 
             while True:
                 try:
-                    for Xb, Yb in train_loader:
-                        Xb = Xb.to(device, non_blocking=True)
-                        Yb = Yb.to(device, non_blocking=True)
+                    batch_iter = _iter_preloaded_batches(current_batch_size) if preloaded_splits is not None else train_loader
+                    for Xb, Yb in batch_iter:
+                        if preloaded_splits is None:
+                            Xb = Xb.to(device, non_blocking=True)
+                            Yb = Yb.to(device, non_blocking=True)
                         target_series = Xb[..., :1]
 
                         if not supervised_only:
                             for _ in range(d_steps):
+                                critic_step += 1
                                 optD.zero_grad(set_to_none=True)
                                 with torch.no_grad():
                                     with AMP.autocast(device.type, enabled=amp_enabled):
-                                        Y_fake_detached = G(Xb)
+                                        z_d = torch.randn(Xb.size(0), Xb.size(1), noise_dim, device=device) if noise_dim > 0 else None
+                                        Y_fake_detached = G_train(Xb, z_d)
                                 if Y_fake_detached.dtype != target_series.dtype:
                                     Y_fake_detached = Y_fake_detached.to(dtype=target_series.dtype)
 
@@ -582,14 +780,23 @@ def train_rgan_torch(
                                         real_pairs = _apply_instance_noise(real_pairs, noise_std_epoch)
                                         fake_pairs = _apply_instance_noise(fake_pairs, noise_std_epoch)
 
-                                    D_real = D(real_pairs)
-                                    D_fake = D(fake_pairs)
+                                    D_real = D_train(real_pairs)
+                                    D_fake = D_train(fake_pairs)
 
                                 if gan_variant in {"wgan", "wgan-gp"}:
                                     D_loss_main = -(D_real.mean() - D_fake.mean())
                                     if gan_variant == "wgan-gp":
-                                        gp = _gradient_penalty(D, real_pairs, fake_pairs, device, gp_lambda)
-                                        D_loss = D_loss_main + gp
+                                        if _should_apply_critic_regularizer(critic_step, critic_reg_interval):
+                                            gp = _gradient_penalty(
+                                                D_train,
+                                                real_pairs,
+                                                fake_pairs,
+                                                device,
+                                                gp_lambda,
+                                            )
+                                            D_loss = D_loss_main + (gp * critic_reg_interval)
+                                        else:
+                                            D_loss = D_loss_main
                                     else:
                                         D_loss = D_loss_main
                                 else:
@@ -637,7 +844,8 @@ def train_rgan_torch(
                         for _ in range(g_steps):
                             optG.zero_grad(set_to_none=True)
                             with AMP.autocast(device.type, enabled=amp_enabled):
-                                Y_fake = G(Xb)
+                                z_g = torch.randn(Xb.size(0), Xb.size(1), noise_dim, device=device) if noise_dim > 0 else None
+                                Y_fake = G_train(Xb, z_g)
                                 cat_target = target_series
                                 if cat_target.dtype != Y_fake.dtype:
                                     cat_target = cat_target.to(dtype=Y_fake.dtype)
@@ -648,9 +856,9 @@ def train_rgan_torch(
                                 if supervised_only:
                                     adv_loss = torch.tensor(0.0, device=device)
                                 elif gan_variant in {"wgan", "wgan-gp"}:
-                                    adv_loss = -D(fake_pairs).mean()
+                                    adv_loss = -D_train(fake_pairs).mean()
                                 else:
-                                    logits = D(fake_pairs)
+                                    logits = D_train(fake_pairs)
                                     labels = torch.ones_like(logits)
                                     if use_logits:
                                         adv_inputs = logits
@@ -664,7 +872,17 @@ def train_rgan_torch(
                                 if target_for_reg.dtype != Y_fake.dtype:
                                     target_for_reg = target_for_reg.to(dtype=Y_fake.dtype)
                                 reg_loss = mse(Y_fake, target_for_reg)
-                                total_loss = adv_weight * adv_loss + lambda_reg * reg_loss
+
+                                # Diversity loss (MSGAN-style): penalize same output for different z
+                                div_loss = torch.tensor(0.0, device=device)
+                                if noise_dim > 0 and lambda_diversity > 0 and not supervised_only:
+                                    z_g2 = torch.randn_like(z_g)
+                                    Y_fake2 = G_train(Xb, z_g2)
+                                    z_dist = (z_g - z_g2).flatten(1).norm(dim=1, keepdim=True) + 1e-8
+                                    y_dist = (Y_fake - Y_fake2).flatten(1).norm(dim=1, keepdim=True)
+                                    div_loss = -(y_dist / z_dist).mean()
+
+                                total_loss = adv_weight * adv_loss + lambda_reg * reg_loss + lambda_diversity * div_loss
 
                             scaler_G.scale(total_loss).backward()
                             scaler_G.unscale_(optG)
@@ -679,6 +897,7 @@ def train_rgan_torch(
                             epoch_G_losses.append(total_loss.detach().item())
                             epoch_adv.append(adv_loss.detach().item())
                             epoch_reg.append(reg_loss.detach().item())
+                            epoch_div.append(div_loss.detach().item())
 
                             if use_ema and ema_shadow is not None:
                                 _update_ema(ema_shadow, G, ema_decay)
@@ -695,9 +914,10 @@ def train_rgan_torch(
                     if current_batch_size == 1:
                         log_error("Batch size already 1, cannot reduce further. Raising OOM.")
                         raise
-                    current_batch_size = max(1, current_batch_size // 2)
+                    current_batch_size = _effective_batch_size(max(1, current_batch_size // 2))
                     log_warn(f"Reducing batch size to {current_batch_size} and retrying epoch {epoch}")
-                    train_loader = make_loader(current_batch_size)
+                    if train_ds is not None:
+                        train_loader = make_loader(current_batch_size)
                     continue
 
             hist["batch_size"].append(current_batch_size)
@@ -707,6 +927,7 @@ def train_rgan_torch(
             hist["G_loss"].append(float(np.mean(epoch_G_losses) if epoch_G_losses else 0.0))
             hist["G_adv"].append(float(np.mean(epoch_adv) if epoch_adv else 0.0))
             hist["G_reg"].append(float(np.mean(epoch_reg) if epoch_reg else 0.0))
+            hist["G_div"].append(float(np.mean(epoch_div) if epoch_div else 0.0))
             if track_logits:
                 hist["D_real_mean"].append(float(np.mean(epoch_D_real) if epoch_D_real else 0.0))
                 hist["D_fake_mean"].append(float(np.mean(epoch_D_fake) if epoch_D_fake else 0.0))
@@ -718,12 +939,14 @@ def train_rgan_torch(
             if is_eval_epoch:
                 # Only evaluate on val set during training for speed;
                 # train/test metrics are computed at the end.
+                eval_Xval = preloaded_splits["Xval"] if preloaded_splits is not None else Xval
+                eval_Yval = preloaded_splits["Yval"] if preloaded_splits is not None else Yval
                 if use_ema and ema_shadow is not None:
                     backup = _swap_params_with_shadow(G, ema_shadow)
-                    va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
+                    va_stats, _ = compute_metrics(G, eval_Xval, eval_Yval, batch_size=eval_bs)
                     _swap_params_with_shadow(G, backup)
                 else:
-                    va_stats, _ = compute_metrics(G, Xval, Yval, batch_size=eval_bs)
+                    va_stats, _ = compute_metrics(G, eval_Xval, eval_Yval, batch_size=eval_bs)
 
                 hist["epoch"].append(epoch)
                 hist["val_rmse"].append(va_stats["rmse"])
@@ -797,12 +1020,16 @@ def train_rgan_torch(
         G_ema = None
 
     eval_bs = max(1, min(config.eval_batch_size, current_batch_size))
-    eval_model = G_ema or G
+    eval_model = _select_eval_generator(G, G_ema)
+    eval_Xtr = preloaded_splits["Xtr"] if preloaded_splits is not None else Xtr
+    eval_Ytr = preloaded_splits["Ytr"] if preloaded_splits is not None else Ytr
+    eval_Xte = preloaded_splits["Xte"] if preloaded_splits is not None else Xte
+    eval_Yte = preloaded_splits["Yte"] if preloaded_splits is not None else Yte
     log_step(f"Computing final train metrics (eval_bs={eval_bs}, samples={len(Xtr)})")
-    train_stats, _ = compute_metrics(eval_model, Xtr, Ytr, batch_size=eval_bs)
+    train_stats, train_pred = compute_metrics(eval_model, eval_Xtr, eval_Ytr, batch_size=eval_bs)
     log_step(f"Final train RMSE={train_stats.get('rmse', 'N/A'):.6f}")
     log_step(f"Computing final test metrics (samples={len(Xte)})")
-    test_stats, Y_pred = compute_metrics(eval_model, Xte, Yte, batch_size=eval_bs)
+    test_stats, Y_pred = compute_metrics(eval_model, eval_Xte, eval_Yte, batch_size=eval_bs)
     log_step(f"Final test RMSE={test_stats.get('rmse', 'N/A'):.6f}")
 
     return {
@@ -812,6 +1039,8 @@ def train_rgan_torch(
         "history": hist,
         "train_stats": train_stats,
         "test_stats": test_stats,
+        "pred_train": train_pred,
         "pred_test": Y_pred,
         "lambda_reg_final": lambda_reg,
+        "resumed_from_epoch": resumed_from_epoch,
     }

@@ -47,7 +47,8 @@ def diebold_mariano(actual: np.ndarray, pred_a: np.ndarray, pred_b: np.ndarray, 
     var_diff = max(var_diff, 1e-12)
     stat = mean_diff / math.sqrt(var_diff / n)
     cdf = 0.5 * (1.0 + math.erf(stat / math.sqrt(2.0)))
-    pvalue = 2 * (1 - cdf)
+    pvalue = 2.0 * min(cdf, 1.0 - cdf)
+    assert 0.0 <= pvalue <= 1.0, f"DM p-value out of range: {pvalue}"
     return {"stat": float(stat), "pvalue": float(pvalue)}
 
 def summarise_with_uncertainty(

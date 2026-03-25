@@ -7,9 +7,9 @@ compared with published numbers from papers like PatchTST, iTransformer,
 DLinear, etc.
 
 Usage:
-    python run_tslib_benchmark.py                       # all 4 datasets, all horizons
-    python run_tslib_benchmark.py --datasets ETTh1      # single dataset quick test
-    python run_tslib_benchmark.py --skip_classical      # skip slow ARIMA / Tree
+    rgan-benchmark                                     # all datasets, all horizons
+    rgan-benchmark --datasets ETTh1                    # single dataset quick test
+    rgan-benchmark --skip_classical                    # skip slow ARIMA / Tree
 """
 
 from __future__ import annotations
@@ -60,10 +60,33 @@ def _split_windows(X, Y, val_frac=0.1):
 
 def _device_str(gpu_id: int) -> str:
     if torch.cuda.is_available():
+        if gpu_id < 0:
+            raise ValueError("--gpu_id must be non-negative.")
+        if gpu_id >= torch.cuda.device_count():
+            print(
+                f"WARNING: --gpu_id {gpu_id} requested but only "
+                f"{torch.cuda.device_count()} devices available. Falling back to CPU."
+            )
+            return "cpu"
         return f"cuda:{gpu_id}"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _set_seed(seed: int, deterministic: bool = False) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
 
 # ── single benchmark run ───────────────────────────────────────────
@@ -287,10 +310,10 @@ def main():
     parser.add_argument("--results_dir", type=str, default=str(Path(_PROJECT_ROOT) / "results" / "tslib_benchmark"))
     parser.add_argument("--data_dir", type=str, default=str(Path(_PROJECT_ROOT) / "data" / "tslib"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic CUDA algorithms for reproducible runs.")
     args = parser.parse_args()
 
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    _set_seed(args.seed, deterministic=args.deterministic)
 
     datasets = [d.strip() for d in args.datasets.split(",")]
     pred_lens = [int(p.strip()) for p in args.pred_lens.split(",")]
@@ -299,6 +322,7 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     all_results: List[dict] = []
+    failures: List[dict] = []
 
     for ds in datasets:
         for pl in pred_lens:
@@ -311,10 +335,15 @@ def main():
                 })
             except Exception as e:
                 print(f"\n  SKIPPED {ds} pred_len={pl}: {e}")
+                failures.append({
+                    "dataset": ds,
+                    "pred_len": pl,
+                    "error": str(e),
+                })
 
     if not all_results:
         print("\nNo results collected.")
-        return
+        sys.exit(1)
 
     # ── save consolidated tables ────────────────────────────────────
     import pandas as pd
@@ -344,7 +373,9 @@ def main():
         "pred_lens": pred_lens,
         "epochs": args.epochs,
         "seed": args.seed,
+        "deterministic": args.deterministic,
         "results": all_results,
+        "failures": failures,
     }
     with open(results_dir / "benchmark_meta.json", "w") as f:
         json.dump(meta, f, indent=2)

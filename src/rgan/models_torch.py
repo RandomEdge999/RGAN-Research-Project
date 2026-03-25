@@ -118,22 +118,27 @@ class Generator(nn.Module):
         dropout: float,
         dense_activation: Optional[str] = None,
         layer_norm: bool = False,
+        noise_dim: int = 0,
     ):
         """Initializes the Generator.
 
         Args:
             L: Input sequence length (not directly used by architecture but kept for config consistency).
             H: Output horizon (size of the output vector).
-            n_in: Number of input features (noise dimension + covariates).
+            n_in: Number of input features (real data features).
             units: Hidden units in LSTM.
             num_layers: Number of LSTM layers.
             dropout: Dropout probability.
             dense_activation: Activation for the final dense layer.
             layer_norm: Whether to use LayerNorm in the LSTM stack.
+            noise_dim: Dimension of latent noise vector z concatenated with input
+                       at each timestep (RCGAN-style). 0 disables noise input.
         """
         super().__init__()
+        self.noise_dim = noise_dim
+        self.n_in = n_in
         self.stack = LSTMStack(
-            input_size=n_in,
+            input_size=n_in + noise_dim,
             units=units,
             num_layers=num_layers,
             dropout=dropout,
@@ -148,15 +153,28 @@ class Generator(nn.Module):
         nn.init.xavier_uniform_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Generates a sequence from input noise.
+    def forward(self, x: torch.Tensor, z: torch.Tensor = None) -> torch.Tensor:
+        """Generates a forecast from input sequence and optional latent noise.
 
         Args:
-            x: Input noise tensor of shape (batch, seq_len, n_in).
+            x: Input time-series tensor of shape (batch, seq_len, n_in).
+            z: Optional latent noise tensor of shape (batch, seq_len, noise_dim).
+               When noise_dim > 0 and z is None, zeros are used (deterministic mode
+               for evaluation/metrics).
 
         Returns:
             Generated sequence tensor of shape (batch, H, 1).
         """
+        if self.noise_dim > 0:
+            if z is not None:
+                x = torch.cat([x, z], dim=-1)
+            else:
+                # Deterministic mode: zero noise for consistent eval predictions
+                zeros = torch.zeros(
+                    x.size(0), x.size(1), self.noise_dim,
+                    device=x.device, dtype=x.dtype,
+                )
+                x = torch.cat([x, zeros], dim=-1)
         h = self.stack(x)
         y = self.fc(h)
         y = self.out_activation(y)
@@ -238,6 +256,146 @@ class Discriminator(nn.Module):
         return self.out_activation(p)
 
 
+class _Chomp1d(nn.Module):
+    """Removes right-side padding introduced by causal convolutions."""
+
+    def __init__(self, chomp_size: int):
+        super().__init__()
+        self.chomp_size = max(0, int(chomp_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.chomp_size == 0:
+            return x
+        return x[..., :-self.chomp_size].contiguous()
+
+
+class ResidualTCNBlock(nn.Module):
+    """A causal residual Conv1d block for sequence critics."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+        layer_norm: bool = False,
+    ):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+        )
+        self.chomp1 = _Chomp1d(padding)
+        self.norm1 = nn.GroupNorm(1, out_channels) if layer_norm else nn.Identity()
+        self.act1 = nn.ReLU()
+        self.drop1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+        )
+        self.chomp2 = _Chomp1d(padding)
+        self.norm2 = nn.GroupNorm(1, out_channels) if layer_norm else nn.Identity()
+        self.act2 = nn.ReLU()
+        self.drop2 = nn.Dropout(dropout)
+
+        self.residual = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        )
+        self.out_act = nn.ReLU()
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in (self.conv1, self.conv2):
+            nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        if isinstance(self.residual, nn.Conv1d):
+            nn.init.xavier_uniform_(self.residual.weight)
+            if self.residual.bias is not None:
+                nn.init.zeros_(self.residual.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.residual(x)
+
+        out = self.conv1(x)
+        out = self.chomp1(out)
+        out = self.norm1(out)
+        out = self.act1(out)
+        out = self.drop1(out)
+
+        out = self.conv2(out)
+        out = self.chomp2(out)
+        out = self.norm2(out)
+        out = self.act2(out)
+        out = self.drop2(out)
+        return self.out_act(out + residual)
+
+
+class TCNDiscriminator(nn.Module):
+    """A causal residual TCN critic for WGAN-style sequence discrimination."""
+
+    def __init__(
+        self,
+        L_plus_H: int,
+        units: int,
+        num_layers: int,
+        dropout: float,
+        activation: Optional[str] = None,
+        layer_norm: bool = False,
+        use_spectral_norm: bool = False,
+    ):
+        super().__init__()
+        del L_plus_H  # Sequence length is handled dynamically by Conv1d blocks.
+        kernel_size = 3
+        blocks = []
+        in_channels = 1
+        for block_idx in range(max(1, num_layers)):
+            dilation = 2 ** block_idx
+            blocks.append(
+                ResidualTCNBlock(
+                    in_channels=in_channels,
+                    out_channels=units,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                    layer_norm=layer_norm,
+                )
+            )
+            in_channels = units
+        self.stack = nn.Sequential(*blocks)
+        self.out = nn.Linear(units, 1)
+        if use_spectral_norm:
+            self.out = nn.utils.spectral_norm(self.out)
+        self.out_activation = _get_activation(activation or "sigmoid")
+        self._init_weights()
+
+    def _init_weights(self):
+        if hasattr(self.out, "weight_orig"):
+            nn.init.xavier_uniform_(self.out.weight_orig)
+        elif hasattr(self.out, "weight"):
+            nn.init.xavier_uniform_(self.out.weight)
+        if hasattr(self.out, "bias") and self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
+
+    def forward(self, x_concat: torch.Tensor) -> torch.Tensor:
+        x = x_concat.transpose(1, 2)
+        h = self.stack(x)
+        last_timestep = h[:, :, -1]
+        p = self.out(last_timestep)
+        return self.out_activation(p)
+
+
 def build_generator(
     L: int,
     H: int,
@@ -247,6 +405,7 @@ def build_generator(
     num_layers: int = 1,
     dense_activation: Optional[str] = None,
     layer_norm: bool = False,
+    noise_dim: int = 0,
     **kwargs,
 ) -> Generator:
     """Factory function to build a Generator instance.
@@ -260,6 +419,7 @@ def build_generator(
         num_layers: Number of layers.
         dense_activation: Output activation.
         layer_norm: Use layer normalization.
+        noise_dim: Latent noise dimension (0 = deterministic, >0 = stochastic).
         **kwargs: Ignored extra arguments.
 
     Returns:
@@ -274,6 +434,7 @@ def build_generator(
         dropout,
         dense_activation=dense_activation,
         layer_norm=layer_norm,
+        noise_dim=noise_dim,
     )
 
 
@@ -286,6 +447,7 @@ def build_discriminator(
     activation: Optional[str] = None,
     layer_norm: bool = False,
     use_spectral_norm: bool = False,
+    critic_arch: str = "tcn",
     **kwargs,
 ) -> Discriminator:
     """Factory function to build a Discriminator instance.
@@ -304,14 +466,26 @@ def build_discriminator(
     Returns:
         An instantiated Discriminator module.
     """
-    return Discriminator(
-        L + H,
-        units,
-        num_layers,
-        dropout,
-        activation=activation,
-        layer_norm=layer_norm,
-        use_spectral_norm=use_spectral_norm,
-    )
-
+    critic_arch = (critic_arch or "tcn").lower()
+    if critic_arch == "lstm":
+        return Discriminator(
+            L + H,
+            units,
+            num_layers,
+            dropout,
+            activation=activation,
+            layer_norm=layer_norm,
+            use_spectral_norm=use_spectral_norm,
+        )
+    if critic_arch == "tcn":
+        return TCNDiscriminator(
+            L + H,
+            units,
+            num_layers,
+            dropout,
+            activation=activation,
+            layer_norm=layer_norm,
+            use_spectral_norm=use_spectral_norm,
+        )
+    raise ValueError(f"Unsupported critic_arch='{critic_arch}'. Expected 'lstm' or 'tcn'.")
 

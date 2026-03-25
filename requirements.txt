@@ -7,3 +7,4 @@ torch>=2.2
 rich>=13.0
 plotly>=5.22
 psutil>=5.9
+datasets>=2.0

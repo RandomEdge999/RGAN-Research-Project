@@ -24,7 +24,7 @@ def load_and_process_m5(data_dir, output_file, aggregate_level='total'):
         print("Data loaded successfully.")
     except FileNotFoundError as e:
         print(f"Error: {e}")
-        return
+        return False
 
     # Create a map from d_1, d_2, ... to date
     d_cols = [c for c in sales.columns if c.startswith('d_')]
@@ -58,11 +58,14 @@ def load_and_process_m5(data_dir, output_file, aggregate_level='total'):
         print(f"Aggregation level '{aggregate_level}' not yet implemented.")
 
 def cli_main():
+    import sys
     parser = argparse.ArgumentParser(description="Process M5 dataset for RGAN.")
     parser.add_argument("--data_dir", type=str, default="data/m5", help="Directory containing M5 data files.")
     parser.add_argument("--output", type=str, default="m5_total.csv", help="Output CSV file.")
     args = parser.parse_args()
-    load_and_process_m5(args.data_dir, args.output)
+    result = load_and_process_m5(args.data_dir, args.output)
+    if result is False:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

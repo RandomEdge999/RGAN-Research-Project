@@ -18,7 +18,7 @@ def get_config() -> dict:
     if not config_path.exists():
         raise FileNotFoundError(
             f"Cloud config not found at {config_path}. "
-            "Copy cloud/config.yaml.example and fill in your settings."
+            "Create cloud/config.yaml with your AWS settings (see README for format)."
         )
     with open(config_path) as f:
         return yaml.safe_load(f)

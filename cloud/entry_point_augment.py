@@ -100,10 +100,11 @@ def main():
     elif gen_std.exists():
         print(f"[entry_point_augment] Found generator: {gen_std}")
     else:
-        print("[entry_point_augment] WARNING: No RGAN generator found in models channel!")
+        print("[entry_point_augment] ERROR: No RGAN generator found in models channel!")
         print(f"  Contents of {models_dir}:")
         for f in sorted(models_dir.rglob("*")):
             print(f"    {f.relative_to(models_dir)}")
+        sys.exit(1)
 
     if metrics_json.exists():
         print(f"[entry_point_augment] Found metrics.json")

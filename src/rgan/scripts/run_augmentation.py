@@ -15,13 +15,19 @@ Can be deleted entirely without affecting the main pipeline.
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
 
-from rgan.data import load_csv_series, interpolate_and_standardize, make_windows_univariate
+from rgan.data import (
+    load_csv_series,
+    interpolate_and_standardize,
+    make_windows_univariate,
+    make_windows_with_covariates,
+)
 from rgan.baselines import arima_forecast, arma_forecast, tree_ensemble_forecast, naive_baseline
 from rgan.lstm_supervised_torch import train_lstm_supervised_torch
 from rgan.config import TrainConfig
@@ -31,6 +37,7 @@ from rgan.patchtst import train_patchtst
 from rgan.itransformer import train_itransformer
 from rgan.timegan import train_timegan
 from rgan.rgan_torch import AMP
+from rgan.scripts.run_training import set_seed
 from rgan.synthetic_analysis import (
     generate_synthetic_sequences,
     frechet_distance,
@@ -41,7 +48,8 @@ from rgan.synthetic_analysis import (
     create_synthetic_quality_table,
     create_data_augmentation_table,
     plot_real_vs_synthetic_sequences,
-    plot_real_vs_synthetic_distributions,
+    plot_real_vs_synthetic_kde,
+    plot_synthetic_quality_heatmap,
     plot_data_augmentation_comparison
 )
 
@@ -52,6 +60,193 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+
+def _resolve_rgan_source(args):
+    """Resolve the RGAN generator source and related metrics path."""
+    rgan_model_path = None
+    run_dir = None
+
+    if args.rgan_model:
+        rgan_model_path = Path(args.rgan_model)
+        if not rgan_model_path.exists():
+            raise FileNotFoundError(f"RGAN model file not found: {rgan_model_path}")
+    elif args.results_from:
+        run_dir = Path(args.results_from)
+        models_dir = run_dir / "models"
+        ema_path = models_dir / "rgan_generator_ema.pt"
+        gen_path = models_dir / "rgan_generator.pt"
+        if ema_path.exists():
+            rgan_model_path = ema_path
+        elif gen_path.exists():
+            rgan_model_path = gen_path
+        else:
+            raise FileNotFoundError(f"No RGAN generator found in {models_dir}")
+    elif args.auto_discover_results:
+        results_root = Path("results")
+        if results_root.exists():
+            for pattern in ("rgan_generator_ema.pt", "rgan_generator.pt"):
+                matches = list(results_root.rglob(pattern))
+                if matches:
+                    rgan_model_path = max(matches, key=lambda p: p.stat().st_mtime)
+                    run_dir = rgan_model_path.parent.parent
+                    break
+
+    if rgan_model_path and run_dir is None:
+        run_dir = rgan_model_path.parent.parent
+
+    if rgan_model_path is None and not args.allow_gaussian_baseline:
+        raise FileNotFoundError(
+            "No RGAN generator source resolved. Provide --results_from or --rgan_model, "
+            "or pass --allow_gaussian_baseline for an explicit non-RGAN baseline run."
+        )
+
+    rgan_config_path = run_dir / "metrics.json" if run_dir is not None else None
+    return rgan_model_path, rgan_config_path, run_dir
+
+
+def _load_source_run_args(run_dir):
+    """Load saved training CLI args from a prior run directory when available."""
+    if run_dir is None:
+        return {}
+
+    run_config_path = Path(run_dir) / "run_config.json"
+    if not run_config_path.exists():
+        return {}
+
+    with open(run_config_path, encoding="utf-8") as f:
+        run_config = json.load(f)
+    run_args = run_config.get("args", {})
+    return run_args if isinstance(run_args, dict) else {}
+
+
+def _resolve_augmentation_data_config(args, run_dir):
+    """Resolve data-loading settings, replaying the source training config when available."""
+    config = {
+        "target_col": args.target_col,
+        "time_col": args.time_col,
+        "resample": getattr(args, "resample", ""),
+        "agg": getattr(args, "agg", "last"),
+        "train_split": args.train_split,
+    }
+
+    if run_dir is None:
+        return config
+
+    run_args = _load_source_run_args(run_dir)
+    if not run_args:
+        return config
+
+    return {
+        "target_col": run_args.get("target", config["target_col"]),
+        "time_col": run_args.get("time_col", config["time_col"]),
+        "resample": run_args.get("resample", config["resample"]),
+        "agg": run_args.get("agg", config["agg"]),
+        "train_split": float(run_args.get("train_ratio", config["train_split"])),
+    }
+
+
+def _resolve_augmentation_seed(args, run_dir):
+    """Resolve augmentation seed with explicit CLI override, replay fallback, then default."""
+    explicit_seed = getattr(args, "seed", None)
+    if explicit_seed is not None:
+        return int(explicit_seed)
+
+    run_args = _load_source_run_args(run_dir)
+    replay_seed = run_args.get("seed")
+    if replay_seed is not None:
+        return int(replay_seed)
+
+    return 42
+
+
+def _sample_timegan_indices(n_train, max_samples, seed):
+    """Deterministically sample TimeGAN training windows without replacement."""
+    rng = np.random.default_rng(int(seed))
+    sample_size = min(int(n_train), int(max_samples))
+    return rng.choice(int(n_train), sample_size, replace=False)
+
+
+def _shuffle_mixed_indices(n_mixed, seed):
+    """Deterministically shuffle augmentation windows."""
+    rng = np.random.default_rng(int(seed))
+    return rng.permutation(int(n_mixed))
+
+
+def _make_augmentation_windows(prep, target_col, L, H):
+    """Build forecast windows using the same covariate logic as training."""
+    if prep["covariates"]:
+        return make_windows_with_covariates(
+            prep["scaled_train"], target_col, prep["covariates"], L, H
+        ), make_windows_with_covariates(
+            prep["scaled_test"], target_col, prep["covariates"], L, H
+        )
+    return (
+        make_windows_univariate(prep["scaled_train"], target_col, L, H),
+        make_windows_univariate(prep["scaled_test"], target_col, L, H),
+    )
+
+
+def _infer_generator_replay_config(saved_metrics, state_dict, n_in_current, model_label="RGAN"):
+    """Infer generator reconstruction settings and verify the prepared data width matches."""
+    metrics_key = model_label.lower().replace("-", "_").replace(" ", "_")
+    cfg = (saved_metrics or {}).get(metrics_key, {}).get("config", {})
+    if not cfg:
+        cfg = (saved_metrics or {}).get("rgan", {}).get("config", {})
+
+    lstm_weight = None
+    for key, tensor in state_dict.items():
+        if key.endswith("lstm.weight_ih_l0"):
+            lstm_weight = tensor
+            break
+    if lstm_weight is None:
+        raise ValueError(f"{model_label} checkpoint is missing the generator LSTM input weights.")
+
+    input_size = int(lstm_weight.shape[1])
+    inferred_units = int(lstm_weight.shape[0] // 4)
+    inferred_layers = max(1, len([k for k in state_dict if "lstm.weight_ih_l" in k]))
+
+    noise_dim = cfg.get("noise_dim")
+    n_in_saved = cfg.get("n_in")
+    if noise_dim is None:
+        if n_in_saved is not None:
+            noise_dim = input_size - int(n_in_saved)
+        elif input_size == int(n_in_current):
+            noise_dim = 0
+        else:
+            raise ValueError(
+                f"Cannot safely reconstruct {model_label} input width: checkpoint input_size={input_size}, "
+                f"prepared data features={n_in_current}, and saved metrics are missing noise_dim/n_in."
+            )
+    noise_dim = int(noise_dim)
+    if noise_dim < 0:
+        raise ValueError(f"{model_label} replay inferred an invalid noise_dim={noise_dim}.")
+
+    n_in_expected = int(n_in_saved) if n_in_saved is not None else input_size - noise_dim
+    if n_in_expected <= 0:
+        raise ValueError(f"{model_label} replay inferred an invalid n_in={n_in_expected}.")
+    if input_size != n_in_expected + noise_dim:
+        raise ValueError(
+            f"{model_label} checkpoint/input config mismatch: input_size={input_size}, "
+            f"n_in={n_in_expected}, noise_dim={noise_dim}."
+        )
+    if n_in_expected != int(n_in_current):
+        raise ValueError(
+            f"{model_label} expects {n_in_expected} input features, but augmentation prepared {n_in_current}. "
+            "Replay the original training preprocessing or use matching data."
+        )
+
+    dense_activation = cfg.get("g_dense_activation", cfg.get("g_dense"))
+    if dense_activation in {"", None, "linear"}:
+        dense_activation = None
+
+    return {
+        "n_in": n_in_expected,
+        "units": int(cfg.get("units_g", inferred_units)),
+        "num_layers": int(cfg.get("g_layers", inferred_layers)),
+        "noise_dim": noise_dim,
+        "dense_activation": dense_activation,
+    }
 
 
 def get_trend_labels(X, Y):
@@ -66,16 +261,16 @@ def get_trend_labels(X, Y):
     return (future_mean > last_obs).astype(int)
 
 
-def train_evaluate_classifiers(X_train, y_train, X_test, y_test):
+def train_evaluate_classifiers(X_train, y_train, X_test, y_test, seed=42):
     """Train RF, SVM, MLP on flattened time series and return metrics."""
     # Flatten timeseries for standard classifiers
     X_train_flat = X_train.reshape(X_train.shape[0], -1)
     X_test_flat = X_test.reshape(X_test.shape[0], -1)
 
     classifiers = {
-        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
-        'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=42)),
-        'MLP': make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42))
+        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=seed),
+        'SVM (RBF)': make_pipeline(StandardScaler(), SVC(kernel='rbf', gamma='scale', random_state=seed)),
+        'MLP': make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=seed))
     }
 
     results = {}
@@ -120,83 +315,66 @@ def main(args):
     # ========================================================================
     print("\n[STEP 1] Resolving training configuration...")
 
-    # Resolve the training run directory and model path
-    rgan_model_path = None
-    rgan_config_path = None
-    run_dir = None  # the training results directory (contains metrics.json)
+    try:
+        rgan_model_path, rgan_config_path, run_dir = _resolve_rgan_source(args)
+    except FileNotFoundError as exc:
+        print(f"  ERROR: {exc}")
+        sys.exit(1)
 
-    if args.rgan_model:
-        rgan_model_path = Path(args.rgan_model)
-    elif args.results_from:
-        run_dir = Path(args.results_from)
-        ema_path = run_dir / 'models' / 'rgan_generator_ema.pt'
-        gen_path = run_dir / 'models' / 'rgan_generator.pt'
-        if ema_path.exists():
-            rgan_model_path = ema_path
-            print(f"  Using EMA generator (better quality): {ema_path.name}")
-        elif gen_path.exists():
-            rgan_model_path = gen_path
-        else:
-            print(f"  ERROR: No RGAN generator found in {run_dir / 'models'}")
-    else:
-        results_root = Path('results')
-        if results_root.exists():
-            for pattern in ['rgan_generator_ema.pt', 'rgan_generator.pt']:
-                matches = list(results_root.rglob(pattern))
-                if matches:
-                    rgan_model_path = max(matches, key=lambda p: p.stat().st_mtime)
-                    if 'ema' in pattern:
-                        print(f"  Auto-found EMA generator: {rgan_model_path}")
-                    break
+    if rgan_model_path is not None and rgan_model_path.name == "rgan_generator_ema.pt":
+        print(f"  Using EMA generator (better quality): {rgan_model_path.name}")
+    elif rgan_model_path is not None and args.auto_discover_results:
+        print(f"  Auto-discovered generator: {rgan_model_path}")
 
-    # Locate metrics.json
-    if rgan_model_path and rgan_model_path.exists():
-        if run_dir is None:
-            run_dir = rgan_model_path.parent.parent
-        rgan_config_path = run_dir / 'metrics.json'
-
-    # Read L/H and architecture from metrics.json BEFORE creating windows
-    g_units = 128
-    g_layers = 2
+    # Read L/H from metrics.json BEFORE creating windows
     g_layer_norm = True
-    config_loaded = False
     saved_metrics = None
 
     if rgan_config_path and rgan_config_path.exists():
-        with open(rgan_config_path) as f:
+        with open(rgan_config_path, encoding="utf-8") as f:
             saved_metrics = json.load(f)
 
         # Override L/H to match training (cast to int for safe comparison)
         trained_L = int(saved_metrics["L"]) if saved_metrics.get("L") is not None else None
         trained_H = int(saved_metrics["H"]) if saved_metrics.get("H") is not None else None
-        if trained_L and args.L != trained_L:
+        if trained_L is not None and args.L != trained_L:
             print(f"  WARNING: Training used L={trained_L} but augmentation has L={args.L}")
             print(f"           Overriding L to {trained_L} to match trained model")
             args.L = trained_L
-        if trained_H and args.H != trained_H:
+        if trained_H is not None and args.H != trained_H:
             print(f"  WARNING: Training used H={trained_H} but augmentation has H={args.H}")
             print(f"           Overriding H to {trained_H} to match trained model")
             args.H = trained_H
 
-        # Read architecture params
-        cfg = saved_metrics.get("rgan", {}).get("config", {})
-        if cfg:
-            g_units = cfg.get("units_g", g_units)
-            g_layers = cfg.get("g_layers", g_layers)
-            config_loaded = True
-            print(f"  Architecture from metrics.json: units={g_units}, layers={g_layers}")
-
     print(f"  Using L={args.L}, H={args.H}")
+    data_cfg = _resolve_augmentation_data_config(args, run_dir)
+    resolved_seed = _resolve_augmentation_seed(args, run_dir)
+    deterministic = bool(getattr(args, "deterministic", False))
+    set_seed(resolved_seed, deterministic=deterministic)
+    if run_dir is not None:
+        print(
+            "  Replaying training preprocessing:"
+            f" target={data_cfg['target_col']}, time_col={data_cfg['time_col']},"
+            f" resample={data_cfg['resample'] or '(none)'}, agg={data_cfg['agg']},"
+            f" train_split={data_cfg['train_split']}"
+        )
+    print(f"  Augmentation seed={resolved_seed}, deterministic={deterministic}")
 
     # ========================================================================
     # STEP 2: Load and prepare data
     # ========================================================================
     t0 = time.time()
     print("\n[STEP 2] Loading and preparing data...")
-    data, target_col, time_col = load_csv_series(args.csv, target=args.target_col, time_col=args.time_col)
+    data, target_col, time_col = load_csv_series(
+        args.csv,
+        target=data_cfg["target_col"],
+        time_col=data_cfg["time_col"],
+        resample=data_cfg["resample"],
+        agg=data_cfg["agg"],
+    )
     print(f"  Loaded {len(data)} time series samples from {args.csv}")
 
-    data_split = interpolate_and_standardize(data, target_col, train_ratio=args.train_split)
+    data_split = interpolate_and_standardize(data, target_col, train_ratio=data_cfg["train_split"])
     data_train = data_split['scaled_train']
     data_test = data_split['scaled_test']
 
@@ -208,8 +386,9 @@ def main(args):
     # ========================================================================
     t0 = time.time()
     print(f"\n[STEP 3] Creating time windows (L={args.L}, H={args.H})...")
-    X_train, Y_train = make_windows_univariate(data_train, target_col, args.L, args.H)
-    X_test, Y_test = make_windows_univariate(data_test, target_col, args.L, args.H)
+    (X_train, Y_train), (X_test, Y_test) = _make_augmentation_windows(
+        data_split, target_col, args.L, args.H
+    )
 
     print(f"  Train windows: {X_train.shape}, Test windows: {X_test.shape}")
     print(f"  Step 3 took {_fmt_elapsed(time.time() - t0)}")
@@ -231,23 +410,30 @@ def main(args):
             if isinstance(rgan_checkpoint, dict) and 'state_dict' in rgan_checkpoint:
                 print(f"  Unwrapping state_dict from checkpoint wrapper")
                 rgan_checkpoint = rgan_checkpoint['state_dict']
-
-            # Fallback: infer architecture from state_dict if metrics.json wasn't available
-            if not config_loaded:
-                print("  WARNING: Could not load config from metrics.json — inferring from state_dict")
-                for key, tensor in rgan_checkpoint.items():
-                    if 'lstm.weight_ih_l0' in key:
-                        g_units = tensor.shape[0] // 4
-                        print(f"  Inferred units={g_units} from state_dict")
-                        break
-                layer_keys = [k for k in rgan_checkpoint if 'lstm.weight_ih_l' in k]
-                if layer_keys:
-                    g_layers = len(layer_keys)
-                    print(f"  Inferred layers={g_layers} from state_dict")
+            replay_cfg = _infer_generator_replay_config(
+                saved_metrics,
+                rgan_checkpoint,
+                n_in_current=X_train.shape[-1],
+                model_label="RGAN",
+            )
+            print(
+                "  Generator replay config:"
+                f" n_in={replay_cfg['n_in']}, units={replay_cfg['units']},"
+                f" layers={replay_cfg['num_layers']}, noise_dim={replay_cfg['noise_dim']},"
+                f" dense={replay_cfg['dense_activation'] or 'linear'}"
+            )
 
             from rgan.models_torch import build_generator
-            G = build_generator(args.L, args.H, n_in=1, units=g_units,
-                                num_layers=g_layers, layer_norm=g_layer_norm)
+            G = build_generator(
+                args.L,
+                args.H,
+                n_in=replay_cfg["n_in"],
+                units=replay_cfg["units"],
+                num_layers=replay_cfg["num_layers"],
+                dense_activation=replay_cfg["dense_activation"],
+                layer_norm=g_layer_norm,
+                noise_dim=replay_cfg["noise_dim"],
+            )
             G.load_state_dict(rgan_checkpoint)
             G.eval()
             has_rgan = True
@@ -256,13 +442,9 @@ def main(args):
         except Exception as e:
             print(f"  ERROR: Could not load RGAN model: {e}")
             import traceback; traceback.print_exc()
-            print("  Falling back to Gaussian perturbation for synthetic data")
+            sys.exit(1)
     else:
-        search_hint = ""
-        if rgan_model_path:
-            search_hint = f" (looked for {rgan_model_path})"
-        print(f"  WARNING: RGAN model not found{search_hint}")
-        print("  Hint: Use --results_from <training_run_dir> or --rgan_model <path_to_generator.pt>")
+        print("  Proceeding without an RGAN model because --allow_gaussian_baseline was set.")
 
     # ========================================================================
     # STEP 5: Generate synthetic data (RGAN + TimeGAN)
@@ -270,25 +452,22 @@ def main(args):
     t0 = time.time()
     print("\n[STEP 5] Generating synthetic data...")
 
-    # --- 4a: RGAN synthetic data (with stochastic diversity) ---
-    rng = np.random.default_rng(42)
+    # --- 4a: RGAN synthetic data (with latent noise for diversity) ---
+    rng = np.random.default_rng(resolved_seed)
+    primary_synthetic_label = "RGAN" if has_rgan else "Gaussian Perturbation"
     if has_rgan and G is not None:
-        print("  Generating RGAN synthetic data (with input perturbation + dropout for diversity)...")
+        noise_dim = getattr(G, 'noise_dim', 0)
+        print(f"  Generating RGAN synthetic data (noise_dim={noise_dim})...")
         n_synth = len(X_train)
-        n_runs = 10  # Multiple forward passes for diversity
+        n_runs = 10  # Multiple forward passes with different z for diversity
 
-        # Move generator to GPU if available
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         G.to(device)
-        G.train()  # Enable dropout for stochastic generation
+        G.eval()  # Always use eval mode for generation
 
-        # Scale input noise to data magnitude (0.02 fixed was negligible)
-        x_std = float(np.std(X_train))
-
-        # Process each run in GPU-friendly chunks to avoid OOM
-        # Keep X on CPU, stream chunks to GPU
         X_np = X_train  # (N, L, 1) numpy
-        chunk_size = 2048  # Safe for A10G 24GB with LSTM hidden states
+        L_seq = X_np.shape[1]
+        chunk_size = 2048
         Y_rgan_runs = []
 
         with torch.no_grad(), AMP.autocast(device.type, enabled=(device.type == 'cuda')):
@@ -297,30 +476,31 @@ def main(args):
                 for start in range(0, n_synth, chunk_size):
                     end = min(start + chunk_size, n_synth)
                     xb = torch.from_numpy(X_np[start:end]).float().to(device)
-                    noise = torch.randn_like(xb) * (0.15 * x_std)
-                    parts.append(G(xb + noise).cpu().numpy())
+                    if noise_dim > 0:
+                        z = torch.randn(xb.size(0), L_seq, noise_dim, device=device)
+                    else:
+                        z = None
+                    parts.append(G(xb, z).cpu().numpy())
                 Y_rgan_runs.append(np.concatenate(parts, axis=0))
 
-        G.eval()
-        G.cpu()  # Free GPU memory for later training
-        torch.cuda.empty_cache()
+        G.cpu()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-        # Pick one run per sample (round-robin) for maximum diversity — vectorized
+        # Pick one run per sample (round-robin) for maximum diversity
         Y_synthetic = np.empty_like(Y_rgan_runs[0])
         run_indices = np.arange(n_synth) % n_runs
         for r in range(n_runs):
             mask = run_indices == r
             Y_synthetic[mask] = Y_rgan_runs[r][mask]
 
-        # Verify scale consistency: synthetic should have similar stats to real
+        # Verify scale consistency
         real_mean, real_std = Y_train.mean(), Y_train.std()
         syn_mean, syn_std = Y_synthetic.mean(), Y_synthetic.std()
         print(f"  Scale check — Real: mean={real_mean:.4f} std={real_std:.4f}")
         print(f"  Scale check — Syn:  mean={syn_mean:.4f} std={syn_std:.4f}")
 
-        # If scale is way off, re-normalize synthetic to match real distribution
         if syn_std < 0.01 * real_std:
-            # Degenerate case: near-zero variance — dividing by syn_std would amplify to infinity
             print("  WARNING: Near-zero synthetic variance — falling back to perturbed real data")
             Y_synthetic = Y_train + rng.normal(0, 0.15 * real_std, size=Y_train.shape).astype(Y_train.dtype)
         elif abs(syn_mean - real_mean) > 2 * real_std or syn_std > 3 * real_std or syn_std < 0.3 * real_std:
@@ -329,8 +509,7 @@ def main(args):
 
         print(f"  Generated {len(Y_synthetic)} RGAN synthetic sequences")
     else:
-        # No RGAN: use Gaussian perturbation as baseline
-        print("  No RGAN model — using Gaussian perturbation as synthetic baseline")
+        print("  Using Gaussian perturbation as the explicit synthetic baseline")
         Y_synthetic = Y_train + rng.normal(0, 0.15 * Y_train.std(), size=Y_train.shape).astype(Y_train.dtype)
         print(f"  Generated {len(Y_synthetic)} perturbed sequences")
 
@@ -348,7 +527,7 @@ def main(args):
             # 10K samples is sufficient to learn the distribution
             n_train = len(X_train)
             tgan_max_samples = min(n_train, 10000)
-            tgan_idx = np.random.RandomState(42).choice(n_train, tgan_max_samples, replace=False)
+            tgan_idx = _sample_timegan_indices(n_train, tgan_max_samples, seed=resolved_seed)
             X_train_tgan = X_train[tgan_idx]
             tgan_epochs = args.timegan_epochs
             tgan_batch = min(256, tgan_max_samples)
@@ -360,13 +539,20 @@ def main(args):
                 epochs_ae=tgan_epochs, epochs_sup=tgan_epochs, epochs_joint=tgan_epochs,
                 batch_size=tgan_batch,
                 lr=1e-3, device='auto',
+                seed=resolved_seed,
             )
             X_timegan = timegan_result["synthetic_data"].astype(np.float32)
             if has_rgan and G is not None:
                 G.eval()
+                tg_device = next(G.parameters()).device
                 with torch.no_grad():
-                    tg_device = next(G.parameters()).device
-                    Y_timegan = G(torch.from_numpy(X_timegan).float().to(tg_device)).cpu().numpy()
+                    X_tg = torch.from_numpy(X_timegan).float().to(tg_device)
+                    tg_noise_dim = getattr(G, 'noise_dim', 0)
+                    if tg_noise_dim > 0:
+                        z_tg = torch.randn(X_tg.size(0), X_tg.size(1), tg_noise_dim, device=tg_device)
+                    else:
+                        z_tg = None
+                    Y_timegan = G(X_tg, z_tg).cpu().numpy()
             else:
                 Y_timegan = None
             has_timegan = True
@@ -381,12 +567,25 @@ def main(args):
     print(f"  Step 5 took {_fmt_elapsed(time.time() - t0)}")
 
     # ========================================================================
-    # STEP 6: Create mixed dataset
+    # STEP 6: Create mixed dataset (with quality gate)
     # ========================================================================
     print("\n[STEP 6] Creating mixed real + synthetic dataset...")
 
-    X_mixed = np.concatenate([X_train, X_train], axis=0)
-    Y_mixed = np.concatenate([Y_train, Y_synthetic], axis=0)
+    # Quality gate: only mix if synthetic data is plausible
+    from rgan.synthetic_analysis import frechet_distance, variance_difference
+    gate_fd = frechet_distance(Y_train, Y_synthetic)
+    gate_vd = variance_difference(Y_train.ravel(), Y_synthetic.ravel())
+    gate_var_ratio = abs(gate_vd.get("rel_diff", -100.0))
+    print(f"  Quality gate — FD={gate_fd:.2f}, Var diff={gate_vd.get('rel_diff', -100):.1f}%")
+
+    syn_quality_ok = gate_fd < 10.0 and gate_var_ratio < 80.0
+    if not syn_quality_ok:
+        print(f"  WARNING: Synthetic data failed quality gate — using real-only for downstream training")
+        X_mixed = X_train.copy()
+        Y_mixed = Y_train.copy()
+    else:
+        X_mixed = np.concatenate([X_train, X_train], axis=0)
+        Y_mixed = np.concatenate([Y_train, Y_synthetic], axis=0)
 
     print(f"  Mixed dataset: X shape {X_mixed.shape}, Y shape {Y_mixed.shape}")
 
@@ -460,7 +659,7 @@ def main(args):
     # Mixed training: real train + synthetic train, but validate on real-only
     # Shuffle to prevent the model from seeing all real then all synthetic
     n_mixed = len(X_mixed)
-    shuffle_idx = np.random.RandomState(42).permutation(n_mixed)
+    shuffle_idx = _shuffle_mixed_indices(n_mixed, seed=resolved_seed)
     X_mixed_shuffled = X_mixed[shuffle_idx]
     Y_mixed_shuffled = Y_mixed[shuffle_idx]
     # Use same real-only validation split for fair early stopping comparison
@@ -534,7 +733,7 @@ def main(args):
         var_diff = variance_difference(Y_real, Y_syn)
         print(f"    Var Diff (rel): {var_diff['rel_diff']:.2f}%")
         print(f"  [{name}] Discrimination Score (RF/SVM/MLP)...")
-        disc = evaluate_discriminators(Y_real, Y_syn, n_folds=3)
+        disc = evaluate_discriminators(Y_real, Y_syn, n_folds=3, seed=resolved_seed)
         for m, s in disc.items():
             print(f"    {m} Accuracy: {s['accuracy']:.4f}")
         return {
@@ -545,8 +744,8 @@ def main(args):
         }
 
     synthetic_quality = {}
-    synthetic_quality['RGAN'] = _compute_quality("RGAN", Y_train, Y_synthetic)
-    disc_scores = synthetic_quality['RGAN']['all_discrimination']
+    synthetic_quality[primary_synthetic_label] = _compute_quality(primary_synthetic_label, Y_train, Y_synthetic)
+    disc_scores = synthetic_quality[primary_synthetic_label]['all_discrimination']
 
     if has_timegan and X_timegan is not None:
         if Y_timegan is not None:
@@ -597,22 +796,30 @@ def main(args):
     viz1_path = results_dir / 'real_vs_synthetic_sequences'
     viz1 = plot_real_vs_synthetic_sequences(Y_train[:n_seq], Y_synthetic[:n_seq], str(viz1_path), n_samples=n_seq)
     print(f"  Saved: {viz1['static']}")
-    if viz1['interactive']:
+    if viz1.get('interactive'):
         print(f"  Saved: {viz1['interactive']}")
 
-    # Distributions
-    viz2_path = results_dir / 'real_vs_synthetic_distributions'
-    viz2 = plot_real_vs_synthetic_distributions(Y_train, Y_synthetic, str(viz2_path))
+    # KDE distribution comparison (lightweight replacement for full histogram)
+    viz2_path = results_dir / 'real_vs_synthetic_kde'
+    viz2 = plot_real_vs_synthetic_kde(Y_train, Y_synthetic, str(viz2_path), seed=resolved_seed)
     print(f"  Saved: {viz2['static']}")
-    if viz2['interactive']:
+    if viz2.get('interactive'):
         print(f"  Saved: {viz2['interactive']}")
+
+    # Synthetic quality heatmap (RGAN vs TimeGAN comparison)
+    if synthetic_quality:
+        viz_heatmap_path = results_dir / 'synthetic_quality_heatmap'
+        viz_heatmap = plot_synthetic_quality_heatmap(synthetic_quality, str(viz_heatmap_path))
+        print(f"  Saved: {viz_heatmap['static']}")
+        if viz_heatmap.get('interactive'):
+            print(f"  Saved: {viz_heatmap['interactive']}")
 
     # Augmentation comparison
     if augmentation_results:
         viz3_path = results_dir / 'data_augmentation_comparison'
         viz3 = plot_data_augmentation_comparison(augmentation_results, str(viz3_path))
         print(f"  Saved: {viz3['static']}")
-        if viz3['interactive']:
+        if viz3.get('interactive'):
             print(f"  Saved: {viz3['interactive']}")
 
     # ========================================================================
@@ -626,9 +833,9 @@ def main(args):
     print(f"  Binary Classification Task: Predict Trend (Increase vs Decrease)")
     print(f"  Class Balance (Train): {np.mean(y_train_cls):.2f} positive")
 
-    # 2. Table 1: Baseline Classification Metrics (Real Data)
-    print("\n  Generating Table 1: Baseline Classification on Real Data...")
-    baseline_metrics = train_evaluate_classifiers(X_train, y_train_cls, X_test, y_test_cls)
+    # 2. Supervisor baseline classification metrics (real data)
+    print("\n  Generating supervisor baseline classification table...")
+    baseline_metrics = train_evaluate_classifiers(X_train, y_train_cls, X_test, y_test_cls, seed=resolved_seed)
     
     table1_rows = []
     for model_name, metrics in baseline_metrics.items():
@@ -640,16 +847,16 @@ def main(args):
     df_table1 = pd.DataFrame(table1_rows)
     cols = ['Model', 'Accuracy', 'F1', 'Precision', 'Recall']
     df_table1 = df_table1[cols]
-    df_table1.to_csv(results_dir / "table1_baseline_classification.csv", index=False)
-    print("    Saved: table1_baseline_classification.csv")
+    df_table1.to_csv(results_dir / "supervisor_baseline_classification_table.csv", index=False)
+    print("    Saved: supervisor_baseline_classification_table.csv")
 
     # 3. Table 2 & 3: GAN vs WGAN Quality & Augmentation
     # We need the WGAN model for full comparison
     
     # Store synthetic datasets for classification augmentation
     syn_datasets = {}
-    if 'RGAN' in synthetic_quality:
-        syn_datasets['RGAN'] = (X_train, Y_synthetic)
+    if primary_synthetic_label in synthetic_quality:
+        syn_datasets[primary_synthetic_label] = (X_train, Y_synthetic)
 
     # Load WGAN if provided
     if args.wgan_model:
@@ -659,15 +866,44 @@ def main(args):
             if isinstance(wgan_checkpoint, dict) and 'state_dict' in wgan_checkpoint:
                 wgan_checkpoint = wgan_checkpoint['state_dict']
             from rgan.models_torch import build_generator
-            G_wgan = build_generator(args.L, args.H, n_in=1, units=g_units,
-                                     num_layers=g_layers, layer_norm=True)
+            wgan_run_dir = Path(args.wgan_model).parent.parent
+            wgan_metrics_path = wgan_run_dir / "metrics.json"
+            wgan_metrics = None
+            if wgan_metrics_path.exists():
+                with open(wgan_metrics_path, encoding="utf-8") as f:
+                    wgan_metrics = json.load(f)
+            wgan_replay_cfg = _infer_generator_replay_config(
+                wgan_metrics,
+                wgan_checkpoint,
+                n_in_current=X_train.shape[-1],
+                model_label="WGAN",
+            )
+            G_wgan = build_generator(
+                args.L,
+                args.H,
+                n_in=wgan_replay_cfg["n_in"],
+                units=wgan_replay_cfg["units"],
+                num_layers=wgan_replay_cfg["num_layers"],
+                dense_activation=wgan_replay_cfg["dense_activation"],
+                layer_norm=True,
+                noise_dim=wgan_replay_cfg["noise_dim"],
+            )
             wgan_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             G_wgan.load_state_dict(wgan_checkpoint)
             G_wgan.to(wgan_device).eval()
             with torch.no_grad(), AMP.autocast(wgan_device.type, enabled=(wgan_device.type == 'cuda')):
                 X_torch = torch.from_numpy(X_train).float().to(wgan_device)
-                Y_wgan = G_wgan(X_torch).float().cpu().numpy()
+                if wgan_replay_cfg["noise_dim"] > 0:
+                    z_wgan = torch.randn(
+                        X_torch.size(0), X_torch.size(1), wgan_replay_cfg["noise_dim"], device=wgan_device
+                    )
+                else:
+                    z_wgan = None
+                Y_wgan = G_wgan(X_torch, z_wgan).float().cpu().numpy()
             G_wgan.cpu()
+            del G_wgan
+            if wgan_device.type == 'cuda':
+                torch.cuda.empty_cache()
             syn_datasets['WGAN-GP'] = (X_train, Y_wgan)
             print(f"  Generated {len(Y_wgan)} WGAN sequences.")
         except Exception as e:
@@ -679,7 +915,7 @@ def main(args):
     # Generate Table 2: Quantitative Quality (GAN vs WGAN)
     # Reuse metrics already computed in Step 8 where possible
     if syn_datasets:
-        print("\n  Generating Table 2: GAN vs WGAN Quality Metrics...")
+        print("\n  Generating supervisor GAN quality table...")
         quality_results = []
         for name, (_X_syn, Y_syn) in syn_datasets.items():
             if name in synthetic_quality:
@@ -693,7 +929,7 @@ def main(args):
                 print(f"    Computing metrics for {name}...")
                 fd_val = frechet_distance(Y_train, Y_syn)
                 var_val = variance_difference(Y_train, Y_syn)['abs_diff']
-                disc_res = evaluate_discriminators(Y_train, Y_syn, n_folds=3)
+                disc_res = evaluate_discriminators(Y_train, Y_syn, n_folds=3, seed=resolved_seed)
                 disc_acc = disc_res['Random Forest']['accuracy']
 
             quality_results.append({
@@ -704,11 +940,11 @@ def main(args):
             })
         
         df_table2 = pd.DataFrame(quality_results)
-        df_table2.to_csv(results_dir / "table2_gan_quality.csv", index=False)
-        print("    Saved: table2_gan_quality.csv")
+        df_table2.to_csv(results_dir / "supervisor_gan_quality_table.csv", index=False)
+        print("    Saved: supervisor_gan_quality_table.csv")
     
     # Generate Table 3: Augmentation Performance
-    print("\n  Generating Table 3: Augmentation Performance (Accuracy)...")
+    print("\n  Generating supervisor augmentation table (accuracy)...")
     
     # Dict: Model -> Scenario -> Accuracy
     # Initialized with Real Only results
@@ -724,7 +960,7 @@ def main(args):
         y_aug = np.concatenate([y_train_cls, y_syn_cls], axis=0)
         
         # Train & Evaluate
-        aug_metrics = train_evaluate_classifiers(X_aug, y_aug, X_test, y_test_cls)
+        aug_metrics = train_evaluate_classifiers(X_aug, y_aug, X_test, y_test_cls, seed=resolved_seed)
         
         col_name = f"+ {syn_name} Synthetic"
         for m, res in aug_metrics.items():
@@ -740,7 +976,7 @@ def main(args):
         
     df_table3 = pd.DataFrame(rows)
     # Order columns
-    desired = ['Model', 'Real Only', '+ RGAN Synthetic', '+ WGAN-GP Synthetic', '+ TimeGAN Synthetic']
+    desired = ['Model', 'Real Only', f'+ {primary_synthetic_label} Synthetic', '+ WGAN-GP Synthetic', '+ TimeGAN Synthetic']
     final_cols = [c for c in desired if c in df_table3.columns]
     # Add any other columns found
     for c in df_table3.columns:
@@ -748,8 +984,8 @@ def main(args):
             final_cols.append(c)
             
     df_table3 = df_table3[final_cols]
-    df_table3.to_csv(results_dir / "table3_augmentation.csv", index=False)
-    print("    Saved: table3_augmentation.csv")
+    df_table3.to_csv(results_dir / "supervisor_augmentation_table.csv", index=False)
+    print("    Saved: supervisor_augmentation_table.csv")
 
     
     # ========================================================================
@@ -761,8 +997,11 @@ def main(args):
         'dataset': str(args.csv),
         'L': args.L,
         'H': args.H,
+        'seed': resolved_seed,
+        'deterministic': deterministic,
         'train_size': len(X_train),
         'test_size': len(X_test),
+        'synthetic_source': primary_synthetic_label,
         'classification_metrics': classification_results,
         'synthetic_quality': synthetic_quality,
         'data_augmentation': augmentation_results,
@@ -806,10 +1045,14 @@ def _build_parser():
     parser = argparse.ArgumentParser(description='Run synthetic data augmentation experiments')
     parser.add_argument('--csv', type=str, required=True,
                        help='Path to CSV data file')
-    parser.add_argument('--time_col', type=str, default=None,
+    parser.add_argument('--time_col', type=str, default="auto",
                        help='Name of time column (auto-detected if not specified)')
-    parser.add_argument('--target_col', type=str, default=None,
+    parser.add_argument('--target_col', type=str, default="auto",
                        help='Name of target column (auto-detected if not specified)')
+    parser.add_argument('--resample', type=str, default='',
+                       help='Optional resampling frequency when not replaying from a prior run')
+    parser.add_argument('--agg', type=str, default='last',
+                       help='Aggregation method used with --resample')
     parser.add_argument('--L', type=int, default=60,
                        help='Lookback window size (auto-overridden from metrics.json if --results_from is set)')
     parser.add_argument('--H', type=int, default=12,
@@ -819,12 +1062,16 @@ def _build_parser():
     parser.add_argument('--results_dir', type=str, default='results/augmentation',
                        help='Directory to save results')
     parser.add_argument('--rgan_model', type=str, default=None,
-                       help='Path to RGAN generator .pt file (auto-detected if not set)')
+                       help='Path to RGAN generator .pt file')
     parser.add_argument('--wgan_model', type=str, default=None,
                        help='Path to WGAN model checkpoint (for Supervisor Comparison)')
     parser.add_argument('--results_from', type=str, default=None,
                        help='Path to training results directory (e.g. results/cloud/results). '
-                            'Auto-finds generator, metrics.json, and uses correct L/H/architecture.')
+                            'Loads generator, metrics.json, and uses correct L/H/architecture.')
+    parser.add_argument('--auto_discover_results', action='store_true',
+                       help='Search results/ for the most recent generator when --results_from/--rgan_model are not provided.')
+    parser.add_argument('--allow_gaussian_baseline', action='store_true',
+                       help='Run without RGAN weights and use Gaussian perturbation as an explicit synthetic baseline.')
     parser.add_argument('--skip_timegan', action='store_true',
                        help='Skip TimeGAN training (saves significant time)')
     parser.add_argument('--timegan_epochs', type=int, default=100,
@@ -833,6 +1080,10 @@ def _build_parser():
                        help='Max epochs for neural model augmentation training (early stopping applies)')
     parser.add_argument('--nn_patience', type=int, default=25,
                        help='Early stopping patience for neural models')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed override. Defaults to the source training run seed when replaying, else 42.')
+    parser.add_argument('--deterministic', action='store_true',
+                       help='Enable deterministic CUDA algorithms for reproducible augmentation runs (slower).')
     return parser
 
 

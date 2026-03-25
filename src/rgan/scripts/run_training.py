@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import dataclasses
 import json
 import math
 import os
 import platform
+import shutil
 import random
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +36,10 @@ from rgan.data import (
     DataSplit,
 )
 from rgan.plots import (
-    plot_single_train_test,
-    plot_constant_train_test,
-    plot_compare_models_bars,
+    plot_training_curves_overlay,
+    plot_ranked_model_bars,
+    plot_noise_robustness_heatmap,
+    plot_multi_metric_radar,
     plot_predictions,
     create_error_metrics_table,
     create_noise_robustness_table,
@@ -104,7 +110,7 @@ def describe_resource_heavy_steps(args: argparse.Namespace, console) -> None:
         console.print("All optional heavy components are disabled for this run.")
 
 
-def set_seed(seed: int = 42) -> None:
+def set_seed(seed: int = 42, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
@@ -114,10 +120,15 @@ def set_seed(seed: int = 42) -> None:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-            # benchmark=True auto-tunes kernels for fixed input shapes — significant
-            # speedup for LSTM training where every batch has the same dimensions.
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.deterministic = False
+            if deterministic:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            else:
+                # benchmark=True auto-tunes kernels for fixed input shapes — significant
+                # speedup for LSTM training where every batch has the same dimensions.
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.deterministic = False
     except ModuleNotFoundError:
         pass
 
@@ -190,6 +201,350 @@ def parse_noise_levels(spec: str) -> np.ndarray:
     return np.array(sorted(set(values)), dtype=float)
 
 
+def _collect_environment_info(seed: int) -> Dict[str, Any]:
+    packages = {}
+    _pkg_import_map = {
+        "numpy": "numpy",
+        "pandas": "pandas",
+        "torch": "torch",
+        "scikit-learn": "sklearn",
+    }
+    for pkg, module_name in _pkg_import_map.items():
+        try:
+            module = __import__(module_name)
+            packages[pkg] = getattr(module, "__version__", "unknown")
+        except ModuleNotFoundError:
+            continue
+
+    git_commit = ""
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parent,
+            text=True,
+        ).strip()
+    except Exception:
+        git_commit = ""
+
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "packages": packages,
+        "git_commit": git_commit,
+        "seed": seed,
+    }
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    return obj
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _resume_store_path(results_dir: Path, checkpoint_dir: Optional[str]) -> Path:
+    return Path(checkpoint_dir) if checkpoint_dir else results_dir
+
+
+def _build_resume_signature(args: argparse.Namespace) -> Dict[str, Any]:
+    csv_path = Path(args.csv).expanduser().resolve()
+    csv_exists = csv_path.exists()
+    csv_stat = csv_path.stat() if csv_exists else None
+    prior_results = str(Path(args.prior_results).expanduser().resolve()) if args.prior_results else ""
+
+    return _sanitize_for_json(
+        {
+            "dataset": {
+                "csv": str(csv_path),
+                "exists": csv_exists,
+                "size": csv_stat.st_size if csv_stat else None,
+                "mtime_ns": csv_stat.st_mtime_ns if csv_stat else None,
+                "target": args.target,
+                "time_col": args.time_col,
+                "resample": args.resample,
+                "agg": args.agg,
+                "train_ratio": args.train_ratio,
+                "val_frac": args.val_frac,
+                "max_train_windows": args.max_train_windows,
+            },
+            "pipeline": {
+                "only_models": args.only_models,
+                "prior_results": prior_results,
+                "skip_classical": args.skip_classical,
+                "skip_noise_robustness": args.skip_noise_robustness,
+                "bootstrap_samples": args.bootstrap_samples,
+                "noise_levels": args.noise_levels,
+            },
+            "training": {
+                "L": args.L,
+                "H": args.H,
+                "batch_size": args.batch_size,
+                "eval_every": args.eval_every,
+                "eval_batch_size": args.eval_batch_size,
+                "seed": args.seed,
+                "deterministic": bool(getattr(args, "deterministic", False)),
+                "lambda_reg": args.lambda_reg,
+                "gan_variant": args.gan_variant,
+                "units_g": args.units_g,
+                "units_d": args.units_d,
+                "g_layers": args.g_layers,
+                "d_layers": args.d_layers,
+                "lr_g": args.lr_g,
+                "lr_d": args.lr_d,
+                "label_smooth": args.label_smooth,
+                "grad_clip": args.grad_clip,
+                "dropout": args.dropout,
+                "patience": args.patience,
+                "g_dense_activation": args.g_dense_activation,
+                "d_activation": args.d_activation,
+                "amp": args.amp,
+                "ema_decay": args.ema_decay,
+                "wgan_gp_lambda": args.wgan_gp_lambda,
+                "wgan_clip_value": args.wgan_clip_value,
+                "use_logits": args.use_logits,
+                "d_steps": args.d_steps,
+                "g_steps": args.g_steps,
+                "supervised_warmup_epochs": args.supervised_warmup_epochs,
+                "lambda_reg_start": args.lambda_reg_start,
+                "lambda_reg_end": args.lambda_reg_end,
+                "lambda_reg_warmup_epochs": args.lambda_reg_warmup_epochs,
+                "adv_weight": args.adv_weight,
+                "instance_noise_std": args.instance_noise_std,
+                "instance_noise_decay": args.instance_noise_decay,
+                "weight_decay": args.weight_decay,
+                "noise_dim": args.noise_dim,
+                "lambda_diversity": args.lambda_diversity,
+                "critic_reg_interval": args.critic_reg_interval,
+                "critic_arch": args.critic_arch,
+            },
+        }
+    )
+
+
+def _signature_differences(previous: Dict[str, Any], current: Dict[str, Any], prefix: str = "") -> List[str]:
+    diffs: List[str] = []
+    prev_keys = set(previous.keys())
+    curr_keys = set(current.keys())
+    for key in sorted(prev_keys | curr_keys):
+        full_key = f"{prefix}.{key}" if prefix else key
+        if key not in previous:
+            diffs.append(f"{full_key}: <missing> -> {current[key]!r}")
+            continue
+        if key not in current:
+            diffs.append(f"{full_key}: {previous[key]!r} -> <missing>")
+            continue
+        prev_val = previous[key]
+        curr_val = current[key]
+        if isinstance(prev_val, dict) and isinstance(curr_val, dict):
+            diffs.extend(_signature_differences(prev_val, curr_val, full_key))
+        elif prev_val != curr_val:
+            diffs.append(f"{full_key}: {prev_val!r} -> {curr_val!r}")
+    return diffs
+
+
+def _init_resume_manifest(signature: Dict[str, Any], results_dir: Path, resume_store: Path) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "signature": signature,
+        "results_dir": str(results_dir.resolve()),
+        "resume_store": str(resume_store.resolve()),
+        "checkpoint": {
+            "latest_path": "checkpoint_latest.pt" if resume_store != results_dir else "",
+            "latest_epoch": 0,
+        },
+        "stages": {},
+    }
+
+
+def _manifest_path(store: Path) -> Path:
+    return store / "resume_manifest.json"
+
+
+_manifest_lock = threading.Lock()
+
+
+def _write_resume_manifest(manifest: Dict[str, Any], results_dir: Path, resume_store: Path) -> None:
+    with _manifest_lock:
+        manifest["updated_at"] = _now_iso()
+        manifest_path = _manifest_path(resume_store)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_sanitize_for_json(manifest), f, indent=2)
+        tmp_path.replace(manifest_path)
+        if results_dir.resolve() != resume_store.resolve():
+            dst = results_dir / "resume_manifest.json"
+            tmp_dst = dst.with_suffix(".json.tmp")
+            with open(tmp_dst, "w", encoding="utf-8") as f:
+                json.dump(_sanitize_for_json(manifest), f, indent=2)
+            tmp_dst.replace(dst)
+
+
+def _load_resume_manifest(resume_store: Path) -> Optional[Dict[str, Any]]:
+    path = _manifest_path(resume_store)
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _peek_checkpoint_metadata(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        return None
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return {
+        "epoch": int(ckpt.get("epoch", 0)),
+        "config_dict": ckpt.get("config_dict", {}),
+    }
+
+
+def _stage_cache_path(resume_store: Path, stage_name: str) -> Path:
+    return resume_store / "stage_cache" / f"{stage_name}.pt"
+
+
+def _save_stage_cache(resume_store: Path, stage_name: str, payload: Dict[str, Any]) -> str:
+    cache_path = _stage_cache_path(resume_store, stage_name)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, cache_path)
+    return str(cache_path.relative_to(resume_store))
+
+
+def _load_stage_cache(resume_store: Path, stage_name: str) -> Dict[str, Any]:
+    return torch.load(_stage_cache_path(resume_store, stage_name), map_location="cpu", weights_only=False)
+
+
+def _stage_entry_complete(entry: Optional[Dict[str, Any]], resume_store: Path) -> bool:
+    if not entry or entry.get("status") != "completed":
+        return False
+    cache_rel = entry.get("cache")
+    if cache_rel and not (resume_store / cache_rel).exists():
+        return False
+    for rel_path in entry.get("artifacts", []):
+        if not (resume_store / rel_path).exists():
+            return False
+    return True
+
+
+def _stage_completed(manifest: Dict[str, Any], stage_name: str, resume_store: Path) -> bool:
+    return _stage_entry_complete(manifest.get("stages", {}).get(stage_name), resume_store)
+
+
+def _mark_stage(
+    manifest: Dict[str, Any],
+    stage_name: str,
+    *,
+    status: str,
+    cache: Optional[str] = None,
+    artifacts: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    with _manifest_lock:
+        stage_entry = manifest.setdefault("stages", {}).get(stage_name, {})
+        stage_entry["status"] = status
+        stage_entry["updated_at"] = _now_iso()
+        if status == "completed":
+            stage_entry["completed_at"] = _now_iso()
+        if cache is not None:
+            stage_entry["cache"] = cache
+        if artifacts is not None:
+            stage_entry["artifacts"] = sorted(set(artifacts))
+        if metadata is not None:
+            stage_entry["metadata"] = metadata
+        manifest["stages"][stage_name] = stage_entry
+
+
+def _invalidate_stage(manifest: Dict[str, Any], stage_name: str, reason: str) -> None:
+    entry = manifest.setdefault("stages", {}).get(stage_name, {})
+    entry["status"] = "pending"
+    entry["invalidated_at"] = _now_iso()
+    entry["reason"] = reason
+    manifest["stages"][stage_name] = entry
+
+
+def _sync_artifact_to_resume_store(relative_path: str, results_dir: Path, resume_store: Path) -> str:
+    src = results_dir / relative_path
+    if not src.exists():
+        raise FileNotFoundError(f"Artifact missing for resume sync: {src}")
+    dest = resume_store / relative_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() != dest.resolve():
+        shutil.copy2(src, dest)
+    return relative_path
+
+
+def _restore_stage_artifacts(stage_entry: Dict[str, Any], resume_store: Path, results_dir: Path) -> None:
+    for rel_path in stage_entry.get("artifacts", []):
+        src = resume_store / rel_path
+        if not src.exists():
+            continue
+        dest = results_dir / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+
+
+def _restore_all_completed_stage_artifacts(manifest: Dict[str, Any], resume_store: Path, results_dir: Path) -> None:
+    for stage_entry in manifest.get("stages", {}).values():
+        if _stage_entry_complete(stage_entry, resume_store):
+            _restore_stage_artifacts(stage_entry, resume_store, results_dir)
+
+
+def _save_json_artifact(obj: Any, relative_path: str, results_dir: Path, resume_store: Path) -> str:
+    dest = results_dir / relative_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(_sanitize_for_json(obj), f, indent=2, default=str)
+    return _sync_artifact_to_resume_store(relative_path, results_dir, resume_store)
+
+
+def _sync_existing_artifacts(relative_paths: List[str], results_dir: Path, resume_store: Path) -> List[str]:
+    synced: List[str] = []
+    for rel_path in relative_paths:
+        if not rel_path:
+            continue
+        normalized = str(Path(rel_path))
+        if (results_dir / normalized).exists():
+            synced.append(_sync_artifact_to_resume_store(normalized, results_dir, resume_store))
+    return sorted(set(synced))
+
+
+def _save_stage_artifact_cache(
+    manifest: Dict[str, Any],
+    stage_name: str,
+    payload: Dict[str, Any],
+    *,
+    results_dir: Path,
+    resume_store: Path,
+    artifacts: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cache_rel = _save_stage_cache(resume_store, stage_name, payload)
+    _mark_stage(
+        manifest,
+        stage_name,
+        status="completed",
+        cache=cache_rel,
+        artifacts=artifacts or [],
+        metadata=metadata or {},
+    )
+    _write_resume_manifest(manifest, results_dir, resume_store)
+    return payload
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
@@ -216,6 +571,12 @@ def main():
     ap.add_argument("--units_d", type=int, default=128)
     ap.add_argument("--g_layers", type=int, default=2)
     ap.add_argument("--d_layers", type=int, default=2)
+    ap.add_argument(
+        "--critic_arch",
+        choices=["lstm", "tcn"],
+        default="tcn",
+        help="Critic architecture to use with the existing GAN objective.",
+    )
     ap.add_argument("--g_dense_activation", default="", help="Optional dense activation for the generator (PyTorch activation name).")
     ap.add_argument("--d_activation", default="sigmoid", help="Discriminator activation (PyTorch activation name).")
     ap.add_argument("--lr_g", "--lrG", type=float, default=5e-4, dest="lr_g")
@@ -223,6 +584,18 @@ def main():
     ap.add_argument("--label_smooth", type=float, default=0.9)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument(
+        "--noise_dim",
+        type=int,
+        default=16,
+        help="Latent noise dimension for stochastic generation (RCGAN-style). 0 = deterministic.",
+    )
+    ap.add_argument(
+        "--lambda_diversity",
+        type=float,
+        default=0.1,
+        help="Weight for MSGAN diversity loss (encourages different z -> different output). 0 = disabled.",
+    )
     ap.add_argument("--patience", type=int, default=25)
     ap.add_argument(
         "--wgan_clip_value",
@@ -318,6 +691,33 @@ def main():
     ap.add_argument("--pin_memory", type=lambda v: str(v).lower() in ["1","true","yes"], default=True,
                     help="Pin host memory for faster host-to-device copies")
     ap.add_argument(
+        "--preload_to_device",
+        choices=["auto", "always", "never"],
+        default="never",
+        help=(
+            "Move train/val/test tensors to the GPU once before RGAN training when feasible. "
+            "'auto' enables this only for CUDA runs under a safe size threshold."
+        ),
+    )
+    ap.add_argument(
+        "--compile_mode",
+        choices=["off", "reduce-overhead"],
+        default="off",
+        help=(
+            "Compile the RGAN recurrent training path with torch.compile. "
+            "'reduce-overhead' targets small-kernel GPU workloads."
+        ),
+    )
+    ap.add_argument(
+        "--critic_reg_interval",
+        type=int,
+        default=1,
+        help=(
+            "Apply the WGAN-GP critic regularizer every N critic updates. "
+            "Values > 1 use lazy regularization and scale the penalty on applied steps."
+        ),
+    )
+    ap.add_argument(
         "--noise_levels",
         default="0,0.01,0.05,0.1,0.2",
         help="Comma-separated list of Gaussian noise standard deviations for robustness evaluation (0 always included).",
@@ -374,6 +774,8 @@ def main():
     ap.add_argument("--tune_csv", default="")
     ap.add_argument("--results_dir", default="./results/experiment")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--deterministic", action="store_true",
+                    help="Enable CUDA deterministic mode for reproducible runs (slower).")
     ap.add_argument("--gpu_id", type=int, default=0, help="ID of the GPU to use (default: 0).")
     # Checkpoint & Resume
     ap.add_argument(
@@ -432,13 +834,15 @@ def main():
             return f"PyTorch CUDA build detected (CUDA {cuda_version})."
         return "PyTorch was installed without CUDA support. Install a CUDA wheel (e.g., torch==2.2.2+cu121)."
 
+    resolved_device_str = "cpu"
+
     if args.require_cuda:
         if not torch.cuda.is_available():
             console.print(f"CRITICAL ERROR: --require_cuda specified but no CUDA device found.")
             console.print(_cuda_build_hint())
             sys.exit(1)
 
-        if args.gpu_id >= torch.cuda.device_count():
+        if args.gpu_id < 0 or args.gpu_id >= torch.cuda.device_count():
             console.print(f"CRITICAL ERROR: --gpu_id {args.gpu_id} requested but only {torch.cuda.device_count()} devices available.")
             sys.exit(1)
 
@@ -446,13 +850,18 @@ def main():
         device_name = torch.cuda.get_device_name(args.gpu_id)
         console.print(f"Strict GPU Mode Active: Using device {args.gpu_id} ({device_name})")
         console.print("CPU fallback is DISABLED.")
+        resolved_device_str = f"cuda:{args.gpu_id}"
 
     elif torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu_id)
-        device_name = torch.cuda.get_device_name(args.gpu_id)
-        console.print(f"GPU Detected: {device_name} (ID: {args.gpu_id})")
-        console.print("Using CUDA for training. Fallback to CPU enabled if CUDA fails.")
-        console.print(_cuda_build_hint())
+        if args.gpu_id < 0 or args.gpu_id >= torch.cuda.device_count():
+            console.print(f"WARNING: --gpu_id {args.gpu_id} requested but only {torch.cuda.device_count()} devices available. Falling back to CPU.")
+        else:
+            torch.cuda.set_device(args.gpu_id)
+            device_name = torch.cuda.get_device_name(args.gpu_id)
+            console.print(f"GPU Detected: {device_name} (ID: {args.gpu_id})")
+            console.print("Using CUDA for training. Fallback to CPU enabled if CUDA fails.")
+            console.print(_cuda_build_hint())
+            resolved_device_str = f"cuda:{args.gpu_id}"
     else:
         console.print("WARNING: No GPU detected. Falling back to CPU.")
         console.print("Training will be significantly slower.")
@@ -515,6 +924,64 @@ def main():
     with open(results_dir / "run_config.json", "w") as f:
         json.dump(run_config, f, indent=2)
 
+    resume_store = _resume_store_path(results_dir, args.checkpoint_dir)
+    resume_store.mkdir(parents=True, exist_ok=True)
+    resume_models_dir = resume_store / "models"
+    resume_models_dir.mkdir(parents=True, exist_ok=True)
+    log_info(f"Resume store: {resume_store.resolve()}")
+
+    resume_signature = _build_resume_signature(args)
+    resume_manifest = _load_resume_manifest(resume_store)
+    checkpoint_meta = _peek_checkpoint_metadata(args.resume_from)
+    resumed_job = checkpoint_meta is not None
+
+    if resume_manifest is None:
+        if resumed_job:
+            raise ValueError(
+                "Resume checkpoint detected but resume_manifest.json is missing from the resume store. "
+                "Strict resume cannot be enforced; restore the manifest or start a fresh run."
+            )
+        resume_manifest = _init_resume_manifest(resume_signature, results_dir, resume_store)
+        log_info("Resume manifest initialized.")
+    else:
+        diffs = _signature_differences(resume_manifest.get("signature", {}), resume_signature)
+        if diffs:
+            diff_msg = "\n".join(f"  - {item}" for item in diffs)
+            raise ValueError(
+                "Resume config drift detected. Only total --epochs and resume/job plumbing may change.\n"
+                f"{diff_msg}"
+            )
+        log_info("Resume manifest signature matches current run.")
+
+    if checkpoint_meta is not None:
+        checkpoint_epoch = int(checkpoint_meta["epoch"])
+        resume_manifest.setdefault("checkpoint", {})["latest_epoch"] = checkpoint_epoch
+        if args.epochs < checkpoint_epoch:
+            raise ValueError(
+                f"Resume checkpoint is already at epoch {checkpoint_epoch}, but --epochs={args.epochs}. "
+                "Increase --epochs or start a fresh run."
+            )
+        log_info(
+            f"Resume checkpoint detected: epoch={checkpoint_epoch}, "
+            f"target_epochs={args.epochs}, remaining_epochs={max(0, args.epochs - checkpoint_epoch)}"
+        )
+    else:
+        checkpoint_epoch = 0
+
+    resume_manifest["signature"] = resume_signature
+    resume_manifest["results_dir"] = str(results_dir.resolve())
+    resume_manifest["resume_store"] = str(resume_store.resolve())
+    resume_manifest.setdefault("checkpoint", {})["latest_path"] = "checkpoint_latest.pt" if args.checkpoint_dir else ""
+    _write_resume_manifest(resume_manifest, results_dir, resume_store)
+
+    if resumed_job and checkpoint_epoch == args.epochs:
+        reporting_entry = resume_manifest.get("stages", {}).get("reporting")
+        if _stage_entry_complete(reporting_entry, resume_store):
+            log_info("Checkpoint already matches target epochs and reporting artifacts are complete; restoring cached artifacts and exiting.")
+            _restore_all_completed_stage_artifacts(resume_manifest, resume_store, results_dir)
+            close_log_file()
+            return
+
     noise_levels = parse_noise_levels(str(args.noise_levels))
 
     describe_resource_heavy_steps(args, console)
@@ -525,6 +992,7 @@ def main():
             build_discriminator as build_discriminator_backend,
         )
         from rgan.rgan_torch import (
+            _select_eval_generator as select_eval_generator_backend,
             train_rgan_torch as train_rgan_backend,
             compute_metrics as compute_metrics_backend,
         )
@@ -546,20 +1014,26 @@ def main():
 
     # ── Parse --only_models / --prior_results for selective retraining ──
     ALL_NEURAL_MODELS = {"rgan", "lstm", "dlinear", "nlinear", "fits", "patchtst", "itransformer", "autoformer", "informer"}
+    standalone_rgan_only = False
     if args.only_models:
         _only_set = {m.strip().lower() for m in args.only_models.split(",") if m.strip()}
         invalid = _only_set - ALL_NEURAL_MODELS
         if invalid:
             log_error(f"Unknown model names in --only_models: {invalid}. Valid: {sorted(ALL_NEURAL_MODELS)}")
             sys.exit(1)
-        if not args.prior_results:
-            log_error("--only_models requires --prior_results (path to previous run's results dir with models/*.pt)")
-            sys.exit(1)
-        _prior_dir = Path(args.prior_results)
-        if not (_prior_dir / "models").is_dir():
-            log_error(f"--prior_results directory missing 'models/' subfolder: {_prior_dir}")
-            sys.exit(1)
-        log_info(f"Selective retraining: only training {sorted(_only_set)}, loading rest from {_prior_dir}")
+        standalone_rgan_only = (_only_set == {"rgan"} and not args.prior_results)
+        if standalone_rgan_only:
+            _prior_dir = None
+            log_info("Selective retraining: training only RGAN without prior baseline artifacts.")
+        else:
+            if not args.prior_results:
+                log_error("--only_models requires --prior_results unless it is exactly '--only_models rgan'.")
+                sys.exit(1)
+            _prior_dir = Path(args.prior_results)
+            if not (_prior_dir / "models").is_dir():
+                log_error(f"--prior_results directory missing 'models/' subfolder: {_prior_dir}")
+                sys.exit(1)
+            log_info(f"Selective retraining: only training {sorted(_only_set)}, loading rest from {_prior_dir}")
     else:
         _only_set = ALL_NEURAL_MODELS  # train everything
         _prior_dir = None
@@ -599,7 +1073,7 @@ def main():
             "pred_test": te,
         }
 
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=getattr(args, 'deterministic', False))
 
     with log_phase(console, "Load dataset and standardize"):
         log_step(f"Loading CSV from: {args.csv}")
@@ -681,10 +1155,7 @@ def main():
     horizon = int(Ytr.shape[1])
 
     # Determine device string strictly
-    if args.require_cuda or torch.cuda.is_available():
-        device_str = f"cuda:{args.gpu_id}"
-    else:
-        device_str = "cpu"
+    device_str = resolved_device_str
 
     # Construct TrainConfig
     base_config = TrainConfig(
@@ -711,6 +1182,10 @@ def main():
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
         pin_memory=args.pin_memory,
+        preload_to_device=args.preload_to_device,
+        compile_mode=args.compile_mode,
+        critic_reg_interval=args.critic_reg_interval,
+        critic_arch=args.critic_arch,
         device=device_str,
         gan_variant=args.gan_variant,
         d_steps=args.d_steps,
@@ -729,6 +1204,8 @@ def main():
         strict_device=args.require_cuda,
         wgan_clip_value=args.wgan_clip_value,
         weight_decay=args.weight_decay,
+        noise_dim=args.noise_dim,
+        lambda_diversity=args.lambda_diversity,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_every=args.checkpoint_every,
         resume_from=args.resume_from,
@@ -743,11 +1220,48 @@ def main():
         "Units (G/D)": f"{args.units_g}/{args.units_d}",
         "GAN Variant": args.gan_variant,
         "D/G Steps": f"{args.d_steps}/{args.g_steps}",
+        "Preload / Compile": f"{args.preload_to_device} / {args.compile_mode}",
+        "Critic Reg Interval": args.critic_reg_interval,
+        "Critic Arch": args.critic_arch,
         "Lambda": args.lambda_reg,
         "Learning Rates (G/D)": f"{args.lr_g}/{args.lr_d}",
         "Dropout": args.dropout,
         "Layers (G/D)": f"{args.g_layers}/{args.d_layers}",
     })
+
+    _sync_artifact_to_resume_store("run_config.json", results_dir, resume_store)
+    _mark_stage(
+        resume_manifest,
+        "data_prep",
+        status="completed",
+        artifacts=["run_config.json"],
+        metadata={
+            "target_col": args.target,
+            "time_col": args.time_col,
+            "num_train_windows": int(Xfull_tr.shape[0]),
+            "num_test_windows": int(Xte.shape[0]),
+        },
+    )
+    _write_resume_manifest(resume_manifest, results_dir, resume_store)
+
+    if resumed_job and checkpoint_epoch < args.epochs:
+        log_info("Target epochs increased on resume; invalidating RGAN-dependent downstream stages.")
+        for _stage_name in ("rgan", "bootstrap", "noise_robustness", "reporting"):
+            _invalidate_stage(resume_manifest, _stage_name, reason="target_epochs_increased")
+        _write_resume_manifest(resume_manifest, results_dir, resume_store)
+
+    stage_changed = {
+        "rgan": False,
+        "classical_baselines": False,
+        "lstm": False,
+        "dlinear": False,
+        "nlinear": False,
+        "fits": False,
+        "patchtst": False,
+        "itransformer": False,
+        "autoformer": False,
+        "informer": False,
+    }
 
     used_tune = ""
     best_hp = None
@@ -853,7 +1367,7 @@ def main():
     use_spectral_norm = True if base_config.gan_variant.lower() == "wgan-gp" else False
 
     console.rule("Build Models")
-    log_step(f"Building Generator: L={base_config.L}, H={base_config.H}, n_in={Xtr.shape[-1]}, units={base_config.units_g}, layers={base_config.g_layers}, dropout={base_config.dropout}, dense_act={g_dense_act}, layer_norm={layer_norm}")
+    log_step(f"Building Generator: L={base_config.L}, H={base_config.H}, n_in={Xtr.shape[-1]}, units={base_config.units_g}, layers={base_config.g_layers}, dropout={base_config.dropout}, dense_act={g_dense_act}, layer_norm={layer_norm}, noise_dim={base_config.noise_dim}")
     G = build_generator_backend(
         L=base_config.L,
         H=base_config.H,
@@ -863,9 +1377,13 @@ def main():
         num_layers=base_config.g_layers,
         dense_activation=g_dense_act,
         layer_norm=layer_norm,
+        noise_dim=base_config.noise_dim,
     )
     log_step(f"Generator built: {sum(p.numel() for p in G.parameters())} parameters")
-    log_step(f"Building Discriminator: units={base_config.units_d}, layers={base_config.d_layers}, activation={base_config.d_activation}, spectral_norm={use_spectral_norm}")
+    log_step(
+        f"Building Discriminator: arch={base_config.critic_arch}, units={base_config.units_d}, "
+        f"layers={base_config.d_layers}, activation={base_config.d_activation}, spectral_norm={use_spectral_norm}"
+    )
     D = build_discriminator_backend(
         L=base_config.L,
         H=base_config.H,
@@ -875,6 +1393,7 @@ def main():
         activation=base_config.d_activation,
         layer_norm=layer_norm,
         use_spectral_norm=use_spectral_norm,
+        critic_arch=base_config.critic_arch,
     )
 
     log_step(f"Discriminator built: {sum(p.numel() for p in D.parameters())} parameters")
@@ -884,11 +1403,111 @@ def main():
     models_dir.mkdir(exist_ok=True)
     log_step(f"Models directory: {models_dir.resolve()}")
 
+    def _sync_model_artifact(filename: str) -> str:
+        return _sync_artifact_to_resume_store(f"models/{filename}", results_dir, resume_store)
+
     def _save_model(name: str, model_obj):
         """Save a PyTorch model's state_dict to models/<name>.pt"""
         path = models_dir / f"{name}.pt"
         torch.save(model_obj.state_dict(), path)
+        _sync_model_artifact(f"{name}.pt")
         return path
+
+    def _save_model_state_dict(name: str, state_dict: Dict[str, Any]):
+        """Save a raw state_dict to models/<name>.pt."""
+        path = models_dir / f"{name}.pt"
+        torch.save(state_dict, path)
+        _sync_model_artifact(f"{name}.pt")
+        return path
+
+    def _save_tree_model_artifact(tree_model_obj):
+        import joblib
+
+        results_path = models_dir / "tree_ensemble.joblib"
+        joblib.dump(tree_model_obj, results_path)
+        _sync_model_artifact("tree_ensemble.joblib")
+        return results_path
+
+    def _load_tree_model_artifact():
+        import joblib
+
+        model_path = resume_models_dir / "tree_ensemble.joblib"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Missing cached tree ensemble model artifact: {model_path}")
+        return joblib.load(model_path)
+
+    def _load_cached_model_stage(
+        stage_name: str,
+        model_class,
+        model_kwargs: Dict[str, Any],
+        model_filename: str,
+        device: torch.device,
+    ) -> Dict[str, Any]:
+        cache = _load_stage_cache(resume_store, stage_name)
+        model = model_class(**model_kwargs)
+        state_path = resume_models_dir / model_filename
+        state_dict = torch.load(state_path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        model = model.to(device)
+        model.eval()
+        _restore_stage_artifacts(resume_manifest["stages"][stage_name], resume_store, results_dir)
+        return {
+            "model": model,
+            "history": cache.get("history", {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": []}),
+            "train_stats": cache["train_stats"],
+            "test_stats": cache["test_stats"],
+            "pred_train": cache.get("pred_train"),
+            "pred_test": cache["pred_test"],
+        }
+
+    def _save_model_stage_cache(stage_name: str, out: Dict[str, Any], model_filename: str) -> None:
+        payload = {
+            "history": out.get("history", {}),
+            "train_stats": out.get("train_stats"),
+            "test_stats": out.get("test_stats"),
+            "pred_train": out.get("pred_train"),
+            "pred_test": out.get("pred_test"),
+            "model_filename": model_filename,
+        }
+        _save_stage_artifact_cache(
+            resume_manifest,
+            stage_name,
+            payload,
+            results_dir=results_dir,
+            resume_store=resume_store,
+            artifacts=[f"models/{model_filename}"],
+            metadata={"skipped": False},
+        )
+
+    def _load_cached_rgan_stage() -> Dict[str, Any]:
+        cache = _load_stage_cache(resume_store, "rgan")
+        raw_generator_state = torch.load(resume_models_dir / "rgan_generator.pt", map_location=_load_device, weights_only=True)
+        G.load_state_dict(raw_generator_state)
+        G.eval()
+
+        disc_path = resume_models_dir / "rgan_discriminator.pt"
+        if disc_path.exists():
+            D.load_state_dict(torch.load(disc_path, map_location=_load_device, weights_only=True))
+            D.eval()
+
+        G_ema = None
+        ema_path = resume_models_dir / "rgan_generator_ema.pt"
+        if ema_path.exists():
+            G_ema = copy.deepcopy(G)
+            G_ema.load_state_dict(torch.load(ema_path, map_location=_load_device, weights_only=True))
+            G_ema.eval()
+
+        _restore_stage_artifacts(resume_manifest["stages"]["rgan"], resume_store, results_dir)
+        return {
+            "G": G,
+            "D": D,
+            "G_ema": G_ema,
+            "history": cache["history"],
+            "train_stats": cache["train_stats"],
+            "test_stats": cache["test_stats"],
+            "pred_train": cache.get("pred_train"),
+            "pred_test": cache["pred_test"],
+        }
 
     log_step(f"Device for training: {device_str}")
     log_step(f"AMP enabled: {base_config.amp}")
@@ -896,9 +1515,272 @@ def main():
     log_step(f"Checkpoint dir: {base_config.checkpoint_dir or '(none)'}")
     log_step(f"Resume from: {base_config.resume_from or '(none)'}")
 
-    # ── Launch classical baselines on CPU in background while GPU trains ──
-    import threading
+    def _make_skipped_model(reason: str = "not_selected") -> Dict[str, Any]:
+        return {"skipped": True, "reason": reason}
 
+    def _train_or_load_rgan() -> Dict[str, Any]:
+        if _stage_completed(resume_manifest, "rgan", resume_store):
+            log_info("Skipping RGAN stage on resume; loading cached outputs and model artifacts.")
+            return _load_cached_rgan_stage()
+
+        _mark_stage(resume_manifest, "rgan", status="running", metadata={"target_epochs": args.epochs})
+        _write_resume_manifest(resume_manifest, results_dir, resume_store)
+
+        if _should_train("rgan"):
+            with log_phase(console, "Train R-GAN (PyTorch)"):
+                log_step("Calling train_rgan_backend...")
+                rgan_result = train_rgan_backend(
+                    base_config,
+                    (G, D),
+                    {"Xtr": Xtr, "Ytr": Ytr, "Xval": Xval, "Yval": Yval, "Xte": Xte, "Yte": Yte},
+                    str(results_dir),
+                    tag="rgan",
+                )
+
+                log_step(
+                    f"R-GAN training completed. Train RMSE={rgan_result['train_stats'].get('rmse', 'N/A')}, "
+                    f"Test RMSE={rgan_result['test_stats'].get('rmse', 'N/A')}"
+                )
+                _save_model("rgan_generator", rgan_result["G"])
+                _save_model("rgan_discriminator", rgan_result["D"])
+                if rgan_result.get("G_ema"):
+                    _save_model("rgan_generator_ema", rgan_result["G_ema"])
+                log_step(f"Saved RGAN models to: {models_dir}")
+                _save_stage_artifact_cache(
+                    resume_manifest,
+                    "rgan",
+                    {
+                        "history": rgan_result["history"],
+                        "train_stats": rgan_result["train_stats"],
+                        "test_stats": rgan_result["test_stats"],
+                        "pred_train": rgan_result.get("pred_train"),
+                        "pred_test": rgan_result["pred_test"],
+                    },
+                    results_dir=results_dir,
+                    resume_store=resume_store,
+                    artifacts=[
+                        "models/rgan_generator.pt",
+                        "models/rgan_discriminator.pt",
+                    ] + (["models/rgan_generator_ema.pt"] if rgan_result.get("G_ema") else []),
+                    metadata={
+                        "checkpoint_epoch": int(max(rgan_result["history"].get("epoch", [0]) or [0])),
+                        "target_epochs": args.epochs,
+                    },
+                )
+                stage_changed["rgan"] = True
+                return rgan_result
+
+        with log_phase(console, "Load R-GAN from prior results"):
+            pt_path = _prior_dir / "models" / "rgan_generator.pt"
+            log_step(f"Loading RGAN generator from: {pt_path}")
+            raw_generator_state = torch.load(pt_path, map_location=_load_device, weights_only=True)
+            G.load_state_dict(raw_generator_state)
+            G.eval()
+            _save_model_state_dict("rgan_generator", raw_generator_state)
+
+            disc_path = _prior_dir / "models" / "rgan_discriminator.pt"
+            if disc_path.exists():
+                disc_state = torch.load(disc_path, map_location=_load_device, weights_only=True)
+                D.load_state_dict(disc_state)
+                _save_model_state_dict("rgan_discriminator", disc_state)
+            else:
+                log_warn("Prior results do not include rgan_discriminator.pt; skipping discriminator artifact copy.")
+
+            G_ema = None
+            ema_path = _prior_dir / "models" / "rgan_generator_ema.pt"
+            if ema_path.exists():
+                try:
+                    import copy
+                    G_ema = copy.deepcopy(G)
+                    ema_state = torch.load(ema_path, map_location=_load_device, weights_only=True)
+                    G_ema.load_state_dict(ema_state)
+                    _save_model_state_dict("rgan_generator_ema", ema_state)
+                    log_step("Loaded real EMA checkpoint from prior results.")
+                except Exception as e:
+                    log_step(f"WARNING: Could not load EMA checkpoint ({e}); skipping EMA artifact.")
+                    G_ema = None
+
+            rgan_eval_model = select_eval_generator_backend(G, G_ema)
+            _, rgan_train_pred_loaded = compute_metrics_backend(rgan_eval_model, Xtr, Ytr)
+            _, rgan_test_pred_loaded = compute_metrics_backend(rgan_eval_model, Xte, Yte)
+            rgan_result = {
+                "G": G,
+                "D": D,
+                "G_ema": G_ema,
+                "history": {
+                    "epoch": [],
+                    "train_rmse": [],
+                    "test_rmse": [],
+                    "val_rmse": [],
+                    "D_loss": [],
+                    "G_loss": [],
+                },
+                "train_stats": error_stats(Ytr.reshape(-1), rgan_train_pred_loaded.reshape(-1)),
+                "test_stats": error_stats(Yte.reshape(-1), rgan_test_pred_loaded.reshape(-1)),
+                "pred_train": rgan_train_pred_loaded,
+                "pred_test": rgan_test_pred_loaded,
+            }
+            log_step(f"RGAN loaded. Test RMSE={rgan_result['test_stats'].get('rmse', 'N/A')}")
+            _save_stage_artifact_cache(
+                resume_manifest,
+                "rgan",
+                {
+                    "history": rgan_result["history"],
+                    "train_stats": rgan_result["train_stats"],
+                    "test_stats": rgan_result["test_stats"],
+                    "pred_train": rgan_result.get("pred_train"),
+                    "pred_test": rgan_result["pred_test"],
+                },
+                results_dir=results_dir,
+                resume_store=resume_store,
+                artifacts=[
+                    "models/rgan_generator.pt",
+                    "models/rgan_discriminator.pt",
+                ] + (["models/rgan_generator_ema.pt"] if G_ema is not None else []),
+                metadata={"loaded_from_prior_results": True, "target_epochs": args.epochs},
+            )
+            stage_changed["rgan"] = True
+            return rgan_result
+
+    if standalone_rgan_only:
+        rgan_out = _train_or_load_rgan()
+        rgan_architecture = {
+            "generator": describe_model(G),
+            "discriminator": describe_model(D),
+        }
+        env_info = _collect_environment_info(args.seed)
+        skipped_models = {
+            "lstm": _make_skipped_model(),
+            "dlinear": _make_skipped_model(),
+            "nlinear": _make_skipped_model(),
+            "fits": _make_skipped_model(),
+            "patchtst": _make_skipped_model(),
+            "itransformer": _make_skipped_model(),
+            "autoformer": _make_skipped_model(),
+            "informer": _make_skipped_model(),
+            "naive_baseline": _make_skipped_model(),
+            "arima": _make_skipped_model(),
+            "arma": _make_skipped_model(),
+            "tree_ensemble": _make_skipped_model(),
+        }
+        metrics = dict(
+            dataset=args.csv,
+            tuning_dataset=used_tune,
+            time_col_used=time_used,
+            target_col=target_col,
+            L=args.L,
+            H=args.H,
+            train_size=int(prep["split"]),
+            test_size=len(prep["test_df"]),
+            num_train_windows=int(Xfull_tr.shape[0]),
+            num_test_windows=int(Xte.shape[0]),
+            noise_robustness=[],
+            rgan=dict(
+                train=rgan_out["train_stats"],
+                test=rgan_out["test_stats"],
+                history=rgan_out["history"],
+                architecture=rgan_architecture,
+                config=dict(
+                    n_in=int(Xtr.shape[-1]),
+                    units_g=base_config.units_g,
+                    units_d=base_config.units_d,
+                    lambda_reg=base_config.lambda_reg,
+                    lrG=base_config.lr_g,
+                    lrD=base_config.lr_d,
+                    dropout=base_config.dropout,
+                    g_layers=base_config.g_layers,
+                    d_layers=base_config.d_layers,
+                    g_dense=(g_dense_act if g_dense_act else "linear"),
+                    g_dense_activation=(g_dense_act if g_dense_act else "linear"),
+                    d_activation=base_config.d_activation or "sigmoid",
+                    gan_variant=base_config.gan_variant,
+                    d_steps=base_config.d_steps,
+                    g_steps=base_config.g_steps,
+                    wgan_gp_lambda=base_config.wgan_gp_lambda,
+                    wgan_clip_value=base_config.wgan_clip_value,
+                    use_logits=base_config.use_logits,
+                    amp=base_config.amp,
+                    device=base_config.device,
+                    noise_dim=base_config.noise_dim,
+                    lambda_diversity=base_config.lambda_diversity,
+                    preload_to_device=base_config.preload_to_device,
+                    compile_mode=base_config.compile_mode,
+                    critic_reg_interval=base_config.critic_reg_interval,
+                    critic_arch=base_config.critic_arch,
+                ),
+            ),
+            charts=dict(
+                training_curves_overlay="",
+                training_curves_overlay_interactive="",
+                ranked_model_bars="",
+                ranked_model_bars_interactive="",
+                noise_robustness_heatmap="",
+                noise_robustness_heatmap_interactive="",
+                multi_metric_radar="",
+                multi_metric_radar_interactive="",
+            ),
+            classical={"skipped": True, "reason": "standalone_rgan_only"},
+            advanced_metrics={},
+            statistical_tests=dict(diebold_mariano={}),
+            tuning=dict(
+                enabled=bool(args.tune),
+                dataset=used_tune,
+                best=best_hp or {},
+            ),
+            environment=env_info,
+            scaling={"target_mean": float(target_mean), "target_std": float(target_std)},
+            created=datetime.now(timezone.utc).isoformat(),
+            mode={"standalone_rgan_only": True},
+            **skipped_models,
+        )
+
+        _save_json_artifact(metrics, "metrics.json", results_dir, resume_store)
+
+        total_elapsed = time.time() - run_start_time
+        summary = {
+            "dataset": args.csv,
+            "target": target_col,
+            "results_dir": str(results_dir.resolve()),
+            "elapsed_seconds": round(total_elapsed, 1),
+            "epochs": args.epochs,
+            "leaderboard": [
+                {
+                    "rank": 1,
+                    "model": "RGAN",
+                    "test_rmse_orig": rgan_out["test_stats"].get(
+                        "rmse_orig",
+                        rgan_out["test_stats"].get("rmse"),
+                    ),
+                }
+            ],
+            "best_model": "RGAN",
+            "best_rmse": rgan_out["test_stats"].get("rmse_orig", rgan_out["test_stats"].get("rmse")),
+            "completed_at": datetime.now().isoformat(),
+            "num_models_trained": 1,
+            "models_saved": [f.name for f in (results_dir / "models").glob("*.pt")],
+            "mode": "standalone_rgan_only",
+        }
+        _save_json_artifact(summary, "run_summary.json", results_dir, resume_store)
+        _save_stage_artifact_cache(
+            resume_manifest,
+            "reporting",
+            {
+                "mode": "standalone_rgan_only",
+                "metrics": metrics,
+                "summary": summary,
+            },
+            results_dir=results_dir,
+            resume_store=resume_store,
+            artifacts=["metrics.json", "run_summary.json"],
+            metadata={"standalone_rgan_only": True, "target_epochs": args.epochs},
+        )
+
+        log_info("Standalone RGAN-only run complete.")
+        log_info(f"Results saved to: {results_dir.resolve()}")
+        close_log_file()
+        return
+
+    # ── Launch classical baselines on CPU in background while GPU trains ──
     _classical_results = {}  # filled by background thread
 
     def _run_classical_baselines():
@@ -906,6 +1788,8 @@ def main():
         try:
             import matplotlib
             matplotlib.use("Agg")  # non-interactive backend safe for background threads
+            _mark_stage(resume_manifest, "classical_baselines", status="running")
+            _write_resume_manifest(resume_manifest, results_dir, resume_store)
             log_info("BACKGROUND: Starting classical baselines on CPU (parallel with GPU training)")
 
             # Naive baseline (always runs)
@@ -924,16 +1808,10 @@ def main():
                 original_mean=target_mean, original_std=target_std,
                 training_series=training_series_scaled, training_series_orig=training_series_orig,
             )
-            naive_curve_bg = plot_constant_train_test(
-                naive_train_stats_bg["rmse"], naive_test_stats_bg["rmse"],
-                "Naïve Baseline: Error vs Epochs",
-                results_dir / "naive_train_test_rmse_vs_epochs.png",
-            )
             _classical_results["naive_train_pred"] = naive_train_pred_bg
             _classical_results["naive_test_pred"] = naive_test_pred_bg
             _classical_results["naive_train_stats"] = naive_train_stats_bg
             _classical_results["naive_test_stats"] = naive_test_stats_bg
-            _classical_results["naive_curve_artifacts"] = naive_curve_bg
             log_step(f"BACKGROUND: Naive done. Test RMSE={naive_test_stats_bg.get('rmse', 'N/A')}")
 
             if args.skip_classical:
@@ -959,14 +1837,8 @@ def main():
                 original_mean=target_mean, original_std=target_std,
                 training_series=training_series_scaled, training_series_orig=training_series_orig,
             )
-            arima_curve_bg = plot_constant_train_test(
-                arima_train_stats_bg["rmse"], arima_test_stats_bg["rmse"],
-                "ARIMA: Error vs Epochs",
-                results_dir / "arima_train_test_rmse_vs_epochs.png",
-            )
             _classical_results["arima_train_stats"] = arima_train_stats_bg
             _classical_results["arima_test_stats"] = arima_test_stats_bg
-            _classical_results["arima_curve_artifacts"] = arima_curve_bg
             _classical_results["arima_test_pred"] = arima_test_pred_bg
             log_step(f"BACKGROUND: ARIMA done. Test RMSE={arima_test_stats_bg.get('rmse', 'N/A')}")
 
@@ -986,14 +1858,8 @@ def main():
                 original_mean=target_mean, original_std=target_std,
                 training_series=training_series_scaled, training_series_orig=training_series_orig,
             )
-            arma_curve_bg = plot_constant_train_test(
-                arma_train_stats_bg["rmse"], arma_test_stats_bg["rmse"],
-                "ARMA: Error vs Epochs",
-                results_dir / "arma_train_test_rmse_vs_epochs.png",
-            )
             _classical_results["arma_train_stats"] = arma_train_stats_bg
             _classical_results["arma_test_stats"] = arma_test_stats_bg
-            _classical_results["arma_curve_artifacts"] = arma_curve_bg
             _classical_results["arma_test_pred"] = arma_test_pred_bg
             log_step(f"BACKGROUND: ARMA done. Test RMSE={arma_test_stats_bg.get('rmse', 'N/A')}")
 
@@ -1017,14 +1883,8 @@ def main():
                 original_mean=target_mean, original_std=target_std,
                 training_series=training_series_scaled, training_series_orig=training_series_orig,
             )
-            tree_curve_bg = plot_constant_train_test(
-                tree_train_stats_bg["rmse"], tree_test_stats_bg["rmse"],
-                "Tree Ensemble: Error vs Epochs",
-                results_dir / "tree_ensemble_train_test_rmse_vs_epochs.png",
-            )
             _classical_results["tree_train_stats"] = tree_train_stats_bg
             _classical_results["tree_test_stats"] = tree_test_stats_bg
-            _classical_results["tree_curve_artifacts"] = tree_curve_bg
             _classical_results["tree_test_pred"] = tree_test_pred_bg
             _classical_results["tree_model"] = tree_model_bg
             _classical_results["tree_config"] = {
@@ -1037,6 +1897,7 @@ def main():
                 "random_state": args.seed,
             }
             log_step(f"BACKGROUND: Tree Ensemble done. Test RMSE={tree_test_stats_bg.get('rmse', 'N/A')}")
+            _save_tree_model_artifact(tree_model_bg)
 
             log_info("BACKGROUND: All classical baselines completed.")
 
@@ -1047,37 +1908,64 @@ def main():
                 with open(_cache_path, "wb") as _f:
                     pickle.dump(dict(_classical_results), _f, protocol=pickle.HIGHEST_PROTOCOL)
                 log_info(f"BACKGROUND: Classical baselines cached to {_cache_path}")
+                _sync_artifact_to_resume_store("classical_baselines_cache.pkl", results_dir, resume_store)
             except Exception as _save_exc:
                 log_error(f"BACKGROUND: Failed to cache classical baselines — {_save_exc}")
+
+            _save_stage_artifact_cache(
+                resume_manifest,
+                "classical_baselines",
+                {
+                    "naive_train_pred": _classical_results.get("naive_train_pred"),
+                    "naive_test_pred": _classical_results.get("naive_test_pred"),
+                    "naive_train_stats": _classical_results.get("naive_train_stats"),
+                    "naive_test_stats": _classical_results.get("naive_test_stats"),
+                    "arima_train_stats": _classical_results.get("arima_train_stats"),
+                    "arima_test_stats": _classical_results.get("arima_test_stats"),
+                    "arima_test_pred": _classical_results.get("arima_test_pred"),
+                    "arma_train_stats": _classical_results.get("arma_train_stats"),
+                    "arma_test_stats": _classical_results.get("arma_test_stats"),
+                    "arma_test_pred": _classical_results.get("arma_test_pred"),
+                    "tree_train_stats": _classical_results.get("tree_train_stats"),
+                    "tree_test_stats": _classical_results.get("tree_test_stats"),
+                    "tree_test_pred": _classical_results.get("tree_test_pred"),
+                    "tree_config": _classical_results.get("tree_config", {}),
+                    "skip_classical": _classical_results.get("skip_classical", False),
+                },
+                results_dir=results_dir,
+                resume_store=resume_store,
+                artifacts=(
+                    ["models/tree_ensemble.joblib"] if "tree_model" in _classical_results else []
+                ) + (
+                    ["classical_baselines_cache.pkl"] if _cache_path.exists() else []
+                ),
+            )
+            stage_changed["classical_baselines"] = True
 
         except Exception as exc:
             log_error(f"BACKGROUND: Classical baselines FAILED — {type(exc).__name__}: {exc}")
             _classical_results["error"] = exc
+            _mark_stage(
+                resume_manifest,
+                "classical_baselines",
+                status="failed",
+                metadata={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            _write_resume_manifest(resume_manifest, results_dir, resume_store)
 
     # ── Try to load cached classical baselines (saves ~64 min on resume) ──
     _classical_cache_loaded = False
-    _cache_search_dirs = [results_dir]
-    if args.resume_from:
-        # resume_from points to a checkpoint file; baselines cache lives in the results dir
-        _resume_dir = Path(args.resume_from).parent
-        _cache_search_dirs.insert(0, _resume_dir)
-        # Also check one level up (checkpoint might be in a subdirectory)
-        _cache_search_dirs.insert(1, _resume_dir.parent)
-    if base_config.checkpoint_dir:
-        _cache_search_dirs.insert(0, Path(base_config.checkpoint_dir))
-
-    for _search_dir in _cache_search_dirs:
-        _cache_file = _search_dir / "classical_baselines_cache.pkl"
-        if _cache_file.exists():
-            try:
-                import pickle
-                with open(_cache_file, "rb") as _f:
-                    _classical_results = pickle.load(_f)
-                log_info(f"Loaded cached classical baselines from {_cache_file} — skipping recomputation")
-                _classical_cache_loaded = True
-                break
-            except Exception as _load_exc:
-                log_error(f"Failed to load classical baselines cache from {_cache_file} — {_load_exc}")
+    if _stage_completed(resume_manifest, "classical_baselines", resume_store):
+        try:
+            cached_classical = _load_stage_cache(resume_store, "classical_baselines")
+            _classical_results = dict(cached_classical)
+            if (resume_models_dir / "tree_ensemble.joblib").exists():
+                _classical_results["tree_model"] = _load_tree_model_artifact()
+            _restore_stage_artifacts(resume_manifest["stages"]["classical_baselines"], resume_store, results_dir)
+            log_info("Loaded cached classical baselines from resume store — skipping recomputation")
+            _classical_cache_loaded = True
+        except Exception as _load_exc:
+            log_error(f"Failed to load cached classical baselines from resume store — {_load_exc}")
 
     if _classical_cache_loaded:
         # Create a no-op thread that's already "done" so the join() later works
@@ -1106,10 +1994,7 @@ def main():
         "informer":     (Informer,           {"L": base_config.L, "H": base_config.H}, "informer.pt"),
     }
 
-    preferred = base_config.device
-    if preferred == "auto":
-        preferred = "cuda" if torch.cuda.is_available() else "cpu"
-    _load_device = torch.device(preferred)
+    _load_device = torch.device("cpu")
 
     def _load_or_skip(model_name):
         """Load a skipped model from prior results. Returns *_out dict."""
@@ -1118,45 +2003,24 @@ def main():
         return _load_prior_model_and_predict(cls, kwargs, pt_file, data_dict, _load_device)
 
     # ── Train or load RGAN ──
-    if _should_train("rgan"):
-        with log_phase(console, "Train R-GAN (PyTorch)"):
-            log_step("Calling train_rgan_backend...")
-            rgan_out = train_rgan_backend(
-                base_config,
-                (G,D),
-                {"Xtr": Xtr,"Ytr": Ytr,"Xval": Xval,"Yval": Yval,"Xte": Xte,"Yte": Yte},
-                str(results_dir),
-                tag="rgan"
-            )
-
-            log_step(f"R-GAN training completed. Train RMSE={rgan_out['train_stats'].get('rmse', 'N/A')}, Test RMSE={rgan_out['test_stats'].get('rmse', 'N/A')}")
-            _save_model("rgan_generator", rgan_out["G"])
-            _save_model("rgan_discriminator", rgan_out["D"])
-            if rgan_out.get("G_ema"):
-                _save_model("rgan_generator_ema", rgan_out["G_ema"])
-            log_step(f"Saved RGAN models to: {models_dir}")
-    else:
-        with log_phase(console, "Load R-GAN from prior results"):
-            pt_path = _prior_dir / "models" / "rgan_generator.pt"
-            log_step(f"Loading RGAN generator from: {pt_path}")
-            G.load_state_dict(torch.load(pt_path, map_location=_load_device, weights_only=True))
-            G.eval()
-            _, rgan_train_pred_loaded = compute_metrics_backend(G, Xtr, Ytr)
-            _, rgan_test_pred_loaded = compute_metrics_backend(G, Xte, Yte)
-            rgan_out = {
-                "G": G, "D": D,
-                "history": {"epoch": [], "train_rmse": [], "test_rmse": [], "val_rmse": [], "D_loss": [], "G_loss": []},
-                "train_stats": error_stats(Ytr.reshape(-1), rgan_train_pred_loaded.reshape(-1)),
-                "test_stats": error_stats(Yte.reshape(-1), rgan_test_pred_loaded.reshape(-1)),
-                "pred_test": rgan_test_pred_loaded,
-            }
-            if (_prior_dir / "models" / "rgan_generator_ema.pt").exists():
-                _save_model("rgan_generator_ema", G)  # copy for consistency
-            log_step(f"RGAN loaded. Test RMSE={rgan_out['test_stats'].get('rmse', 'N/A')}")
+    rgan_out = _train_or_load_rgan()
 
     # ── Train or load LSTM ──
-    if _should_train("lstm"):
+    if _stage_completed(resume_manifest, "lstm", resume_store):
+        with log_phase(console, "Load cached LSTM baseline"):
+            from rgan.lstm_supervised_torch import LSTMSupervised
+            lstm_out = _load_cached_model_stage(
+                "lstm",
+                LSTMSupervised,
+                {"L": base_config.L, "H": base_config.H, "n_in": Xtr.shape[-1], "units": base_config.units_g},
+                "lstm.pt",
+                _load_device,
+            )
+            log_step(f"LSTM cache loaded. Test RMSE={lstm_out['test_stats'].get('rmse', 'N/A')}")
+    elif _should_train("lstm"):
         with log_phase(console, "Train supervised LSTM baseline"):
+            _mark_stage(resume_manifest, "lstm", status="running")
+            _write_resume_manifest(resume_manifest, results_dir, resume_store)
             log_step("Calling train_lstm_backend...")
             lstm_out = train_lstm_backend(
                 base_config,
@@ -1166,10 +2030,17 @@ def main():
             )
             log_step(f"LSTM training completed. Train RMSE={lstm_out['train_stats'].get('rmse', 'N/A')}, Test RMSE={lstm_out['test_stats'].get('rmse', 'N/A')}")
             _save_model("lstm", lstm_out["model"])
+            _save_model_stage_cache("lstm", lstm_out, "lstm.pt")
+            stage_changed["lstm"] = True
     else:
         with log_phase(console, "Load LSTM from prior results"):
+            _mark_stage(resume_manifest, "lstm", status="running")
+            _write_resume_manifest(resume_manifest, results_dir, resume_store)
             from rgan.lstm_supervised_torch import LSTMSupervised
             lstm_out = _load_prior_model_and_predict(LSTMSupervised, {"L": base_config.L, "H": base_config.H, "n_in": Xtr.shape[-1], "units": base_config.units_g}, "lstm.pt", {"Xtr": Xtr, "Ytr": Ytr, "Xte": Xte, "Yte": Yte}, _load_device)
+            _save_model("lstm", lstm_out["model"])
+            _save_model_stage_cache("lstm", lstm_out, "lstm.pt")
+            stage_changed["lstm"] = True
             log_step(f"LSTM loaded. Test RMSE={lstm_out['test_stats'].get('rmse', 'N/A')}")
 
     data_dict = {"Xtr": Xtr, "Ytr": Ytr, "Xval": Xval, "Yval": Yval, "Xte": Xte, "Yte": Yte}
@@ -1185,14 +2056,28 @@ def main():
         ("autoformer",   lambda: train_autoformer(base_config, data_dict, str(results_dir), tag="Autoformer"),                           None, "Autoformer",   "autoformer"),
         ("informer",     lambda: train_informer(base_config, data_dict, str(results_dir), tag="Informer"),                               None, "Informer",     "informer"),
     ]:
-        if _should_train(_mname):
+        if _stage_completed(resume_manifest, _mname, resume_store):
+            with log_phase(console, f"Load cached {_label} baseline"):
+                _cls, _kwargs, _filename = _MODEL_REGISTRY[_mname]
+                _out = _load_cached_model_stage(_mname, _cls, _kwargs, _filename, _load_device)
+                log_step(f"{_label} cache loaded. Test RMSE={_out['test_stats'].get('rmse', 'N/A')}")
+        elif _should_train(_mname):
             with log_phase(console, f"Train {_label} baseline"):
+                _mark_stage(resume_manifest, _mname, status="running")
+                _write_resume_manifest(resume_manifest, results_dir, resume_store)
                 _out = _train_fn()
                 log_step(f"{_label} done. Test RMSE={_out['test_stats'].get('rmse', 'N/A')}")
                 _save_model(_pt_name, _out["model"])
+                _save_model_stage_cache(_mname, _out, f"{_pt_name}.pt")
+                stage_changed[_mname] = True
         else:
             with log_phase(console, f"Load {_label} from prior results"):
+                _mark_stage(resume_manifest, _mname, status="running")
+                _write_resume_manifest(resume_manifest, results_dir, resume_store)
                 _out = _load_or_skip(_mname)
+                _save_model(_pt_name, _out["model"])
+                _save_model_stage_cache(_mname, _out, f"{_pt_name}.pt")
+                stage_changed[_mname] = True
                 log_step(f"{_label} loaded. Test RMSE={_out['test_stats'].get('rmse', 'N/A')}")
         # Assign to the expected variable names
         if _mname == "dlinear":      dlinear_out = _out
@@ -1205,69 +2090,16 @@ def main():
 
     log_step(f"All model weights saved to: {models_dir}")
 
-    rgan_curve_artifacts = plot_single_train_test(
-        rgan_out["history"]["epoch"],
-        rgan_out["history"]["train_rmse"],
-        rgan_out["history"]["test_rmse"],
-        "RGAN: Error vs Epochs",
-        results_dir / "rgan_train_test_rmse_vs_epochs.png",
-    )
-    lstm_curve_artifacts = plot_single_train_test(
-        lstm_out["history"]["epoch"],
-        lstm_out["history"]["train_rmse"],
-        lstm_out["history"]["test_rmse"],
-        "LSTM (Supervised): Error vs Epochs",
-        results_dir / "lstm_train_test_rmse_vs_epochs.png",
-    )
-    dlinear_curve_artifacts = plot_single_train_test(
-        dlinear_out["history"]["epoch"],
-        dlinear_out["history"]["train_rmse"],
-        dlinear_out["history"]["test_rmse"],
-        "DLinear: Error vs Epochs",
-        results_dir / "dlinear_train_test_rmse_vs_epochs.png",
-    )
-    nlinear_curve_artifacts = plot_single_train_test(
-        nlinear_out["history"]["epoch"],
-        nlinear_out["history"]["train_rmse"],
-        nlinear_out["history"]["test_rmse"],
-        "NLinear: Error vs Epochs",
-        results_dir / "nlinear_train_test_rmse_vs_epochs.png",
-    )
-    fits_curve_artifacts = plot_single_train_test(
-        fits_out["history"]["epoch"],
-        fits_out["history"]["train_rmse"],
-        fits_out["history"]["test_rmse"],
-        "FITS: Error vs Epochs",
-        results_dir / "fits_train_test_rmse_vs_epochs.png",
-    )
-    patchtst_curve_artifacts = plot_single_train_test(
-        patchtst_out["history"]["epoch"],
-        patchtst_out["history"]["train_rmse"],
-        patchtst_out["history"]["test_rmse"],
-        "PatchTST: Error vs Epochs",
-        results_dir / "patchtst_train_test_rmse_vs_epochs.png",
-    )
-    itransformer_curve_artifacts = plot_single_train_test(
-        itransformer_out["history"]["epoch"],
-        itransformer_out["history"]["train_rmse"],
-        itransformer_out["history"]["test_rmse"],
-        "iTransformer: Error vs Epochs",
-        results_dir / "itransformer_train_test_rmse_vs_epochs.png",
-    )
-    autoformer_curve_artifacts = plot_single_train_test(
-        autoformer_out["history"]["epoch"],
-        autoformer_out["history"]["train_rmse"],
-        autoformer_out["history"]["test_rmse"],
-        "Autoformer: Error vs Epochs",
-        results_dir / "autoformer_train_test_rmse_vs_epochs.png",
-    )
-    informer_curve_artifacts = plot_single_train_test(
-        informer_out["history"]["epoch"],
-        informer_out["history"]["train_rmse"],
-        informer_out["history"]["test_rmse"],
-        "Informer: Error vs Epochs",
-        results_dir / "informer_train_test_rmse_vs_epochs.png",
-    )
+    # Build model histories for overlay chart (neural models only — classical added after thread join)
+    _model_histories = {}
+    for _name, _out in [
+        ("RGAN", rgan_out), ("LSTM", lstm_out), ("DLinear", dlinear_out),
+        ("NLinear", nlinear_out), ("FITS", fits_out), ("PatchTST", patchtst_out),
+        ("iTransformer", itransformer_out), ("Autoformer", autoformer_out),
+        ("Informer", informer_out),
+    ]:
+        if _out and "history" in _out:
+            _model_histories[_name] = _out["history"]
 
     def _blank_stats() -> Dict[str, float]:
         nan_keys = [
@@ -1301,30 +2133,54 @@ def main():
         return {k: float("nan") for k in nan_keys}
 
     # ── Wait for classical baselines background thread to finish ────────
+    _CLASSICAL_TIMEOUT = 7200  # 2 hours max
     with log_phase(console, "Wait for classical baselines (background thread)"):
-        classical_thread.join()
+        classical_thread.join(timeout=_CLASSICAL_TIMEOUT)
+        if classical_thread.is_alive():
+            log_error(f"Classical baselines thread still running after {_CLASSICAL_TIMEOUT}s — possible hang in ARIMA/ARMA fit()")
+            log_error("Continuing without classical results to avoid blocking the pipeline")
+            _classical_results.setdefault("error", TimeoutError(f"Classical baselines exceeded {_CLASSICAL_TIMEOUT}s timeout"))
         if "error" in _classical_results:
-            raise _classical_results["error"]
-        log_info("Classical baselines background thread completed successfully.")
+            log_error(f"Classical baselines error: {_classical_results['error']}")
+            log_warn("Proceeding with blank classical baseline stats")
+        else:
+            log_info("Classical baselines background thread completed successfully.")
 
-    # Extract results from background thread
-    naive_train_stats = _classical_results["naive_train_stats"]
-    naive_test_stats = _classical_results["naive_test_stats"]
-    naive_curve_artifacts = _classical_results["naive_curve_artifacts"]
+    # Classical baselines (single-value RMSE, shown as hlines on overlay)
+    _classical_baselines = {}
+    if "naive_test_stats" in _classical_results:
+        _classical_baselines["Naive"] = _classical_results["naive_test_stats"].get("rmse")
+    if "arima_test_stats" in _classical_results:
+        _classical_baselines["ARIMA"] = _classical_results["arima_test_stats"].get("rmse")
+    if "arma_test_stats" in _classical_results:
+        _classical_baselines["ARMA"] = _classical_results["arma_test_stats"].get("rmse")
+    if "tree_test_stats" in _classical_results:
+        _classical_baselines["Tree Ensemble"] = _classical_results["tree_test_stats"].get("rmse")
 
+    log_info("Generating plot: training_curves_overlay...")
+    _plot_t0 = time.perf_counter()
+    overlay_artifacts = plot_training_curves_overlay(
+        _model_histories, _classical_baselines,
+        str(results_dir / "training_curves_overlay"),
+        metric="val_rmse",
+        ylabel="Validation RMSE",
+    )
+    log_step(f"Training curves overlay: {overlay_artifacts.get('static', '')} ({time.perf_counter()-_plot_t0:.1f}s)")
+
+    # Extract results from background thread (guarded for timeout/error case)
+    _classical_failed = "error" in _classical_results
+    naive_train_stats = _classical_results.get("naive_train_stats", _blank_stats())
+    naive_test_stats = _classical_results.get("naive_test_stats", _blank_stats())
     # Extract prediction arrays (needed for plots and Diebold-Mariano tests)
     naive_test_pred = _classical_results.get("naive_test_pred")
 
-    if _classical_results.get("skip_classical", False):
+    if _classical_failed or _classical_results.get("skip_classical", False):
         arima_train_stats = _blank_stats()
         arima_test_stats = _blank_stats()
-        arima_curve_artifacts = {"static": "", "interactive": ""}
         arma_train_stats = _blank_stats()
         arma_test_stats = _blank_stats()
-        arma_curve_artifacts = {"static": "", "interactive": ""}
         tree_train_stats = _blank_stats()
         tree_test_stats = _blank_stats()
-        tree_curve_artifacts = {"static": "", "interactive": ""}
         tree_config = {}
         arima_test_pred = None
         arma_test_pred = None
@@ -1332,24 +2188,23 @@ def main():
     else:
         arima_train_stats = _classical_results["arima_train_stats"]
         arima_test_stats = _classical_results["arima_test_stats"]
-        arima_curve_artifacts = _classical_results["arima_curve_artifacts"]
         arima_test_pred = _classical_results.get("arima_test_pred")
         arma_train_stats = _classical_results["arma_train_stats"]
         arma_test_stats = _classical_results["arma_test_stats"]
-        arma_curve_artifacts = _classical_results["arma_curve_artifacts"]
         arma_test_pred = _classical_results.get("arma_test_pred")
         tree_train_stats = _classical_results["tree_train_stats"]
         tree_test_stats = _classical_results["tree_test_stats"]
-        tree_curve_artifacts = _classical_results["tree_curve_artifacts"]
         tree_test_pred = _classical_results.get("tree_test_pred")
         tree_model = _classical_results.get("tree_model", None)  # may be absent from cache
         tree_config = _classical_results.get("tree_config", {})
 
     # ── Parallel bootstrap uncertainty for all models (train + test) ────
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     log_info("Computing RGAN train predictions for bootstrap...")
-    _, rgan_train_pred = compute_metrics_backend(rgan_out["G"], Xtr, Ytr)
+    rgan_eval_model = select_eval_generator_backend(rgan_out["G"], rgan_out.get("G_ema"))
+    if rgan_out.get("pred_train") is not None:
+        rgan_train_pred = rgan_out["pred_train"]
+    else:
+        _, rgan_train_pred = compute_metrics_backend(rgan_eval_model, Xtr, Ytr)
     log_info("RGAN train predictions computed.")
 
     train_kwargs = dict(
@@ -1384,23 +2239,63 @@ def main():
         ("informer_test", Yte, informer_out["pred_test"], test_kwargs),
     ]
 
-    log_info(f"Starting parallel bootstrap ({len(_bootstrap_jobs)} jobs, {args.bootstrap_samples} samples each)")
-    _bs_t0 = time.perf_counter()
-    _bs_results = {}
-    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-        futures = {
-            pool.submit(summarise_with_uncertainty, yt, yp, **kw): label
-            for label, yt, yp, kw in _bootstrap_jobs
+    # Save core training results early so post-processing failures don't lose them
+    _core_results = {
+        "dataset": args.csv, "L": args.L, "H": args.H, "seed": args.seed,
+        "models": {}
+    }
+    for _name, _out in [("rgan", rgan_out), ("lstm", lstm_out), ("dlinear", dlinear_out),
+                         ("nlinear", nlinear_out), ("fits", fits_out), ("patchtst", patchtst_out),
+                         ("itransformer", itransformer_out), ("autoformer", autoformer_out),
+                         ("informer", informer_out)]:
+        _core_results["models"][_name] = {
+            "train_rmse": _out.get("train_stats", {}).get("rmse"),
+            "test_rmse": _out.get("test_stats", {}).get("rmse"),
         }
-        for future in as_completed(futures):
-            label = futures[future]
-            try:
-                _bs_results[label] = future.result()
-                log_info(f"  Bootstrap done: {label} (RMSE={_bs_results[label].get('rmse', 'N/A'):.6f})")
-            except Exception as exc:
-                log_error(f"  Bootstrap FAILED: {label} — {type(exc).__name__}: {exc}")
-                raise
-    log_info(f"All bootstrap jobs completed in {time.perf_counter() - _bs_t0:.1f}s")
+    try:
+        with open(results_dir / "core_results.json", "w") as _cf:
+            json.dump(_core_results, _cf, indent=2, default=str)
+        _sync_artifact_to_resume_store("core_results.json", results_dir, resume_store)
+        log_info("Saved core_results.json (pre-bootstrap checkpoint)")
+    except Exception as _ce:
+        log_warn(f"Failed to save core_results.json: {_ce}")
+
+    bootstrap_stage_valid = _stage_completed(resume_manifest, "bootstrap", resume_store)
+    bootstrap_needs_refresh = any(stage_changed[name] for name in (
+        "rgan", "lstm", "dlinear", "nlinear", "fits", "patchtst", "itransformer", "autoformer", "informer"
+    ))
+    if bootstrap_stage_valid and not bootstrap_needs_refresh:
+        log_info("Skipping bootstrap stage on resume; loading cached bootstrap summaries.")
+        _bs_results = _load_stage_cache(resume_store, "bootstrap")
+        _restore_stage_artifacts(resume_manifest["stages"]["bootstrap"], resume_store, results_dir)
+    else:
+        _mark_stage(resume_manifest, "bootstrap", status="running")
+        _write_resume_manifest(resume_manifest, results_dir, resume_store)
+        log_info(f"Starting parallel bootstrap ({len(_bootstrap_jobs)} jobs, {args.bootstrap_samples} samples each)")
+        _bs_t0 = time.perf_counter()
+        _bs_results = {}
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+            futures = {
+                pool.submit(summarise_with_uncertainty, yt, yp, **kw): label
+                for label, yt, yp, kw in _bootstrap_jobs
+            }
+            for future in as_completed(futures):
+                label = futures[future]
+                try:
+                    _bs_results[label] = future.result(timeout=600)  # 10 min per job max
+                    log_info(f"  Bootstrap done: {label} (RMSE={_bs_results[label].get('rmse', 'N/A'):.6f})")
+                except Exception as exc:
+                    log_error(f"  Bootstrap FAILED: {label} — {type(exc).__name__}: {exc}")
+                    raise
+        log_info(f"All bootstrap jobs completed in {time.perf_counter() - _bs_t0:.1f}s")
+        _save_stage_artifact_cache(
+            resume_manifest,
+            "bootstrap",
+            _bs_results,
+            results_dir=results_dir,
+            resume_store=resume_store,
+            artifacts=["core_results.json"],
+        )
 
     rgan_train_stats = _bs_results["rgan_train"]
     rgan_test_stats = _bs_results["rgan_test"]
@@ -1435,171 +2330,215 @@ def main():
     informer_out["train_stats"] = informer_train_stats
     informer_out["test_stats"] = informer_test_stats
 
-    class_curve_artifacts = None
     ets_rmse_full = float("nan")
     arima_rmse_full = float("nan")
 
     # ── Noise robustness across multiple perturbation levels ──────────
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     noise_results = []
-    if args.skip_noise_robustness:
-        noise_levels = np.array([0.0])
-        log_info("Skipping noise robustness evaluation (--skip_noise_robustness)")
+    noise_plot_artifacts = {"static": "", "interactive": ""}
+    noise_heatmap_artifacts = {"static": "", "interactive": ""}
+    noise_stage_valid = _stage_completed(resume_manifest, "noise_robustness", resume_store)
+    noise_needs_refresh = bootstrap_needs_refresh or any(stage_changed[name] for name in (
+        "rgan", "classical_baselines", "lstm", "dlinear", "nlinear", "fits", "patchtst", "itransformer", "autoformer", "informer"
+    ))
+    if noise_stage_valid and not noise_needs_refresh:
+        log_info("Skipping noise robustness stage on resume; loading cached robustness outputs.")
+        noise_cache = _load_stage_cache(resume_store, "noise_robustness")
+        noise_results = noise_cache.get("noise_results", [])
+        noise_plot_artifacts = noise_cache.get("noise_plot_artifacts") or {"static": "", "interactive": ""}
+        noise_heatmap_artifacts = noise_cache.get("noise_heatmap_artifacts") or {"static": "", "interactive": ""}
+        _restore_stage_artifacts(resume_manifest["stages"]["noise_robustness"], resume_store, results_dir)
+    else:
+        _mark_stage(resume_manifest, "noise_robustness", status="running")
+        _write_resume_manifest(resume_manifest, results_dir, resume_store)
 
-    log_info(f"Noise robustness: {len(noise_levels)} levels = {noise_levels.tolist()}")
-    log_info(f"  skip_classical={args.skip_classical}, bootstrap_samples={args.bootstrap_samples}")
+        if args.skip_noise_robustness:
+            noise_levels = np.array([0.0])
+            log_info("Skipping noise robustness evaluation (--skip_noise_robustness)")
 
-    def _make_summary_kwargs(seed_offset):
-        return dict(
-            n_bootstrap=args.bootstrap_samples,
-            seed=args.seed + seed_offset,
-            original_mean=target_mean,
-            original_std=target_std,
-            training_series=training_series_scaled,
-            training_series_orig=training_series_orig,
-        )
+        log_info(f"Noise robustness: {len(noise_levels)} levels = {noise_levels.tolist()}")
+        log_info(f"  skip_classical={args.skip_classical}, bootstrap_samples={args.bootstrap_samples}")
 
-    def _gpu_predict(model, Xn):
-        """Run a torch model on noisy input (must be called from main thread)."""
-        model.eval()
-        dev = next(model.parameters()).device
-        with torch.no_grad():
-            return model(torch.from_numpy(Xn).to(dev)).cpu().numpy()
-
-    has_tree = "tree_model" in locals() and tree_model is not None
-    log_info(f"  has_tree={has_tree}")
-
-    rng_noise = np.random.default_rng(args.seed + 2048)
-    for idx, sd in enumerate(noise_levels):
-        noise_t0 = time.perf_counter()
-        log_info(f"NOISE LEVEL {idx+1}/{len(noise_levels)}: sd={sd}")
-
-        if sd == 0.0:
-            log_info("  sd=0 — reusing clean test stats")
-            noise_results.append(
-                {
-                    "sd": float(sd),
-                    "rgan": rgan_test_stats,
-                    "lstm": lstm_test_stats,
-                    "dlinear": dlinear_out["test_stats"],
-                    "nlinear": nlinear_out["test_stats"],
-                    "fits": fits_out["test_stats"],
-                    "patchtst": patchtst_out["test_stats"],
-                    "itransformer": itransformer_out["test_stats"],
-                    "autoformer": autoformer_out["test_stats"],
-                    "informer": informer_out["test_stats"],
-                    "naive_baseline": naive_test_stats,
-                    "arima": arima_test_stats,
-                    "arma": arma_test_stats,
-                    "tree_ensemble": tree_test_stats,
-                }
+        def _make_summary_kwargs(seed_offset):
+            return dict(
+                n_bootstrap=args.bootstrap_samples,
+                seed=args.seed + seed_offset,
+                original_mean=target_mean,
+                original_std=target_std,
+                training_series=training_series_scaled,
+                training_series_orig=training_series_orig,
             )
-            continue
 
-        log_info(f"  Generating noise perturbation (shape={Xte.shape})...")
-        perturbation = rng_noise.normal(0, sd, size=Xte.shape).astype(Xte.dtype)
-        Xte_noisy = Xte + perturbation
+        def _gpu_predict(model, Xn):
+            """Run a torch model on noisy input (must be called from main thread)."""
+            model.eval()
+            dev = next(model.parameters()).device
+            with torch.no_grad():
+                return model(torch.from_numpy(Xn).to(dev)).cpu().numpy()
 
-        # Phase 1: GPU inference (sequential — single GPU, fast)
-        log_info("  Phase 1: GPU inference on noisy inputs...")
-        _gpu_t0 = time.perf_counter()
+        has_tree = "tree_model" in locals() and tree_model is not None
+        log_info(f"  has_tree={has_tree}")
 
-        log_info("    Predicting: RGAN...")
-        _, rgan_noise_pred = compute_metrics_backend(rgan_out["G"], Xte_noisy, Yte)
-        log_info("    Predicting: LSTM...")
-        lstm_noise_pred = _gpu_predict(lstm_out["model"], Xte_noisy)
-        log_info("    Predicting: DLinear...")
-        dlinear_noise_pred = _gpu_predict(dlinear_out["model"], Xte_noisy)
-        log_info("    Predicting: NLinear...")
-        nlinear_noise_pred = _gpu_predict(nlinear_out["model"], Xte_noisy)
-        log_info("    Predicting: FITS...")
-        fits_noise_pred = _gpu_predict(fits_out["model"], Xte_noisy)
-        log_info("    Predicting: PatchTST...")
-        patchtst_noise_pred = _gpu_predict(patchtst_out["model"], Xte_noisy)
-        log_info("    Predicting: iTransformer...")
-        itransformer_noise_pred = _gpu_predict(itransformer_out["model"], Xte_noisy)
-        log_info("    Predicting: Autoformer...")
-        autoformer_noise_pred = _gpu_predict(autoformer_out["model"], Xte_noisy)
-        log_info("    Predicting: Informer...")
-        informer_noise_pred = _gpu_predict(informer_out["model"], Xte_noisy)
-        log_info("    Predicting: Naive baseline...")
-        _, naive_noise_pred = naive_baseline(Xte_noisy, Yte)
+        rng_noise = np.random.default_rng(args.seed + 2048)
+        for idx, sd in enumerate(noise_levels):
+            noise_t0 = time.perf_counter()
+            log_info(f"NOISE LEVEL {idx+1}/{len(noise_levels)}: sd={sd}")
 
-        if not args.skip_classical:
-            log_info("    Predicting: ARIMA (classical, may be slow)...")
-            _, arima_noise_pred = arima_forecast(Xtr, Ytr, Xte_noisy, Yte)
-            log_info("    Predicting: ARMA (classical, may be slow)...")
-            _, arma_noise_pred = arma_forecast(Xtr, Ytr, Xte_noisy, Yte)
+            if sd == 0.0:
+                log_info("  sd=0 — reusing clean test stats")
+                noise_results.append(
+                    {
+                        "sd": float(sd),
+                        "rgan": rgan_test_stats,
+                        "lstm": lstm_test_stats,
+                        "dlinear": dlinear_out["test_stats"],
+                        "nlinear": nlinear_out["test_stats"],
+                        "fits": fits_out["test_stats"],
+                        "patchtst": patchtst_out["test_stats"],
+                        "itransformer": itransformer_out["test_stats"],
+                        "autoformer": autoformer_out["test_stats"],
+                        "informer": informer_out["test_stats"],
+                        "naive_baseline": naive_test_stats,
+                        "arima": arima_test_stats,
+                        "arma": arma_test_stats,
+                        "tree_ensemble": tree_test_stats,
+                    }
+                )
+                continue
 
-        if has_tree:
-            log_info("    Predicting: Tree ensemble...")
-            tree_noisy_flat = tree_model.predict(Xte_noisy.reshape(Xte_noisy.shape[0], -1)).astype(np.float32)
-            tree_noise_pred = tree_noisy_flat.reshape(Xte_noisy.shape[0], horizon, 1)
+            log_info(f"  Generating noise perturbation (shape={Xte.shape})...")
+            perturbation = rng_noise.normal(0, sd, size=Xte.shape).astype(Xte.dtype)
+            Xte_noisy = Xte + perturbation
 
-        log_info(f"  Phase 1 done in {time.perf_counter() - _gpu_t0:.1f}s")
+            log_info("  Phase 1: GPU inference on noisy inputs...")
+            _gpu_t0 = time.perf_counter()
 
-        # Phase 2: Bootstrap uncertainty — parallel across all models
-        log_info("  Phase 2: Parallel bootstrap uncertainty...")
-        _bs2_t0 = time.perf_counter()
-        summary_kwargs = _make_summary_kwargs(seed_offset=idx)
-        predictions = {
-            "rgan": rgan_noise_pred,
-            "lstm": lstm_noise_pred,
-            "dlinear": dlinear_noise_pred,
-            "nlinear": nlinear_noise_pred,
-            "fits": fits_noise_pred,
-            "patchtst": patchtst_noise_pred,
-            "itransformer": itransformer_noise_pred,
-            "autoformer": autoformer_noise_pred,
-            "informer": informer_noise_pred,
-            "naive_baseline": naive_noise_pred,
-        }
-        if not args.skip_classical:
-            predictions["arima"] = arima_noise_pred
-            predictions["arma"] = arma_noise_pred
-        if has_tree:
-            predictions["tree_ensemble"] = tree_noise_pred
+            log_info("    Predicting: RGAN...")
+            _, rgan_noise_pred = compute_metrics_backend(rgan_eval_model, Xte_noisy, Yte)
+            log_info("    Predicting: LSTM...")
+            lstm_noise_pred = _gpu_predict(lstm_out["model"], Xte_noisy)
+            log_info("    Predicting: DLinear...")
+            dlinear_noise_pred = _gpu_predict(dlinear_out["model"], Xte_noisy)
+            log_info("    Predicting: NLinear...")
+            nlinear_noise_pred = _gpu_predict(nlinear_out["model"], Xte_noisy)
+            log_info("    Predicting: FITS...")
+            fits_noise_pred = _gpu_predict(fits_out["model"], Xte_noisy)
+            log_info("    Predicting: PatchTST...")
+            patchtst_noise_pred = _gpu_predict(patchtst_out["model"], Xte_noisy)
+            log_info("    Predicting: iTransformer...")
+            itransformer_noise_pred = _gpu_predict(itransformer_out["model"], Xte_noisy)
+            log_info("    Predicting: Autoformer...")
+            autoformer_noise_pred = _gpu_predict(autoformer_out["model"], Xte_noisy)
+            log_info("    Predicting: Informer...")
+            informer_noise_pred = _gpu_predict(informer_out["model"], Xte_noisy)
+            log_info("    Predicting: Naive baseline...")
+            _, naive_noise_pred = naive_baseline(Xte_noisy, Yte)
 
-        summaries = {}
-        with ThreadPoolExecutor(max_workers=min(len(predictions), os.cpu_count() or 4)) as pool:
-            futures = {
-                pool.submit(summarise_with_uncertainty, Yte, pred, **summary_kwargs): name
-                for name, pred in predictions.items()
+            if not args.skip_classical:
+                log_info("    Predicting: ARIMA (classical, may be slow)...")
+                _, arima_noise_pred = arima_forecast(Xtr, Ytr, Xte_noisy, Yte)
+                log_info("    Predicting: ARMA (classical, may be slow)...")
+                _, arma_noise_pred = arma_forecast(Xtr, Ytr, Xte_noisy, Yte)
+
+            if has_tree:
+                log_info("    Predicting: Tree ensemble...")
+                tree_noisy_flat = tree_model.predict(Xte_noisy.reshape(Xte_noisy.shape[0], -1)).astype(np.float32)
+                tree_noise_pred = tree_noisy_flat.reshape(Xte_noisy.shape[0], horizon, 1)
+
+            log_info(f"  Phase 1 done in {time.perf_counter() - _gpu_t0:.1f}s")
+
+            log_info("  Phase 2: Parallel bootstrap uncertainty...")
+            summary_kwargs = _make_summary_kwargs(seed_offset=idx)
+            predictions = {
+                "rgan": rgan_noise_pred,
+                "lstm": lstm_noise_pred,
+                "dlinear": dlinear_noise_pred,
+                "nlinear": nlinear_noise_pred,
+                "fits": fits_noise_pred,
+                "patchtst": patchtst_noise_pred,
+                "itransformer": itransformer_noise_pred,
+                "autoformer": autoformer_noise_pred,
+                "informer": informer_noise_pred,
+                "naive_baseline": naive_noise_pred,
             }
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    summaries[name] = future.result()
-                    log_info(f"    Bootstrap done: {name}")
-                except Exception as exc:
-                    log_error(f"    Bootstrap FAILED: {name} — {type(exc).__name__}: {exc}")
-                    raise
+            if not args.skip_classical:
+                predictions["arima"] = arima_noise_pred
+                predictions["arma"] = arma_noise_pred
+            if has_tree:
+                predictions["tree_ensemble"] = tree_noise_pred
 
-        # Fill in missing keys with blank stats
-        for key in ("arima", "arma", "tree_ensemble"):
-            if key not in summaries:
-                summaries[key] = _blank_stats()
+            summaries = {}
+            with ThreadPoolExecutor(max_workers=min(len(predictions), os.cpu_count() or 4)) as pool:
+                futures = {
+                    pool.submit(summarise_with_uncertainty, Yte, pred, **summary_kwargs): name
+                    for name, pred in predictions.items()
+                }
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        summaries[name] = future.result(timeout=600)
+                        log_info(f"    Bootstrap done: {name}")
+                    except Exception as exc:
+                        log_error(f"    Bootstrap FAILED: {name} — {type(exc).__name__}: {exc}")
+                        raise
 
-        summaries["sd"] = float(sd)
-        log_info(f"  Noise level sd={sd} completed in {time.perf_counter() - noise_t0:.1f}s")
-        noise_results.append(summaries)
+            for key in ("arima", "arma", "tree_ensemble"):
+                if key not in summaries:
+                    summaries[key] = _blank_stats()
 
-    # ── Noise Robustness Summary ──────────────────────────────────────
-    if len(noise_results) > 1:
-        noise_table = create_noise_robustness_table(
-            noise_results, out_path=str(results_dir / "noise_robustness_table.csv"),
+            summaries["sd"] = float(sd)
+            log_info(f"  Noise level sd={sd} completed in {time.perf_counter() - noise_t0:.1f}s")
+            noise_results.append(summaries)
+
+        noise_artifacts = []
+        if len(noise_results) > 1:
+            noise_table = create_noise_robustness_table(
+                noise_results, out_path=str(results_dir / "noise_robustness_table.csv"),
+            )
+            print("\n" + "=" * 80)
+            print("NOISE ROBUSTNESS TABLE (RMSE at each noise level)")
+            print("=" * 80)
+            print(noise_table.to_string(index=False))
+            print("=" * 80)
+
+            log_info("Generating plot: noise_robustness...")
+            _plot_t0 = time.perf_counter()
+            noise_plot_artifacts = plot_noise_robustness(
+                noise_results, str(results_dir / "noise_robustness"),
+            )
+            log_info(f"Plot saved: noise_robustness ({time.perf_counter()-_plot_t0:.1f}s)")
+
+            log_info("Generating plot: noise_robustness_heatmap...")
+            _plot_t0 = time.perf_counter()
+            noise_heatmap_artifacts = plot_noise_robustness_heatmap(
+                noise_results, str(results_dir / "noise_robustness_heatmap"),
+            )
+            log_info(f"Plot saved: noise_robustness_heatmap ({time.perf_counter()-_plot_t0:.1f}s)")
+
+            noise_artifacts = _sync_existing_artifacts(
+                [
+                    "noise_robustness_table.csv",
+                    "noise_robustness.png",
+                    "noise_robustness.html",
+                    "noise_robustness_heatmap.png",
+                    "noise_robustness_heatmap.html",
+                ],
+                results_dir,
+                resume_store,
+            )
+
+        _save_stage_artifact_cache(
+            resume_manifest,
+            "noise_robustness",
+            {
+                "noise_results": noise_results,
+                "noise_plot_artifacts": noise_plot_artifacts,
+                "noise_heatmap_artifacts": noise_heatmap_artifacts,
+            },
+            results_dir=results_dir,
+            resume_store=resume_store,
+            artifacts=noise_artifacts,
         )
-        print("\n" + "=" * 80)
-        print("NOISE ROBUSTNESS TABLE (RMSE at each noise level)")
-        print("=" * 80)
-        print(noise_table.to_string(index=False))
-        print("=" * 80)
-
-        noise_plot_artifacts = plot_noise_robustness(
-            noise_results, str(results_dir / "noise_robustness"),
-        )
-        console.log(f"Noise robustness plot: {noise_plot_artifacts['static']}")
 
     test_errors = {
         "RGAN": rgan_out["test_stats"].get("rmse_orig", rgan_out["test_stats"]["rmse"]),
@@ -1631,12 +2570,29 @@ def main():
         "ARIMA": arima_train_stats.get("rmse_orig", arima_train_stats["rmse"]),
         "ARMA": arma_train_stats.get("rmse_orig", arma_train_stats["rmse"]),
     }
-    model_compare_artifacts = plot_compare_models_bars(
-        train_errors,
-        test_errors,
-        results_dir / "models_test_error.png",
-        results_dir / "models_train_error.png",
+    # Ranked model bars with CI — use full stats dicts (includes bootstrap CI)
+    _test_stats_for_bars = {
+        "RGAN": rgan_out["test_stats"],
+        "LSTM": lstm_out["test_stats"],
+        "DLinear": dlinear_out["test_stats"],
+        "NLinear": nlinear_out["test_stats"],
+        "FITS": fits_out["test_stats"],
+        "PatchTST": patchtst_out["test_stats"],
+        "iTransformer": itransformer_out["test_stats"],
+        "Autoformer": autoformer_out["test_stats"],
+        "Informer": informer_out["test_stats"],
+        "Tree Ensemble": tree_test_stats,
+        "Naive": naive_test_stats,
+        "ARIMA": arima_test_stats,
+        "ARMA": arma_test_stats,
+    }
+    log_info("Generating plot: ranked_model_bars...")
+    _plot_t0 = time.perf_counter()
+    model_compare_artifacts = plot_ranked_model_bars(
+        _test_stats_for_bars,
+        str(results_dir / "ranked_model_bars"),
     )
+    log_info(f"Plot saved: ranked_model_bars ({time.perf_counter()-_plot_t0:.1f}s)")
 
     # Create comprehensive error metrics table
     model_results = {
@@ -1736,9 +2692,18 @@ def main():
             )
     print("="*80)
 
+    # Multi-metric radar chart — compare top models across metrics
+    log_info("Generating plot: multi_metric_radar...")
+    _plot_t0 = time.perf_counter()
+    _radar_test_stats = {name: res["test"] for name, res in model_results.items()}
+    radar_artifacts = plot_multi_metric_radar(
+        _radar_test_stats, str(results_dir / "multi_metric_radar"),
+    )
+    log_info(f"Plot saved: multi_metric_radar ({time.perf_counter()-_plot_t0:.1f}s)")
+
     # Plot predictions
-    print("Visualizing predictions...")
-    
+    log_info("Generating plot: predictions_comparison...")
+    _plot_t0 = time.perf_counter()
     predictions_dict = {
         "True": Yte,
         "RGAN": rgan_out['pred_test'],
@@ -1758,6 +2723,7 @@ def main():
         predictions_dict,
         save_path=os.path.join(str(results_dir), "predictions_comparison")
     )
+    log_info(f"Plot saved: predictions_comparison ({time.perf_counter()-_plot_t0:.1f}s)")
 
     predictions_test = {
         "RGAN": rgan_out["pred_test"],
@@ -1783,6 +2749,9 @@ def main():
         name: (np.asarray(pred).reshape(-1) * target_std) + target_mean for name, pred in predictions_test.items()
     }
 
+    _n_dm_pairs = len(list(combinations(predictions_test.keys(), 2)))
+    log_info(f"Running Diebold-Mariano tests ({_n_dm_pairs} pairs)...")
+    _dm_t0 = time.perf_counter()
     dm_results = {}
     for model_a, model_b in combinations(predictions_test.keys(), 2):
         dm_stat = diebold_mariano(
@@ -1794,6 +2763,8 @@ def main():
             "stat": _safe_float(dm_stat.get("stat")),
             "pvalue": _safe_float(dm_stat.get("pvalue")),
         }
+
+    log_info(f"Diebold-Mariano tests complete ({time.perf_counter()-_dm_t0:.1f}s, {len(dm_results)} pairs)")
 
     print("\n" + "="*80)
     print("DIEBOLD-MARIANO TESTS (ORIGINAL SCALE)")
@@ -1831,32 +2802,7 @@ def main():
     }
     lstm_architecture = describe_model(lstm_out["model"])
 
-    packages = {}
-    for pkg in ("numpy", "pandas", "torch", "scikit-learn"):
-        module_name = pkg.replace("-", "_")
-        try:
-            module = __import__(module_name)
-            packages[pkg] = getattr(module, "__version__", "unknown")
-        except ModuleNotFoundError:
-            continue
-
-    git_commit = ""
-    try:
-        git_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).parent,
-            text=True,
-        ).strip()
-    except Exception:
-        git_commit = ""
-
-    env_info = {
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "packages": packages,
-        "git_commit": git_commit,
-        "seed": args.seed,
-    }
+    env_info = _collect_environment_info(args.seed)
 
     metrics = dict(
         dataset=args.csv,
@@ -1873,11 +2819,10 @@ def main():
         rgan=dict(
             train=rgan_out["train_stats"],
             test=rgan_out["test_stats"],
-            curve=rgan_curve_artifacts["static"],
-            curve_interactive=rgan_curve_artifacts.get("interactive", ""),
             history=rgan_out["history"],
             architecture=rgan_architecture,
             config=dict(
+                n_in=int(Xtr.shape[-1]),
                 units_g=base_config.units_g,
                 units_d=base_config.units_d,
                 lambda_reg=base_config.lambda_reg,
@@ -1887,6 +2832,7 @@ def main():
                 g_layers=base_config.g_layers,
                 d_layers=base_config.d_layers,
                 g_dense=(g_dense_act if g_dense_act else "linear"),
+                g_dense_activation=(g_dense_act if g_dense_act else "linear"),
                 d_activation=base_config.d_activation or "sigmoid",
                 gan_variant=base_config.gan_variant,
                 d_steps=base_config.d_steps,
@@ -1896,13 +2842,17 @@ def main():
                 use_logits=base_config.use_logits,
                 amp=base_config.amp,
                 device=base_config.device,
+                noise_dim=base_config.noise_dim,
+                lambda_diversity=base_config.lambda_diversity,
+                preload_to_device=base_config.preload_to_device,
+                compile_mode=base_config.compile_mode,
+                critic_reg_interval=base_config.critic_reg_interval,
+                critic_arch=base_config.critic_arch,
             ),
         ),
         lstm=dict(
             train=lstm_out["train_stats"],
             test=lstm_out["test_stats"],
-            curve=lstm_curve_artifacts["static"],
-            curve_interactive=lstm_curve_artifacts.get("interactive", ""),
             history=lstm_out["history"],
             architecture=lstm_architecture,
             config=dict(units=base_config.units_g, lr=base_config.lr_g, dropout=base_config.dropout),
@@ -1910,83 +2860,61 @@ def main():
         naive_baseline=dict(
             train=naive_train_stats,
             test=naive_test_stats,
-            curve=naive_curve_artifacts["static"],
-            curve_interactive=naive_curve_artifacts.get("interactive", ""),
         ),
         arima=dict(
             train=arima_train_stats,
             test=arima_test_stats,
-            curve=arima_curve_artifacts["static"],
-            curve_interactive=arima_curve_artifacts.get("interactive", ""),
         ),
         arma=dict(
             train=arma_train_stats,
             test=arma_test_stats,
-            curve=arma_curve_artifacts["static"],
-            curve_interactive=arma_curve_artifacts.get("interactive", ""),
         ),
         tree_ensemble=dict(
             train=tree_train_stats,
             test=tree_test_stats,
-            curve=tree_curve_artifacts["static"],
-            curve_interactive=tree_curve_artifacts.get("interactive", ""),
             config=tree_config,
         ),
         dlinear=dict(
             train=dlinear_out["train_stats"],
             test=dlinear_out["test_stats"],
-            curve=dlinear_curve_artifacts["static"],
-            curve_interactive=dlinear_curve_artifacts.get("interactive", ""),
         ),
         nlinear=dict(
             train=nlinear_out["train_stats"],
             test=nlinear_out["test_stats"],
-            curve=nlinear_curve_artifacts["static"],
-            curve_interactive=nlinear_curve_artifacts.get("interactive", ""),
         ),
         fits=dict(
             train=fits_out["train_stats"],
             test=fits_out["test_stats"],
-            curve=fits_curve_artifacts["static"],
-            curve_interactive=fits_curve_artifacts.get("interactive", ""),
         ),
         patchtst=dict(
             train=patchtst_out["train_stats"],
             test=patchtst_out["test_stats"],
-            curve=patchtst_curve_artifacts["static"],
-            curve_interactive=patchtst_curve_artifacts.get("interactive", ""),
         ),
         itransformer=dict(
             train=itransformer_out["train_stats"],
             test=itransformer_out["test_stats"],
-            curve=itransformer_curve_artifacts["static"],
-            curve_interactive=itransformer_curve_artifacts.get("interactive", ""),
         ),
         autoformer=dict(
             train=autoformer_out["train_stats"],
             test=autoformer_out["test_stats"],
-            curve=autoformer_curve_artifacts["static"],
-            curve_interactive=autoformer_curve_artifacts.get("interactive", ""),
         ),
         informer=dict(
             train=informer_out["train_stats"],
             test=informer_out["test_stats"],
-            curve=informer_curve_artifacts["static"],
-            curve_interactive=informer_curve_artifacts.get("interactive", ""),
         ),
-        compare_plots=dict(
-            test=model_compare_artifacts["test"]["static"],
-            test_interactive=model_compare_artifacts["test"].get("interactive", ""),
-            train=model_compare_artifacts["train"]["static"],
-            train_interactive=model_compare_artifacts["train"].get("interactive", ""),
-            naive_comparison="",
-            naive_comparison_interactive="",
+        charts=dict(
+            training_curves_overlay=overlay_artifacts.get("static", ""),
+            training_curves_overlay_interactive=overlay_artifacts.get("interactive", ""),
+            ranked_model_bars=model_compare_artifacts.get("static", ""),
+            ranked_model_bars_interactive=model_compare_artifacts.get("interactive", ""),
+            noise_robustness_heatmap=noise_heatmap_artifacts.get("static", "") if noise_heatmap_artifacts else "",
+            noise_robustness_heatmap_interactive=noise_heatmap_artifacts.get("interactive", "") if noise_heatmap_artifacts else "",
+            multi_metric_radar=radar_artifacts.get("static", ""),
+            multi_metric_radar_interactive=radar_artifacts.get("interactive", ""),
         ),
         classical=dict(
             ets_rmse_full=ets_rmse_full,
             arima_rmse_full=arima_rmse_full,
-            curves="",
-            curves_interactive="",
         ),
         advanced_metrics=advanced_metrics_summary,
         statistical_tests=dict(diebold_mariano=dm_results),
@@ -1999,23 +2927,13 @@ def main():
         scaling={"target_mean": float(target_mean), "target_std": float(target_std)},
         created=datetime.now(timezone.utc).isoformat(),
     )
-    # Sanitize metrics to ensure valid JSON (replace NaN/Infinity with None)
-    def sanitize_for_json(obj):
-        import math
-        if isinstance(obj, dict):
-            return {k: sanitize_for_json(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [sanitize_for_json(v) for v in obj]
-        elif isinstance(obj, float):
-            if math.isnan(obj) or math.isinf(obj):
-                return None
-            return obj
-        return obj
+    metrics = _sanitize_for_json(metrics)
 
-    metrics = sanitize_for_json(metrics)
-
-    with open(results_dir/"metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
+    log_info("Writing metrics.json...")
+    _json_t0 = time.perf_counter()
+    _save_json_artifact(metrics, "metrics.json", results_dir, resume_store)
+    _json_size_kb = (results_dir / "metrics.json").stat().st_size / 1024
+    log_info(f"metrics.json saved ({_json_size_kb:.0f} KB, {time.perf_counter()-_json_t0:.1f}s)")
     print(json.dumps(metrics, indent=2))
 
     # ── Run Summary ─────────────────────────────────────────────────
@@ -2068,8 +2986,43 @@ def main():
             "pricing": "on-demand",
         },
     }
-    with open(results_dir / "run_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    _save_json_artifact(summary, "run_summary.json", results_dir, resume_store)
+    reporting_artifacts = _sync_existing_artifacts(
+        [
+            "core_results.json",
+            "metrics.json",
+            "run_summary.json",
+            "error_metrics_table.csv",
+            "training_curves_overlay.png",
+            "training_curves_overlay.html",
+            "ranked_model_bars.png",
+            "ranked_model_bars.html",
+            "multi_metric_radar.png",
+            "multi_metric_radar.html",
+            "predictions_comparison.png",
+            "predictions_comparison.html",
+            "noise_robustness_table.csv",
+            "noise_robustness.png",
+            "noise_robustness.html",
+            "noise_robustness_heatmap.png",
+            "noise_robustness_heatmap.html",
+        ],
+        results_dir,
+        resume_store,
+    )
+    _save_stage_artifact_cache(
+        resume_manifest,
+        "reporting",
+        {
+            "charts": metrics["charts"],
+            "metrics": metrics,
+            "summary": summary,
+        },
+        results_dir=results_dir,
+        resume_store=resume_store,
+        artifacts=reporting_artifacts,
+        metadata={"target_epochs": args.epochs},
+    )
 
     # Print summary table
     print(flush=True)
