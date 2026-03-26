@@ -267,7 +267,6 @@ def _build_resume_signature(args: argparse.Namespace) -> Dict[str, Any]:
                 "csv": str(csv_path),
                 "exists": csv_exists,
                 "size": csv_stat.st_size if csv_stat else None,
-                "mtime_ns": csv_stat.st_mtime_ns if csv_stat else None,
                 "target": args.target,
                 "time_col": args.time_col,
                 "resample": args.resample,
@@ -349,6 +348,55 @@ def _signature_differences(previous: Dict[str, Any], current: Dict[str, Any], pr
         elif prev_val != curr_val:
             diffs.append(f"{full_key}: {prev_val!r} -> {curr_val!r}")
     return diffs
+
+
+_ALLOWED_RESUME_PIPELINE_FLAG_KEYS = ("skip_classical", "skip_noise_robustness")
+
+
+def _extract_allowed_resume_flag_changes(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    previous_pipeline = previous.get("pipeline", {}) if isinstance(previous, dict) else {}
+    current_pipeline = current.get("pipeline", {}) if isinstance(current, dict) else {}
+    changes: Dict[str, Dict[str, Any]] = {}
+    for key in _ALLOWED_RESUME_PIPELINE_FLAG_KEYS:
+        prev_val = previous_pipeline.get(key)
+        curr_val = current_pipeline.get(key)
+        if prev_val != curr_val:
+            changes[f"pipeline.{key}"] = {"previous": prev_val, "current": curr_val}
+    return changes
+
+
+def _strip_allowed_resume_flag_changes(signature: Dict[str, Any]) -> Dict[str, Any]:
+    cloned = copy.deepcopy(signature)
+    pipeline = cloned.get("pipeline")
+    if isinstance(pipeline, dict):
+        for key in _ALLOWED_RESUME_PIPELINE_FLAG_KEYS:
+            pipeline.pop(key, None)
+    # mtime_ns is unreliable on SageMaker: the CSV gets a new modification
+    # time each time it is copied to a fresh container, even though the file
+    # content is identical.  Size-based identity is sufficient.
+    dataset = cloned.get("dataset")
+    if isinstance(dataset, dict):
+        dataset.pop("mtime_ns", None)
+    return cloned
+
+
+def _invalidate_stages_for_resume_flag_changes(manifest: Dict[str, Any], changes: Dict[str, Dict[str, Any]]) -> List[str]:
+    invalidated: List[str] = []
+
+    def _invalidate(stage_name: str, reason: str) -> None:
+        _invalidate_stage(manifest, stage_name, reason=reason)
+        invalidated.append(stage_name)
+
+    if "pipeline.skip_classical" in changes:
+        _invalidate("classical_baselines", "resume_flag_changed:skip_classical")
+        _invalidate("noise_robustness", "resume_flag_changed:skip_classical")
+        _invalidate("reporting", "resume_flag_changed:skip_classical")
+
+    if "pipeline.skip_noise_robustness" in changes:
+        _invalidate("noise_robustness", "resume_flag_changed:skip_noise_robustness")
+        _invalidate("reporting", "resume_flag_changed:skip_noise_robustness")
+
+    return sorted(set(invalidated))
 
 
 def _init_resume_manifest(signature: Dict[str, Any], results_dir: Path, resume_store: Path) -> Dict[str, Any]:
@@ -944,14 +992,34 @@ def main():
         resume_manifest = _init_resume_manifest(resume_signature, results_dir, resume_store)
         log_info("Resume manifest initialized.")
     else:
-        diffs = _signature_differences(resume_manifest.get("signature", {}), resume_signature)
+        previous_signature = resume_manifest.get("signature", {})
+        eval_flag_changes = _extract_allowed_resume_flag_changes(previous_signature, resume_signature)
+        diffs = _signature_differences(
+            _strip_allowed_resume_flag_changes(previous_signature),
+            _strip_allowed_resume_flag_changes(resume_signature),
+        )
         if diffs:
             diff_msg = "\n".join(f"  - {item}" for item in diffs)
             raise ValueError(
-                "Resume config drift detected. Only total --epochs and resume/job plumbing may change.\n"
+                "Resume config drift detected. Only total --epochs, resume/job plumbing, and eval-stage skip flags may change.\n"
                 f"{diff_msg}"
             )
         log_info("Resume manifest signature matches current run.")
+        if eval_flag_changes:
+            log_info(
+                "Allowed resume flag changes detected:\n"
+                + "\n".join(
+                    f"  - {name}: {change['previous']!r} -> {change['current']!r}"
+                    for name, change in sorted(eval_flag_changes.items())
+                )
+            )
+            invalidated_stages = _invalidate_stages_for_resume_flag_changes(resume_manifest, eval_flag_changes)
+            if invalidated_stages:
+                log_info(
+                    "Invalidated resume stages for re-evaluation: "
+                    + ", ".join(invalidated_stages)
+                )
+                _write_resume_manifest(resume_manifest, results_dir, resume_store)
 
     if checkpoint_meta is not None:
         checkpoint_epoch = int(checkpoint_meta["epoch"])

@@ -35,6 +35,7 @@ from rgan.metrics import error_stats, summarise_with_uncertainty
 from rgan.fits import train_fits
 from rgan.patchtst import train_patchtst
 from rgan.itransformer import train_itransformer
+from rgan.linear_baselines import train_linear_baseline
 from rgan.timegan import train_timegan
 from rgan.rgan_torch import AMP
 from rgan.scripts.run_training import set_seed
@@ -571,19 +572,39 @@ def main(args):
     # ========================================================================
     print("\n[STEP 6] Creating mixed real + synthetic dataset...")
 
-    # Quality gate: only mix if synthetic data is plausible
+    # Quality gate: only mix if synthetic data is plausible.
+    # Thresholds chosen conservatively:
+    #   FD < 10.0  — Fréchet Distance measures distribution similarity; values
+    #                above 10 in standardised space indicate the generator has
+    #                diverged significantly from the real distribution (mode
+    #                collapse, exploding outputs, etc.).
+    #   Var ratio < 80% — relative variance difference.  80% allows substantial
+    #                      distributional shift while catching degenerate cases
+    #                      (near-zero variance or extreme inflation).
     from rgan.synthetic_analysis import frechet_distance, variance_difference
     gate_fd = frechet_distance(Y_train, Y_synthetic)
     gate_vd = variance_difference(Y_train.ravel(), Y_synthetic.ravel())
     gate_var_ratio = abs(gate_vd.get("rel_diff", -100.0))
     print(f"  Quality gate — FD={gate_fd:.2f}, Var diff={gate_vd.get('rel_diff', -100):.1f}%")
 
-    syn_quality_ok = gate_fd < 10.0 and gate_var_ratio < 80.0
+    _QUALITY_GATE_FD_THRESHOLD = 10.0
+    _QUALITY_GATE_VAR_THRESHOLD = 80.0
+    syn_quality_ok = gate_fd < _QUALITY_GATE_FD_THRESHOLD and gate_var_ratio < _QUALITY_GATE_VAR_THRESHOLD
+    quality_gate_result = {
+        "passed": syn_quality_ok,
+        "frechet_distance": float(gate_fd),
+        "variance_diff_pct": float(gate_vd.get("rel_diff", -100.0)),
+        "fd_threshold": _QUALITY_GATE_FD_THRESHOLD,
+        "var_threshold": _QUALITY_GATE_VAR_THRESHOLD,
+    }
     if not syn_quality_ok:
-        print(f"  WARNING: Synthetic data failed quality gate — using real-only for downstream training")
+        print(f"  WARNING: Synthetic data FAILED quality gate (FD={gate_fd:.2f} >= {_QUALITY_GATE_FD_THRESHOLD} "
+              f"or Var={gate_var_ratio:.1f}% >= {_QUALITY_GATE_VAR_THRESHOLD}%) "
+              f"— using real-only for downstream training")
         X_mixed = X_train.copy()
         Y_mixed = Y_train.copy()
     else:
+        print(f"  Quality gate PASSED — mixing real + synthetic data")
         X_mixed = np.concatenate([X_train, X_train], axis=0)
         Y_mixed = np.concatenate([Y_train, Y_synthetic], axis=0)
 
@@ -715,6 +736,8 @@ def main(args):
     _run_augmentation_test("FITS", train_fits, real_splits, mixed_splits)
     _run_augmentation_test("PatchTST", train_patchtst, real_splits, mixed_splits)
     _run_augmentation_test("iTransformer", train_itransformer, real_splits, mixed_splits)
+    _run_augmentation_test("DLinear", train_linear_baseline, real_splits, mixed_splits, model_type="dlinear")
+    _run_augmentation_test("NLinear", train_linear_baseline, real_splits, mixed_splits, model_type="nlinear")
 
     print(f"  Step 7 took {_fmt_elapsed(time.time() - t0)}")
 
@@ -749,8 +772,12 @@ def main(args):
 
     if has_timegan and X_timegan is not None:
         if Y_timegan is not None:
-            # Compare in forecast (Y) space for consistency with RGAN metrics
-            synthetic_quality['TimeGAN'] = _compute_quality("TimeGAN", Y_train, Y_timegan)
+            # Evaluate on the same subset TimeGAN was trained on for fair comparison.
+            # TimeGAN only sees tgan_max_samples (max 10K), so quality metrics
+            # should compare against that same subset rather than the full
+            # training distribution which TimeGAN never observed.
+            Y_train_tgan_subset = Y_train[tgan_idx] if 'tgan_idx' in dir() else Y_train
+            synthetic_quality['TimeGAN'] = _compute_quality("TimeGAN", Y_train_tgan_subset, Y_timegan)
         else:
             # Fallback to input (X) space if no RGAN generator to produce Y_timegan
             synthetic_quality['TimeGAN'] = _compute_quality("TimeGAN (X-space)", X_train, X_timegan)
@@ -932,6 +959,16 @@ def main(args):
                 disc_res = evaluate_discriminators(Y_train, Y_syn, n_folds=3, seed=resolved_seed)
                 disc_acc = disc_res['Random Forest']['accuracy']
 
+            # If this was computed fresh (e.g. WGAN-GP), add to synthetic_quality
+            # so it gets saved in the JSON alongside RGAN/TimeGAN
+            if name not in synthetic_quality:
+                synthetic_quality[name] = {
+                    'frechet_distance': fd_val,
+                    'variance_difference': {'abs_diff': var_val},
+                    'discrimination_score': {'accuracy': disc_acc},
+                    'all_discrimination': disc_res,
+                }
+
             quality_results.append({
                 'Method': name,
                 'FD': f"{fd_val:.4f}",
@@ -946,10 +983,10 @@ def main(args):
     # Generate Table 3: Augmentation Performance
     print("\n  Generating supervisor augmentation table (accuracy)...")
     
-    # Dict: Model -> Scenario -> Accuracy
+    # Dict: Model -> Scenario -> {Accuracy, F1, Precision, Recall}
     # Initialized with Real Only results
-    aug_table_data = {m: {'Real Only': baseline_metrics[m]['Accuracy']} for m in baseline_metrics}
-    
+    aug_table_data = {m: {'Real Only': baseline_metrics[m]} for m in baseline_metrics}
+
     for syn_name, (X_syn, Y_syn) in syn_datasets.items():
         print(f"    Training with {syn_name} Augmentation...")
         # Augment
@@ -958,20 +995,20 @@ def main(args):
         # Labels for synthetic data (Consistency: derived from synthetic series)
         y_syn_cls = get_trend_labels(X_syn, Y_syn)
         y_aug = np.concatenate([y_train_cls, y_syn_cls], axis=0)
-        
+
         # Train & Evaluate
         aug_metrics = train_evaluate_classifiers(X_aug, y_aug, X_test, y_test_cls, seed=resolved_seed)
-        
+
         col_name = f"+ {syn_name} Synthetic"
         for m, res in aug_metrics.items():
-            aug_table_data[m][col_name] = res['Accuracy']
+            aug_table_data[m][col_name] = res
 
-    # Format Table 3
+    # Format Table 3 (Accuracy column for display)
     rows = []
     for model, scenarios in aug_table_data.items():
         row = {'Model': model}
-        for scen, acc in scenarios.items():
-            row[scen] = f"{acc*100:.2f}%"
+        for scen, metrics_dict in scenarios.items():
+            row[scen] = f"{metrics_dict['Accuracy']*100:.2f}%"
         rows.append(row)
         
     df_table3 = pd.DataFrame(rows)
@@ -1002,9 +1039,12 @@ def main(args):
         'train_size': len(X_train),
         'test_size': len(X_test),
         'synthetic_source': primary_synthetic_label,
+        'quality_gate': quality_gate_result,
         'classification_metrics': classification_results,
         'synthetic_quality': synthetic_quality,
         'data_augmentation': augmentation_results,
+        'supervisor_baseline_classification': baseline_metrics,
+        'supervisor_augmentation_accuracy': aug_table_data,
         'comparison_data': {
             'real_sequences': Y_train[:min(100, len(Y_train))].tolist(),
             'synthetic_sequences': Y_synthetic[:min(100, len(Y_synthetic))].tolist()

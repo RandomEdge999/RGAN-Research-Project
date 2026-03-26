@@ -33,7 +33,10 @@ from rgan.rgan_torch import (
 )
 from rgan.scripts.run_training import (
     _build_resume_signature,
+    _extract_allowed_resume_flag_changes,
+    _invalidate_stages_for_resume_flag_changes,
     _signature_differences,
+    _strip_allowed_resume_flag_changes,
     _stage_entry_complete,
 )
 from rgan.scripts.run_augmentation import (
@@ -179,6 +182,67 @@ class ResidualFixRegressionTests(unittest.TestCase):
             self.assertEqual(_signature_differences(base_signature, _build_resume_signature(same_run_new_target)), [])
             diffs = _signature_differences(base_signature, _build_resume_signature(drifted_args))
             self.assertIn("training.batch_size: 8 -> 32", diffs)
+
+    def test_resume_signature_allows_eval_flag_changes_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "toy.csv"
+            csv_path.write_text("timestamp,value\n1,1.0\n2,2.0\n", encoding="utf-8")
+
+            previous_args = self._make_resume_args(
+                csv_path,
+                skip_classical=True,
+                skip_noise_robustness=True,
+            )
+            current_args = self._make_resume_args(
+                csv_path,
+                skip_classical=False,
+                skip_noise_robustness=False,
+            )
+
+            previous_signature = _build_resume_signature(previous_args)
+            current_signature = _build_resume_signature(current_args)
+
+            changes = _extract_allowed_resume_flag_changes(previous_signature, current_signature)
+            self.assertEqual(
+                changes,
+                {
+                    "pipeline.skip_classical": {"previous": True, "current": False},
+                    "pipeline.skip_noise_robustness": {"previous": True, "current": False},
+                },
+            )
+            self.assertEqual(
+                _signature_differences(
+                    _strip_allowed_resume_flag_changes(previous_signature),
+                    _strip_allowed_resume_flag_changes(current_signature),
+                ),
+                [],
+            )
+
+    def test_eval_flag_changes_invalidate_only_dependent_stages(self):
+        manifest = {
+            "stages": {
+                "rgan": {"status": "completed"},
+                "classical_baselines": {"status": "completed"},
+                "bootstrap": {"status": "completed"},
+                "noise_robustness": {"status": "completed"},
+                "reporting": {"status": "completed"},
+            }
+        }
+
+        invalidated = _invalidate_stages_for_resume_flag_changes(
+            manifest,
+            {
+                "pipeline.skip_classical": {"previous": True, "current": False},
+                "pipeline.skip_noise_robustness": {"previous": True, "current": False},
+            },
+        )
+
+        self.assertEqual(invalidated, ["classical_baselines", "noise_robustness", "reporting"])
+        self.assertEqual(manifest["stages"]["rgan"]["status"], "completed")
+        self.assertEqual(manifest["stages"]["bootstrap"]["status"], "completed")
+        self.assertEqual(manifest["stages"]["classical_baselines"]["status"], "pending")
+        self.assertEqual(manifest["stages"]["noise_robustness"]["status"], "pending")
+        self.assertEqual(manifest["stages"]["reporting"]["status"], "pending")
 
     def test_stage_entry_complete_requires_cache_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,8 +421,8 @@ class ResidualFixRegressionTests(unittest.TestCase):
             time_col="calc_time",
             resample="5min",
             agg="mean",
-            skip_classical=False,
-            skip_noise_robustness=False,
+            skip_classical=None,
+            skip_noise_robustness=None,
             deterministic=False,
             max_train_windows=None,
             only_models="",
@@ -380,6 +444,12 @@ class ResidualFixRegressionTests(unittest.TestCase):
         self.assertEqual(hyperparameters["critic_arch"], "lstm")
         self.assertEqual(hyperparameters["skip_classical"], "true")
         self.assertEqual(hyperparameters["skip_noise_robustness"], "true")
+
+        args.skip_classical = False
+        args.skip_noise_robustness = False
+        hyperparameters = _build_hyperparameters(args, defaults)
+        self.assertNotIn("skip_classical", hyperparameters)
+        self.assertNotIn("skip_noise_robustness", hyperparameters)
 
     def test_cloud_config_uses_binance_throughput_defaults(self):
         cfg = yaml.safe_load((PROJECT_ROOT / "cloud" / "config.yaml").read_text())

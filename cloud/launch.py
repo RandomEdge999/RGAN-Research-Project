@@ -44,6 +44,17 @@ def _coalesce_override(cli_value, default_value):
     return cli_value
 
 
+def _parse_optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in ("true", "1", "yes"):
+        return True
+    if normalized in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError("Expected one of: true, false, 1, 0, yes, no")
+
+
 def _build_hyperparameters(args, defaults: dict) -> dict[str, str]:
     """Build SageMaker hyperparameters from CLI args and config defaults."""
     hyperparameters = {
@@ -88,9 +99,9 @@ def _build_hyperparameters(args, defaults: dict) -> dict[str, str]:
         ),
         "critic_arch": str(_coalesce_override(args.critic_arch, defaults.get("critic_arch", "tcn"))),
     }
-    if args.skip_classical or defaults.get("skip_classical", False):
+    if _coalesce_override(args.skip_classical, defaults.get("skip_classical", False)):
         hyperparameters["skip_classical"] = "true"
-    if args.skip_noise_robustness or defaults.get("skip_noise_robustness", False):
+    if _coalesce_override(args.skip_noise_robustness, defaults.get("skip_noise_robustness", False)):
         hyperparameters["skip_noise_robustness"] = "true"
     if args.deterministic:
         hyperparameters["deterministic"] = "true"
@@ -168,8 +179,8 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--gan_variant", default=None)
     ap.add_argument("--deterministic", action="store_true", help="Enable deterministic CUDA mode in the training job.")
-    ap.add_argument("--skip_classical", action="store_true")
-    ap.add_argument("--skip_noise_robustness", action="store_true")
+    ap.add_argument("--skip_classical", type=_parse_optional_bool, default=None, help="Override skip_classical (true/false)")
+    ap.add_argument("--skip_noise_robustness", type=_parse_optional_bool, default=None, help="Override skip_noise_robustness (true/false)")
     ap.add_argument("--max_train_windows", type=int, default=None)
     ap.add_argument("--compile_mode", choices=["off", "reduce-overhead"], default=None)
     ap.add_argument("--preload_to_device", choices=["auto", "always", "never"], default=None)
@@ -212,9 +223,10 @@ def main():
 
     # 2. Upload dataset to S3
     print("\n[2/5] Uploading dataset...")
-    data_key = f"{cfg['s3']['data_prefix']}{csv_path.name}"
+    dataset_stem = csv_path.stem  # e.g. "nasa_power_denver_2018_2023_hourly"
+    data_key = f"{cfg['s3']['data_prefix']}{dataset_stem}/{csv_path.name}"
     s3.upload_file(str(csv_path), bucket, data_key)
-    data_s3_uri = f"s3://{bucket}/{cfg['s3']['data_prefix']}"
+    data_s3_uri = f"s3://{bucket}/{cfg['s3']['data_prefix']}{dataset_stem}/"
     print(f"  Dataset uploaded to s3://{bucket}/{data_key}")
 
     # 3. Upload source code tarball

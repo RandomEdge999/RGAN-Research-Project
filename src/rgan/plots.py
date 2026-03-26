@@ -141,7 +141,7 @@ def plot_training_curves_overlay(
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title("Training Convergence: All Models", fontsize=13)
-    ax.legend(loc="upper right", fontsize=8, ncol=2, frameon=False)
+    ax.legend(loc="upper right", fontsize=10, ncol=2, frameon=False)
     _style_axes(ax)
     static_path = _finalise_static(fig, out_path)
 
@@ -286,6 +286,7 @@ def plot_noise_robustness_heatmap(
         normalize: If True, show % degradation from clean baseline.
     """
     out_path = _ensure_path(out_path)
+    noise_results = sorted(noise_results, key=lambda r: r["sd"])
     sds = [r["sd"] for r in noise_results]
 
     # Build matrix
@@ -449,7 +450,7 @@ def plot_multi_metric_radar(
     ax.set_yticks([0.25, 0.5, 0.75, 1.0])
     ax.set_yticklabels(["worst", "", "", "best"], fontsize=8, color="#666")
     ax.set_title("Multi-Metric Model Comparison", fontsize=13, pad=20)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+    ax.legend(loc="lower right", bbox_to_anchor=(1.25, -0.05), fontsize=10)
     static_path = _finalise_static(fig, out_path)
 
     html_path = ""
@@ -518,7 +519,7 @@ def plot_predictions(predictions_dict: Dict[str, np.ndarray], save_path: str, n_
         ax.set_title(f"Sample {i}")
         ax.grid(True, alpha=0.3)
         if i == 0:
-            ax.legend(fontsize=7, ncol=3)
+            ax.legend(fontsize=10, ncol=3)
 
     plt.tight_layout()
     _finalise_static(fig, Path(save_path))
@@ -662,7 +663,9 @@ def plot_noise_robustness(
     out_path: str,
 ) -> Dict[str, str]:
     """Plot RMSE vs noise level for all models — the core paper figure."""
-    sds = [r["sd"] for r in noise_results]
+    sds = sorted(set(r["sd"] for r in noise_results))
+    # Re-sort noise_results by sd to ensure consistent x-axis ordering
+    noise_results = sorted(noise_results, key=lambda r: r["sd"])
     out = _ensure_path(out_path)
 
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -687,7 +690,7 @@ def plot_noise_robustness(
     ax.set_xlabel("Noise Standard Deviation (\u03c3)", fontsize=12)
     ax.set_ylabel("Test RMSE (original scale)", fontsize=12)
     ax.set_title("Noise Robustness: RMSE Degradation Under Input Perturbation", fontsize=13)
-    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    ax.legend(loc="upper left", fontsize=10, ncol=2)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=-0.005)
     plt.tight_layout()
@@ -723,3 +726,301 @@ def plot_noise_robustness(
         html_path = _write_interactive(fig_i, out)
 
     return {"static": static_path, "interactive": html_path}
+
+
+# ===== Cross-Dataset Aggregation Charts (for multi-seed, multi-dataset papers) =====
+
+
+def _rank_models(metrics: Dict[str, float]) -> Dict[str, int]:
+    """Rank models by metric value (lower is better). Returns {model: rank}."""
+    sorted_models = sorted(metrics.items(), key=lambda x: x[1])
+    return {model: rank + 1 for rank, (model, _) in enumerate(sorted_models)}
+
+
+def plot_noise_robustness_multi_dataset(
+    all_noise: Dict[str, List[dict]],
+    out_path: str,
+) -> str:
+    """Side-by-side noise robustness plots across datasets.
+
+    Parameters
+    ----------
+    all_noise : dict
+        {dataset_name: [noise_results_list]} where each noise_results_list
+        is the same format as plot_noise_robustness receives.
+    out_path : str
+        Output file path for the combined figure.
+    """
+    n_datasets = len(all_noise)
+    fig, axes = plt.subplots(1, n_datasets, figsize=(6 * n_datasets, 5), sharey=True)
+    if n_datasets == 1:
+        axes = [axes]
+
+    for ax, (ds_name, noise_results) in zip(axes, all_noise.items()):
+        noise_results = sorted(noise_results, key=lambda r: r["sd"])
+        sds = [r["sd"] for r in noise_results]
+
+        for key, label in _NOISE_KEY_MAP.items():
+            rmses = []
+            for nr in noise_results:
+                stats = nr.get(key, {})
+                if not stats:
+                    rmses.append(None)
+                    continue
+                rmse = stats.get("rmse_orig", stats.get("rmse"))
+                rmses.append(rmse)
+            if all(v is None for v in rmses):
+                continue
+            s = _MODEL_STYLES.get(label, {"color": "#333", "ls": "-"})
+            ax.plot(sds, rmses, label=label, color=s["color"],
+                    linestyle=s["ls"], linewidth=2, marker="o", markersize=5)
+
+        ax.set_title(ds_name, fontsize=13, fontweight="bold")
+        ax.set_xlabel("Noise SD (σ)", fontsize=11)
+        ax.grid(True, alpha=0.3)
+        if ax == axes[0]:
+            ax.set_ylabel("Test RMSE (original scale)", fontsize=11)
+
+    axes[-1].legend(loc="upper left", fontsize=9, framealpha=0.9)
+    fig.suptitle("Noise Robustness Across Datasets", fontsize=15, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    out = _ensure_path(out_path)
+    fig.savefig(str(out), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)
+
+
+def plot_seed_boxplots(
+    seed_metrics: Dict[str, Dict[str, List[float]]],
+    metric_name: str,
+    out_path: str,
+) -> str:
+    """Box plots showing metric variance across seeds for each model.
+
+    Parameters
+    ----------
+    seed_metrics : dict
+        {dataset_name: {model_name: [metric_per_seed]}}
+    metric_name : str
+        Name of the metric (e.g., "RMSE", "MAE") for axis label.
+    out_path : str
+        Output file path.
+    """
+    n_datasets = len(seed_metrics)
+    fig, axes = plt.subplots(1, n_datasets, figsize=(6 * n_datasets, 5), sharey=False)
+    if n_datasets == 1:
+        axes = [axes]
+
+    for ax, (ds_name, models) in zip(axes, seed_metrics.items()):
+        model_names = sorted(models.keys())
+        data = [models[m] for m in model_names]
+        colors = [_MODEL_STYLES.get(m, {"color": "#999"})["color"] for m in model_names]
+
+        bp = ax.boxplot(data, labels=model_names, patch_artist=True, widths=0.6)
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+
+        # Overlay individual seed points
+        for i, (m, vals) in enumerate(zip(model_names, data)):
+            jitter = [i + 1 + (v - 0.5) * 0.1 for v in [0.2, 0.4, 0.6, 0.8, 1.0][:len(vals)]]
+            ax.scatter(jitter, vals, color="black", s=20, zorder=3, alpha=0.7)
+
+        ax.set_title(ds_name, fontsize=13, fontweight="bold")
+        ax.set_ylabel(f"Test {metric_name}", fontsize=11)
+        ax.tick_params(axis="x", rotation=30)
+        ax.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle(f"{metric_name} Variance Across Seeds (5 seeds per model)",
+                 fontsize=15, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    out = _ensure_path(out_path)
+    fig.savefig(str(out), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)
+
+
+def create_mean_std_table(
+    seed_metrics: Dict[str, Dict[str, List[float]]],
+    metric_name: str = "RMSE",
+    out_path: Optional[str] = None,
+) -> str:
+    """Create a mean ± std summary table across seeds — the core paper table.
+
+    Parameters
+    ----------
+    seed_metrics : dict
+        {dataset_name: {model_name: [metric_per_seed]}}
+    metric_name : str
+        Name of metric for column headers.
+    out_path : str or None
+        If provided, saves as CSV. Always returns the formatted string.
+
+    Returns
+    -------
+    str
+        Formatted table string.
+    """
+    import numpy as np
+
+    # Collect all model names across datasets
+    all_models = sorted(set(
+        m for ds in seed_metrics.values() for m in ds.keys()
+    ))
+
+    rows = []
+    for model in all_models:
+        row = {"Model": model}
+        for ds_name, models in seed_metrics.items():
+            vals = models.get(model, [])
+            if vals:
+                mean = np.mean(vals)
+                std = np.std(vals, ddof=1) if len(vals) > 1 else 0.0
+                row[ds_name] = f"{mean:.4f} ± {std:.4f}"
+            else:
+                row[ds_name] = "—"
+        rows.append(row)
+
+    # Format as aligned text table
+    headers = ["Model"] + list(seed_metrics.keys())
+    col_widths = {h: max(len(h), max(len(r.get(h, "")) for r in rows)) for h in headers}
+
+    lines = []
+    header_line = " | ".join(h.ljust(col_widths[h]) for h in headers)
+    lines.append(header_line)
+    lines.append("-+-".join("-" * col_widths[h] for h in headers))
+
+    for row in rows:
+        line = " | ".join(str(row.get(h, "")).ljust(col_widths[h]) for h in headers)
+        lines.append(line)
+
+    table_str = "\n".join(lines)
+
+    if out_path:
+        out = _ensure_path(out_path)
+        # Save as CSV for easy import
+        import csv
+        with open(str(out), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    return table_str
+
+
+def plot_ranking_stability(
+    seed_metrics: Dict[str, Dict[str, List[float]]],
+    out_path: str,
+) -> str:
+    """Bump chart showing model rankings across datasets.
+
+    Parameters
+    ----------
+    seed_metrics : dict
+        {dataset_name: {model_name: [metric_per_seed]}}
+    out_path : str
+        Output file path.
+    """
+    import numpy as np
+
+    datasets = list(seed_metrics.keys())
+    all_models = sorted(set(
+        m for ds in seed_metrics.values() for m in ds.keys()
+    ))
+
+    # Compute mean metric per model per dataset, then rank
+    rankings = {}  # {model: [rank_per_dataset]}
+    for ds_name in datasets:
+        means = {m: np.mean(seed_metrics[ds_name].get(m, [float("inf")])) for m in all_models}
+        ranked = _rank_models(means)
+        for m in all_models:
+            rankings.setdefault(m, []).append(ranked.get(m, len(all_models)))
+
+    fig, ax = plt.subplots(figsize=(max(6, 2 * len(datasets)), 5))
+    x_pos = list(range(len(datasets)))
+
+    for model, ranks in rankings.items():
+        s = _MODEL_STYLES.get(model, {"color": "#333", "ls": "-"})
+        ax.plot(x_pos, ranks, label=model, color=s["color"],
+                linestyle=s["ls"], linewidth=2.5, marker="o", markersize=8)
+        # Label endpoint
+        ax.annotate(model, (x_pos[-1], ranks[-1]),
+                    textcoords="offset points", xytext=(8, 0),
+                    fontsize=9, color=s["color"], va="center")
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(datasets, fontsize=11)
+    ax.set_ylabel("Rank (1 = best)", fontsize=12)
+    ax.set_title("Model Ranking Stability Across Datasets", fontsize=14, fontweight="bold")
+    ax.invert_yaxis()  # Rank 1 at top
+    ax.set_yticks(range(1, len(all_models) + 1))
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out = _ensure_path(out_path)
+    fig.savefig(str(out), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)
+
+
+def plot_clean_vs_noisy_rankings(
+    all_noise: Dict[str, List[dict]],
+    out_path: str,
+    clean_sd: float = 0.0,
+    noisy_sd: float = 0.2,
+) -> str:
+    """Compare model rankings under clean vs noisy conditions across datasets.
+
+    Parameters
+    ----------
+    all_noise : dict
+        {dataset_name: [noise_results_list]}
+    out_path : str
+        Output file path.
+    clean_sd : float
+        Noise level considered "clean".
+    noisy_sd : float
+        Noise level considered "noisy".
+    """
+    import numpy as np
+
+    datasets = list(all_noise.keys())
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for ax, (condition, sd) in zip(axes, [("Clean", clean_sd), ("Noisy", noisy_sd)]):
+        all_rankings = {}
+        for ds_name in datasets:
+            noise_results = all_noise[ds_name]
+            target = [r for r in noise_results if abs(r["sd"] - sd) < 1e-6]
+            if not target:
+                continue
+            nr = target[0]
+            metrics = {}
+            for key, label in _NOISE_KEY_MAP.items():
+                stats = nr.get(key, {})
+                if stats:
+                    rmse = stats.get("rmse_orig", stats.get("rmse"))
+                    if rmse is not None:
+                        metrics[label] = rmse
+            ranked = _rank_models(metrics)
+            for m, rank in ranked.items():
+                all_rankings.setdefault(m, []).append(rank)
+
+        # Plot mean rank with error bars
+        models = sorted(all_rankings.keys())
+        means = [np.mean(all_rankings[m]) for m in models]
+        stds = [np.std(all_rankings[m], ddof=1) if len(all_rankings[m]) > 1 else 0 for m in models]
+        colors = [_MODEL_STYLES.get(m, {"color": "#999"})["color"] for m in models]
+
+        bars = ax.barh(models, means, xerr=stds, color=colors, alpha=0.7,
+                       edgecolor="black", linewidth=0.5, capsize=3)
+        ax.set_xlabel("Mean Rank (lower = better)", fontsize=11)
+        ax.set_title(f"{condition} (σ={sd})", fontsize=13, fontweight="bold")
+        ax.invert_xaxis()
+        ax.grid(True, axis="x", alpha=0.3)
+
+    fig.suptitle("Clean vs Noisy Model Rankings", fontsize=15, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    out = _ensure_path(out_path)
+    fig.savefig(str(out), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)

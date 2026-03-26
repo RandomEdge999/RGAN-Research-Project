@@ -28,6 +28,7 @@ rgan-augment = "rgan.scripts.run_augmentation:cli_main"
 rgan-benchmark = "rgan.scripts.run_benchmark:main"
 rgan-prepare-m5 = "rgan.scripts.prepare_m5:cli_main"
 rgan-build-paper = "rgan.scripts.build_paper:main"
+rgan-charts = "rgan.scripts.regenerate_charts:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
