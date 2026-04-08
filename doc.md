@@ -1,14 +1,6 @@
-# Two-Stage RGAN Code Map
-
-This is a quick map of the exact code blocks that implement the two-stage algorithm from the draft.
-
-This implementation follows the paper's two-stage idea closely. First it trains a normal regression model to learn the predictable part of the series, then it trains a WGAN only on the residual noise that the regression model could not explain.
-
-At inference time, the code either uses the clean regression output `f̂(X)` for deterministic evaluation or adds a sampled residual `G(z)` to produce the hybrid forecast `f̂(X) + G(z)`.
-
 ## Core Algorithm Blocks
 
-These are the main blocks for the actual algorithm. This is the closest translation of Algorithm 1 into Python.
+These are the main blocks for the actual algorithm.
 
 - `src/rgan/rgan_torch.py:1181-1459`
   Main two-stage training function: `train_two_stage()`
@@ -33,7 +25,7 @@ These are the main blocks for the actual algorithm. This is the closest translat
 
 ## Core Model Definitions
 
-These are the model definitions used by the two-stage pipeline. If the question is what `f̂`, `G`, and `D` are in code, this is where they live.
+These are the model definitions used by the two-stage pipeline. 
 
 - `src/rgan/models_torch.py:498-542`
   `RegressionModel`
@@ -136,19 +128,6 @@ This is the one-to-one map from the draft to the implementation. If a step in th
   - `src/rgan/rgan_torch.py:1117-1147`
   - `src/rgan/scripts/run_augmentation.py:296-316`
 
-## Minimal Set To Show In A Meeting
 
-If time is short, open only these blocks. Together they show the data setup, the two-stage models, the training loop, and the final hybrid forecast path.
 
-- `src/rgan/rgan_torch.py:1225-1429`
-- `src/rgan/rgan_torch.py:1117-1147`
-- `src/rgan/models_torch.py:498-606`
-- `src/rgan/models_torch.py:636-665`
-- `src/rgan/data.py:184-245`
-- `src/rgan/scripts/run_training.py:1898-1929`
-- `src/rgan/scripts/run_training.py:2052-2072`
-- `src/rgan/scripts/run_augmentation.py:296-316`
-
-## Note
-
-The draft writes the method in single-step notation `x_(t+1)`. The code generalizes that to horizon `H`, so `Y`, residuals, and generated outputs are sequences shaped like `(H, 1)`.
+the method in single-step notation `x_(t+1)`. The code generalizes that to horizon `H`, so `Y`, residuals, and generated outputs are sequences shaped like `(H, 1)`.
