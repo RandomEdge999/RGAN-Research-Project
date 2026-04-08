@@ -1,0 +1,6 @@
+environments:
+  default:
+    projectEndpoint: "https://foundryproject.example.com"
+    agentName: "RGANTrainingAgent"
+    azureContainerRegistry: "myacr.azurecr.io"
+    testCases: []
