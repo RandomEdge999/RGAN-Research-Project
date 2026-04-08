@@ -68,3 +68,6 @@ papers/
 docs/
 document.md
 CLAUDE.md
+
+# Presentation workspace (slides, extracted archives, compiled PDFs)
+presentation/

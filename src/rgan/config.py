@@ -122,6 +122,12 @@ class TrainConfig:
     wgan_clip_value: float = 0.01
     weight_decay: float = 0.0
 
+    # Two-Stage Pipeline (Paper Algorithm 1)
+    pipeline: str = "two_stage"  # "two_stage" (paper) or "joint" (legacy)
+    regression_epochs: int = 100
+    regression_lr: float = 5e-4
+    regression_patience: int = 15
+
     # Evaluation
     eval_every: int = 5  # Evaluate every N epochs (1 = every epoch)
 
@@ -152,6 +158,10 @@ class TrainConfig:
         if self.critic_arch not in {"lstm", "tcn"}:
             raise ValueError(
                 f"Unsupported critic_arch='{self.critic_arch}'. Expected one of: lstm, tcn."
+            )
+        if self.pipeline not in {"two_stage", "joint"}:
+            raise ValueError(
+                f"Unsupported pipeline='{self.pipeline}'. Expected one of: two_stage, joint."
             )
 
 @dataclass

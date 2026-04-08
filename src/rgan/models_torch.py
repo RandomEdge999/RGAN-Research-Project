@@ -489,3 +489,178 @@ def build_discriminator(
         )
     raise ValueError(f"Unsupported critic_arch='{critic_arch}'. Expected 'lstm' or 'tcn'.")
 
+
+# ---------------------------------------------------------------------------
+# Two-Stage Pipeline Models (Paper Algorithm 1)
+# ---------------------------------------------------------------------------
+
+
+class RegressionModel(nn.Module):
+    """Deterministic LSTM regression model f̂(X) for the two-stage pipeline.
+
+    This is the regression model from Algorithm 1 (Steps 3-6) that learns
+    the deterministic signal. It maps input windows X_t to future predictions
+    x̂_{t+1} using pure MSE loss.
+    """
+
+    def __init__(
+        self,
+        L: int,
+        H: int,
+        n_in: int,
+        units: int,
+        num_layers: int,
+        dropout: float,
+        layer_norm: bool = False,
+    ):
+        super().__init__()
+        self.stack = LSTMStack(
+            input_size=n_in,
+            units=units,
+            num_layers=num_layers,
+            dropout=dropout,
+            layer_norm=layer_norm,
+        )
+        self.fc = nn.Linear(units, H)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict future values from input window.
+
+        Args:
+            x: Input tensor of shape (batch, L, n_in).
+
+        Returns:
+            Predictions of shape (batch, H, 1).
+        """
+        h = self.stack(x)
+        y = self.fc(h)
+        return y.view(y.size(0), -1, 1)
+
+
+class ResidualGenerator(nn.Module):
+    """Generator that maps latent noise z to synthetic residuals.
+
+    This is G(z) from Algorithm 1 (Steps 7-20). It takes only noise as input
+    (no X) and produces residuals of the same shape as the forecast horizon.
+    """
+
+    def __init__(
+        self,
+        H: int,
+        noise_dim: int,
+        units: int,
+        num_layers: int,
+        dropout: float,
+        layer_norm: bool = False,
+    ):
+        super().__init__()
+        self.noise_dim = noise_dim
+        self.H = H
+        # Project noise to a sequence the LSTM can process
+        self.input_proj = nn.Linear(noise_dim, units)
+        self.lstm = nn.LSTM(
+            input_size=units,
+            hidden_size=units,
+            num_layers=max(1, num_layers),
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.ln = nn.LayerNorm(units) if layer_norm else nn.Identity()
+        self.fc = nn.Linear(units, 1)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        for name, param in self.lstm.named_parameters():
+            if "weight_ih" in name:
+                nn.init.orthogonal_(param.data)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param.data)
+            elif "bias" in name:
+                param.data.fill_(0)
+                n = param.size(0)
+                param.data[n // 4 : n // 2].fill_(1.0)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Generate synthetic residuals from noise.
+
+        Args:
+            z: Latent noise tensor of shape (batch, H, noise_dim).
+
+        Returns:
+            Synthetic residuals of shape (batch, H, 1).
+        """
+        # z: (batch, H, noise_dim) -> project to (batch, H, units)
+        h = self.input_proj(z)
+        h, _ = self.lstm(h)
+        h = self.ln(h)
+        # Map each timestep to a scalar residual
+        return self.fc(h)  # (batch, H, 1)
+
+
+def build_regression_model(
+    L: int,
+    H: int,
+    n_in: int = 1,
+    units: int = 64,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    layer_norm: bool = False,
+    **kwargs,
+) -> RegressionModel:
+    """Factory function to build a RegressionModel (f̂) for the two-stage pipeline."""
+    return RegressionModel(L, H, n_in, units, num_layers, dropout, layer_norm=layer_norm)
+
+
+def build_residual_generator(
+    H: int,
+    noise_dim: int = 16,
+    units: int = 64,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    layer_norm: bool = False,
+    **kwargs,
+) -> ResidualGenerator:
+    """Factory function to build a ResidualGenerator G(z) for the two-stage pipeline."""
+    return ResidualGenerator(H, noise_dim, units, num_layers, dropout, layer_norm=layer_norm)
+
+
+def build_residual_discriminator(
+    H: int,
+    units: int = 64,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    activation: Optional[str] = None,
+    layer_norm: bool = False,
+    use_spectral_norm: bool = False,
+    critic_arch: str = "tcn",
+    **kwargs,
+) -> nn.Module:
+    """Factory function to build a Discriminator for residual sequences.
+
+    The residual critic operates on sequences of shape (H, 1) — just the
+    residuals, not the full (L+H, 1) input+output pairs.
+    """
+    critic_arch = (critic_arch or "tcn").lower()
+    if critic_arch == "lstm":
+        return Discriminator(
+            H, units, num_layers, dropout,
+            activation=activation, layer_norm=layer_norm,
+            use_spectral_norm=use_spectral_norm,
+        )
+    if critic_arch == "tcn":
+        return TCNDiscriminator(
+            H, units, num_layers, dropout,
+            activation=activation, layer_norm=layer_norm,
+            use_spectral_norm=use_spectral_norm,
+        )
+    raise ValueError(f"Unsupported critic_arch='{critic_arch}'. Expected 'lstm' or 'tcn'.")
+

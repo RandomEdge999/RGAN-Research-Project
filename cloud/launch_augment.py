@@ -172,11 +172,12 @@ def main():
     from cloud.s3_utils import ensure_bucket
     ensure_bucket(bucket, region)
 
-    # 2. Upload dataset
+    # 2. Upload dataset (per-dataset subdirectory to avoid CSV collisions)
     print("\n[2/5] Uploading dataset...")
-    data_key = f"{cfg['s3']['data_prefix']}{csv_path.name}"
+    dataset_stem = csv_path.stem
+    data_key = f"{cfg['s3']['data_prefix']}{dataset_stem}/{csv_path.name}"
     s3.upload_file(str(csv_path), bucket, data_key)
-    data_s3_uri = f"s3://{bucket}/{cfg['s3']['data_prefix']}"
+    data_s3_uri = f"s3://{bucket}/{cfg['s3']['data_prefix']}{dataset_stem}/"
     print(f"  Dataset uploaded to s3://{bucket}/{data_key}")
 
     # 3. Upload trained models

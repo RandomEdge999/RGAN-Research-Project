@@ -286,6 +286,7 @@ def _build_resume_signature(args: argparse.Namespace) -> Dict[str, Any]:
             "training": {
                 "L": args.L,
                 "H": args.H,
+                "pipeline": args.pipeline,
                 "batch_size": args.batch_size,
                 "eval_every": args.eval_every,
                 "eval_batch_size": args.eval_batch_size,
@@ -321,12 +322,421 @@ def _build_resume_signature(args: argparse.Namespace) -> Dict[str, Any]:
                 "instance_noise_decay": args.instance_noise_decay,
                 "weight_decay": args.weight_decay,
                 "noise_dim": args.noise_dim,
+                "regression_epochs": args.regression_epochs,
+                "regression_lr": args.regression_lr,
+                "regression_patience": args.regression_patience,
                 "lambda_diversity": args.lambda_diversity,
                 "critic_reg_interval": args.critic_reg_interval,
                 "critic_arch": args.critic_arch,
             },
         }
     )
+
+
+def _load_json_if_exists(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _detect_rgan_pipeline(
+    saved_metrics: Optional[Dict[str, Any]],
+    run_args: Optional[Dict[str, Any]],
+    models_dir: Optional[Path],
+) -> str:
+    """Infer whether a run uses the legacy joint or paper two-stage pipeline."""
+    cfg = ((saved_metrics or {}).get("rgan") or {}).get("config") or {}
+    metrics_pipeline = cfg.get("pipeline")
+    if metrics_pipeline in {"two_stage", "joint"}:
+        return metrics_pipeline
+
+    args_pipeline = (run_args or {}).get("pipeline")
+    if args_pipeline in {"two_stage", "joint"}:
+        return args_pipeline
+
+    if models_dir is not None:
+        if (models_dir / "rgan_regression.pt").exists() and (models_dir / "rgan_residual_generator.pt").exists():
+            return "two_stage"
+
+    return "joint"
+
+
+def _infer_joint_replay_config(
+    saved_metrics: Optional[Dict[str, Any]],
+    state_dict: Dict[str, Any],
+    n_in_current: int,
+    model_label: str = "RGAN",
+    run_args: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = ((saved_metrics or {}).get(model_label.lower().replace("-", "_").replace(" ", "_")) or {}).get("config", {})
+    if not cfg:
+        cfg = ((saved_metrics or {}).get("rgan") or {}).get("config", {})
+
+    lstm_weight = None
+    for key, tensor in state_dict.items():
+        if key.endswith("lstm.weight_ih_l0"):
+            lstm_weight = tensor
+            break
+    if lstm_weight is None:
+        raise ValueError(f"{model_label} checkpoint is missing the generator LSTM input weights.")
+
+    input_size = int(lstm_weight.shape[1])
+    inferred_units = int(lstm_weight.shape[0] // 4)
+    inferred_layers = max(1, len([k for k in state_dict if "lstm.weight_ih_l" in k]))
+
+    noise_dim = cfg.get("noise_dim")
+    n_in_saved = cfg.get("n_in")
+    if noise_dim is None:
+        if n_in_saved is not None:
+            noise_dim = input_size - int(n_in_saved)
+        elif input_size == int(n_in_current):
+            noise_dim = 0
+        else:
+            raise ValueError(
+                f"Cannot safely reconstruct {model_label} input width: checkpoint input_size={input_size}, "
+                f"prepared data features={n_in_current}, and saved metrics are missing noise_dim/n_in."
+            )
+    noise_dim = int(noise_dim)
+    n_in_expected = int(n_in_saved) if n_in_saved is not None else input_size - noise_dim
+    if n_in_expected != int(n_in_current):
+        raise ValueError(
+            f"{model_label} expects {n_in_expected} input features, but current data has {n_in_current}."
+        )
+
+    dense_activation = cfg.get("g_dense_activation", cfg.get("g_dense"))
+    if dense_activation in {"", None, "linear"}:
+        dense_activation = None
+
+    return {
+        "n_in": n_in_expected,
+        "units": int(cfg.get("units_g", (run_args or {}).get("units_g", inferred_units))),
+        "num_layers": int(cfg.get("g_layers", (run_args or {}).get("g_layers", inferred_layers))),
+        "noise_dim": noise_dim,
+        "dense_activation": dense_activation,
+        "dropout": float(cfg.get("dropout", (run_args or {}).get("dropout", 0.1))),
+        "units_d": int(cfg.get("units_d", (run_args or {}).get("units_d", cfg.get("units_g", inferred_units)))),
+        "d_layers": int(cfg.get("d_layers", (run_args or {}).get("d_layers", cfg.get("g_layers", inferred_layers)))),
+        "d_activation": cfg.get("d_activation", (run_args or {}).get("d_activation", "sigmoid")),
+        "critic_arch": cfg.get("critic_arch", (run_args or {}).get("critic_arch", "tcn")),
+        "layer_norm": bool(
+            cfg["layer_norm"] if "layer_norm" in cfg else any(k.startswith("stack.ln.") for k in state_dict)
+        ),
+        "use_spectral_norm": bool(
+            cfg.get(
+                "use_spectral_norm",
+                str(cfg.get("gan_variant", (run_args or {}).get("gan_variant", ""))).lower() == "wgan-gp",
+            )
+        ),
+    }
+
+
+def _load_rgan_bundle_from_run_dir(
+    run_dir: Path,
+    n_in_current: int,
+    L: int,
+    H: int,
+    device: torch.device,
+    prefer_ema: bool = True,
+) -> Dict[str, Any]:
+    """Load an RGAN run directory into a unified in-memory bundle."""
+    from rgan.models_torch import (
+        build_discriminator,
+        build_generator,
+        build_regression_model,
+        build_residual_discriminator,
+        build_residual_generator,
+    )
+
+    run_dir = Path(run_dir)
+    models_dir = run_dir / "models"
+    saved_metrics = _load_json_if_exists(run_dir / "metrics.json")
+    run_config = _load_json_if_exists(run_dir / "run_config.json")
+    run_args = run_config.get("args", {}) if isinstance(run_config, dict) else {}
+    pipeline = _detect_rgan_pipeline(saved_metrics, run_args, models_dir)
+    cfg = ((saved_metrics or {}).get("rgan") or {}).get("config") or {}
+
+    if pipeline == "two_stage":
+        regression_state = torch.load(models_dir / "rgan_regression.pt", map_location=device, weights_only=True)
+        residual_generator_state = torch.load(
+            models_dir / "rgan_residual_generator.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        residual_critic_state = torch.load(
+            models_dir / "rgan_residual_discriminator.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        n_in_saved = int(cfg.get("n_in", run_args.get("n_in", n_in_current)))
+        if n_in_saved != int(n_in_current):
+            raise ValueError(
+                f"Two-stage RGAN expects {n_in_saved} input features, but current data has {n_in_current}."
+            )
+
+        units_g = int(cfg.get("units_g", run_args.get("units_g", 128)))
+        units_d = int(cfg.get("units_d", run_args.get("units_d", units_g)))
+        g_layers = int(cfg.get("g_layers", run_args.get("g_layers", 2)))
+        d_layers = int(cfg.get("d_layers", run_args.get("d_layers", 2)))
+        dropout = float(cfg.get("dropout", run_args.get("dropout", 0.1)))
+        noise_dim = int(cfg.get("noise_dim", run_args.get("noise_dim", 16)))
+        d_activation = cfg.get("d_activation", run_args.get("d_activation", "sigmoid"))
+        critic_arch = cfg.get("critic_arch", run_args.get("critic_arch", "tcn"))
+        layer_norm = bool(
+            cfg["layer_norm"] if "layer_norm" in cfg
+            else any(k.startswith("stack.ln.") for k in regression_state)
+            or any(k.startswith("ln.") for k in residual_generator_state)
+        )
+        use_spectral_norm = bool(
+            cfg.get(
+                "use_spectral_norm",
+                str(cfg.get("gan_variant", run_args.get("gan_variant", ""))).lower() == "wgan-gp",
+            )
+        )
+
+        regression = build_regression_model(
+            L=L,
+            H=H,
+            n_in=n_in_saved,
+            units=units_g,
+            num_layers=g_layers,
+            dropout=dropout,
+            layer_norm=layer_norm,
+        ).to(device)
+        residual_generator = build_residual_generator(
+            H=H,
+            noise_dim=noise_dim,
+            units=units_g,
+            num_layers=g_layers,
+            dropout=dropout,
+            layer_norm=layer_norm,
+        ).to(device)
+        residual_critic = build_residual_discriminator(
+            H=H,
+            units=units_d,
+            num_layers=d_layers,
+            dropout=dropout,
+            activation=d_activation,
+            layer_norm=layer_norm,
+            use_spectral_norm=use_spectral_norm,
+            critic_arch=critic_arch,
+        ).to(device)
+
+        regression.load_state_dict(regression_state)
+        residual_generator.load_state_dict(residual_generator_state)
+        residual_critic.load_state_dict(residual_critic_state)
+        regression.eval()
+        residual_generator.eval()
+        residual_critic.eval()
+        return {
+            "pipeline": "two_stage",
+            "F_hat": regression,
+            "G": residual_generator,
+            "G_ema": None,
+            "D": residual_critic,
+            "saved_metrics": saved_metrics,
+            "run_args": run_args,
+        }
+
+    gen_path = models_dir / "rgan_generator.pt"
+    ema_path = models_dir / "rgan_generator_ema.pt"
+    if not gen_path.exists() and not ema_path.exists():
+        raise FileNotFoundError(f"Missing generator checkpoint in {models_dir}")
+    generator_state = torch.load(
+        gen_path if gen_path.exists() else ema_path,
+        map_location=device,
+        weights_only=True,
+    )
+    replay_cfg = _infer_joint_replay_config(
+        saved_metrics,
+        generator_state,
+        n_in_current,
+        model_label="RGAN",
+        run_args=run_args,
+    )
+
+    generator = build_generator(
+        L=L,
+        H=H,
+        n_in=replay_cfg["n_in"],
+        units=replay_cfg["units"],
+        num_layers=replay_cfg["num_layers"],
+        dropout=replay_cfg["dropout"],
+        dense_activation=replay_cfg["dense_activation"],
+        layer_norm=replay_cfg["layer_norm"],
+        noise_dim=replay_cfg["noise_dim"],
+    ).to(device)
+    generator.load_state_dict(generator_state)
+    generator.eval()
+
+    generator_ema = None
+    if prefer_ema and ema_path.exists() and gen_path.exists():
+        generator_ema = build_generator(
+            L=L,
+            H=H,
+            n_in=replay_cfg["n_in"],
+            units=replay_cfg["units"],
+            num_layers=replay_cfg["num_layers"],
+            dropout=replay_cfg["dropout"],
+            dense_activation=replay_cfg["dense_activation"],
+            layer_norm=replay_cfg["layer_norm"],
+            noise_dim=replay_cfg["noise_dim"],
+        ).to(device)
+        generator_ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
+        generator_ema.eval()
+
+    discriminator = None
+    disc_path = models_dir / "rgan_discriminator.pt"
+    if disc_path.exists():
+        discriminator = build_discriminator(
+            L=L,
+            H=H,
+            units=replay_cfg["units_d"],
+            dropout=replay_cfg["dropout"],
+            num_layers=replay_cfg["d_layers"],
+            activation=replay_cfg["d_activation"],
+            layer_norm=replay_cfg["layer_norm"],
+            use_spectral_norm=replay_cfg["use_spectral_norm"],
+            critic_arch=replay_cfg["critic_arch"],
+        ).to(device)
+        discriminator.load_state_dict(torch.load(disc_path, map_location=device, weights_only=True))
+        discriminator.eval()
+
+    return {
+        "pipeline": "joint",
+        "G": generator,
+        "G_ema": generator_ema,
+        "D": discriminator,
+        "saved_metrics": saved_metrics,
+        "run_args": run_args,
+    }
+
+
+def _predict_rgan_bundle(
+    rgan_out: Dict[str, Any],
+    X: np.ndarray,
+    Y: Optional[np.ndarray] = None,
+    batch_size: int = 512,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+) -> Tuple[Optional[Dict[str, float]], np.ndarray]:
+    """Predict from an RGAN output bundle regardless of pipeline type."""
+    from rgan.rgan_torch import (
+        _select_eval_generator,
+        predict_generator_forecasts,
+        predict_hybrid_forecasts,
+    )
+
+    pipeline = rgan_out.get("pipeline", "joint")
+    if pipeline == "two_stage":
+        preds = predict_hybrid_forecasts(
+            rgan_out["F_hat"],
+            rgan_out["G"],
+            X,
+            batch_size=batch_size,
+            deterministic=deterministic,
+            seed=seed,
+        )
+    else:
+        eval_model = _select_eval_generator(rgan_out["G"], rgan_out.get("G_ema"))
+        preds = predict_generator_forecasts(
+            eval_model,
+            X,
+            batch_size=batch_size,
+            stochastic=not deterministic,
+            seed=seed,
+        )
+
+    stats = None
+    if Y is not None:
+        Y_ref = Y.detach().cpu().numpy() if torch.is_tensor(Y) else Y
+        stats = error_stats(Y_ref.reshape(-1), preds.reshape(-1))
+    return stats, preds
+
+
+def _describe_rgan_architecture(
+    rgan_out: Dict[str, Any],
+    generator_fallback: Optional[torch.nn.Module] = None,
+    discriminator_fallback: Optional[torch.nn.Module] = None,
+) -> Dict[str, Any]:
+    pipeline = rgan_out.get("pipeline", "joint")
+    if pipeline == "two_stage":
+        regression = rgan_out.get("F_hat")
+        residual_generator = rgan_out.get("G")
+        residual_discriminator = rgan_out.get("D")
+        return {
+            "pipeline": "two_stage",
+            "generator": describe_model(residual_generator),
+            "discriminator": describe_model(residual_discriminator),
+            "regression": describe_model(regression),
+            "residual_generator": describe_model(residual_generator),
+            "residual_discriminator": describe_model(residual_discriminator),
+        }
+    generator = rgan_out.get("G", generator_fallback)
+    discriminator = rgan_out.get("D", discriminator_fallback)
+    return {
+        "pipeline": "joint",
+        "generator": describe_model(generator),
+        "discriminator": describe_model(discriminator),
+    }
+
+
+def _build_rgan_metrics_config(
+    base_config: TrainConfig,
+    n_in: int,
+    g_dense_act: Optional[str],
+    pipeline: str,
+) -> Dict[str, Any]:
+    cfg = dict(
+        pipeline=pipeline,
+        n_in=int(n_in),
+        units_g=base_config.units_g,
+        units_d=base_config.units_d,
+        lambda_reg=base_config.lambda_reg,
+        lrG=base_config.lr_g,
+        lrD=base_config.lr_d,
+        dropout=base_config.dropout,
+        g_layers=base_config.g_layers,
+        d_layers=base_config.d_layers,
+        g_dense=(g_dense_act if g_dense_act else "linear"),
+        g_dense_activation=(g_dense_act if g_dense_act else "linear"),
+        d_activation=base_config.d_activation or "sigmoid",
+        gan_variant=base_config.gan_variant,
+        d_steps=base_config.d_steps,
+        g_steps=base_config.g_steps,
+        wgan_gp_lambda=base_config.wgan_gp_lambda,
+        wgan_clip_value=base_config.wgan_clip_value,
+        use_logits=base_config.use_logits,
+        amp=base_config.amp,
+        device=base_config.device,
+        noise_dim=base_config.noise_dim,
+        lambda_diversity=base_config.lambda_diversity,
+        preload_to_device=base_config.preload_to_device,
+        compile_mode=base_config.compile_mode,
+        critic_reg_interval=base_config.critic_reg_interval,
+        critic_arch=base_config.critic_arch,
+        layer_norm=True,
+        use_spectral_norm=bool(base_config.gan_variant.lower() == "wgan-gp"),
+        checkpoint_files={
+            "generator": "rgan_generator.pt",
+            "discriminator": "rgan_discriminator.pt",
+        },
+    )
+    if pipeline == "two_stage":
+        cfg.update(
+            regression_epochs=base_config.regression_epochs,
+            regression_lr=base_config.regression_lr,
+            regression_patience=base_config.regression_patience,
+            checkpoint_files={
+                "regression": "rgan_regression.pt",
+                "residual_generator": "rgan_residual_generator.pt",
+                "residual_discriminator": "rgan_residual_discriminator.pt",
+                "generator": "rgan_generator.pt",
+                "discriminator": "rgan_discriminator.pt",
+            },
+        )
+    return cfg
 
 
 def _signature_differences(previous: Dict[str, Any], current: Dict[str, Any], prefix: str = "") -> List[str]:
@@ -603,6 +1013,15 @@ def main():
     ap.add_argument("--L", type=int, default=60)
     ap.add_argument("--H", type=int, default=12)
     ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument(
+        "--pipeline",
+        choices=["two_stage", "joint"],
+        default="two_stage",
+        help="Training pipeline: 'two_stage' (paper Algorithm 1) or 'joint' (legacy).",
+    )
+    ap.add_argument("--regression_epochs", type=int, default=100, help="Epochs for Stage 1 regression model (two_stage only).")
+    ap.add_argument("--regression_lr", type=float, default=5e-4, help="Learning rate for Stage 1 regression model.")
+    ap.add_argument("--regression_patience", type=int, default=15, help="Early stopping patience for Stage 1.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--max_train_windows", type=int, default=0,
                     help="Limit training windows (0 = use all). Use e.g. 500 for fast smoke tests.")
@@ -1058,11 +1477,13 @@ def main():
         from rgan.models_torch import (
             build_generator as build_generator_backend,
             build_discriminator as build_discriminator_backend,
+            build_regression_model as build_regression_model_backend,
+            build_residual_generator as build_residual_generator_backend,
+            build_residual_discriminator as build_residual_discriminator_backend,
         )
         from rgan.rgan_torch import (
-            _select_eval_generator as select_eval_generator_backend,
             train_rgan_torch as train_rgan_backend,
-            compute_metrics as compute_metrics_backend,
+            train_two_stage as train_two_stage_backend,
         )
         from rgan.lstm_supervised_torch import (
             train_lstm_supervised_torch as train_lstm_backend,
@@ -1278,6 +1699,10 @@ def main():
         checkpoint_every=args.checkpoint_every,
         resume_from=args.resume_from,
         eval_every=args.eval_every,
+        pipeline=args.pipeline,
+        regression_epochs=args.regression_epochs,
+        regression_lr=args.regression_lr,
+        regression_patience=args.regression_patience,
     )
 
     print_kv_table(console, "Configuration", {
@@ -1466,6 +1891,43 @@ def main():
 
     log_step(f"Discriminator built: {sum(p.numel() for p in D.parameters())} parameters")
 
+    # Two-stage pipeline models (Paper Algorithm 1)
+    F_hat = None
+    G_residual = None
+    D_residual = None
+    if base_config.pipeline == "two_stage":
+        log_step("Building Two-Stage Pipeline models (Paper Algorithm 1)")
+        F_hat = build_regression_model_backend(
+            L=base_config.L,
+            H=base_config.H,
+            n_in=Xtr.shape[-1],
+            units=base_config.units_g,
+            num_layers=base_config.g_layers,
+            dropout=base_config.dropout,
+            layer_norm=layer_norm,
+        )
+        log_step(f"RegressionModel f̂ built: {sum(p.numel() for p in F_hat.parameters())} parameters")
+        G_residual = build_residual_generator_backend(
+            H=base_config.H,
+            noise_dim=base_config.noise_dim,
+            units=base_config.units_g,
+            num_layers=base_config.g_layers,
+            dropout=base_config.dropout,
+            layer_norm=layer_norm,
+        )
+        log_step(f"ResidualGenerator G(z) built: {sum(p.numel() for p in G_residual.parameters())} parameters")
+        D_residual = build_residual_discriminator_backend(
+            H=base_config.H,
+            units=base_config.units_d,
+            num_layers=base_config.d_layers,
+            dropout=base_config.dropout,
+            activation=base_config.d_activation,
+            layer_norm=layer_norm,
+            use_spectral_norm=use_spectral_norm,
+            critic_arch=base_config.critic_arch,
+        )
+        log_step(f"Residual Discriminator D(r) built: {sum(p.numel() for p in D_residual.parameters())} parameters")
+
     # Save all model weights to a models/ subdirectory
     models_dir = results_dir / "models"
     models_dir.mkdir(exist_ok=True)
@@ -1549,27 +2011,17 @@ def main():
 
     def _load_cached_rgan_stage() -> Dict[str, Any]:
         cache = _load_stage_cache(resume_store, "rgan")
-        raw_generator_state = torch.load(resume_models_dir / "rgan_generator.pt", map_location=_load_device, weights_only=True)
-        G.load_state_dict(raw_generator_state)
-        G.eval()
-
-        disc_path = resume_models_dir / "rgan_discriminator.pt"
-        if disc_path.exists():
-            D.load_state_dict(torch.load(disc_path, map_location=_load_device, weights_only=True))
-            D.eval()
-
-        G_ema = None
-        ema_path = resume_models_dir / "rgan_generator_ema.pt"
-        if ema_path.exists():
-            G_ema = copy.deepcopy(G)
-            G_ema.load_state_dict(torch.load(ema_path, map_location=_load_device, weights_only=True))
-            G_ema.eval()
-
+        bundle = _load_rgan_bundle_from_run_dir(
+            run_dir=resume_store,
+            n_in_current=Xtr.shape[-1],
+            L=base_config.L,
+            H=base_config.H,
+            device=_load_device,
+            prefer_ema=True,
+        )
         _restore_stage_artifacts(resume_manifest["stages"]["rgan"], resume_store, results_dir)
         return {
-            "G": G,
-            "D": D,
-            "G_ema": G_ema,
+            **bundle,
             "history": cache["history"],
             "train_stats": cache["train_stats"],
             "test_stats": cache["test_stats"],
@@ -1595,15 +2047,63 @@ def main():
         _write_resume_manifest(resume_manifest, results_dir, resume_store)
 
         if _should_train("rgan"):
-            with log_phase(console, "Train R-GAN (PyTorch)"):
-                log_step("Calling train_rgan_backend...")
-                rgan_result = train_rgan_backend(
-                    base_config,
-                    (G, D),
-                    {"Xtr": Xtr, "Ytr": Ytr, "Xval": Xval, "Yval": Yval, "Xte": Xte, "Yte": Yte},
-                    str(results_dir),
-                    tag="rgan",
-                )
+            data_splits = {"Xtr": Xtr, "Ytr": Ytr, "Xval": Xval, "Yval": Yval, "Xte": Xte, "Yte": Yte}
+
+            if base_config.pipeline == "two_stage" and F_hat is not None:
+                with log_phase(console, "Train R-WGAN Two-Stage (Paper Algorithm 1)"):
+                    log_step("Calling train_two_stage_backend...")
+                    rgan_result = train_two_stage_backend(
+                        base_config,
+                        (F_hat, G_residual, D_residual),
+                        data_splits,
+                        str(results_dir),
+                        tag="rgan_two_stage",
+                    )
+                    log_step(
+                        f"Two-stage training completed. Train RMSE={rgan_result['train_stats'].get('rmse', 'N/A')}, "
+                        f"Test RMSE={rgan_result['test_stats'].get('rmse', 'N/A')}"
+                    )
+                    _save_model("rgan_regression", rgan_result["F_hat"])
+                    _save_model("rgan_residual_generator", rgan_result["G"])
+                    _save_model("rgan_residual_discriminator", rgan_result["D"])
+                    # Also save as rgan_generator for compatibility with augmentation
+                    _save_model("rgan_generator", rgan_result["G"])
+                    _save_model("rgan_discriminator", rgan_result["D"])
+                    log_step(f"Saved two-stage models to: {models_dir}")
+                    _save_stage_artifact_cache(
+                        resume_manifest,
+                        "rgan",
+                        {
+                            "history": rgan_result["history"],
+                            "train_stats": rgan_result["train_stats"],
+                            "test_stats": rgan_result["test_stats"],
+                            "pred_train": rgan_result.get("pred_train"),
+                            "pred_test": rgan_result["pred_test"],
+                            "pipeline": "two_stage",
+                        },
+                        results_dir=results_dir,
+                        resume_store=resume_store,
+                        artifacts=[
+                            "models/rgan_regression.pt",
+                            "models/rgan_residual_generator.pt",
+                            "models/rgan_residual_discriminator.pt",
+                            "models/rgan_generator.pt",
+                            "models/rgan_discriminator.pt",
+                        ],
+                        metadata={"pipeline": "two_stage", "target_epochs": args.epochs},
+                    )
+                    stage_changed["rgan"] = True
+                    return rgan_result
+            else:
+                with log_phase(console, "Train R-GAN Joint (PyTorch)"):
+                    log_step("Calling train_rgan_backend...")
+                    rgan_result = train_rgan_backend(
+                        base_config,
+                        (G, D),
+                        data_splits,
+                        str(results_dir),
+                        tag="rgan",
+                    )
 
                 log_step(
                     f"R-GAN training completed. Train RMSE={rgan_result['train_stats'].get('rmse', 'N/A')}, "
@@ -1623,6 +2123,7 @@ def main():
                         "test_stats": rgan_result["test_stats"],
                         "pred_train": rgan_result.get("pred_train"),
                         "pred_test": rgan_result["pred_test"],
+                        "pipeline": "joint",
                     },
                     results_dir=results_dir,
                     resume_store=resume_store,
@@ -1631,6 +2132,7 @@ def main():
                         "models/rgan_discriminator.pt",
                     ] + (["models/rgan_generator_ema.pt"] if rgan_result.get("G_ema") else []),
                     metadata={
+                        "pipeline": "joint",
                         "checkpoint_epoch": int(max(rgan_result["history"].get("epoch", [0]) or [0])),
                         "target_epochs": args.epochs,
                     },
@@ -1639,42 +2141,39 @@ def main():
                 return rgan_result
 
         with log_phase(console, "Load R-GAN from prior results"):
-            pt_path = _prior_dir / "models" / "rgan_generator.pt"
-            log_step(f"Loading RGAN generator from: {pt_path}")
-            raw_generator_state = torch.load(pt_path, map_location=_load_device, weights_only=True)
-            G.load_state_dict(raw_generator_state)
-            G.eval()
-            _save_model_state_dict("rgan_generator", raw_generator_state)
-
-            disc_path = _prior_dir / "models" / "rgan_discriminator.pt"
-            if disc_path.exists():
-                disc_state = torch.load(disc_path, map_location=_load_device, weights_only=True)
-                D.load_state_dict(disc_state)
-                _save_model_state_dict("rgan_discriminator", disc_state)
+            bundle = _load_rgan_bundle_from_run_dir(
+                run_dir=_prior_dir,
+                n_in_current=Xtr.shape[-1],
+                L=base_config.L,
+                H=base_config.H,
+                device=_load_device,
+                prefer_ema=True,
+            )
+            log_step(f"Loaded prior RGAN pipeline={bundle['pipeline']}")
+            if bundle["pipeline"] == "two_stage":
+                _save_model("rgan_regression", bundle["F_hat"])
+                _save_model("rgan_residual_generator", bundle["G"])
+                _save_model("rgan_residual_discriminator", bundle["D"])
+                _save_model("rgan_generator", bundle["G"])
+                _save_model("rgan_discriminator", bundle["D"])
             else:
-                log_warn("Prior results do not include rgan_discriminator.pt; skipping discriminator artifact copy.")
-
-            G_ema = None
-            ema_path = _prior_dir / "models" / "rgan_generator_ema.pt"
-            if ema_path.exists():
-                try:
-                    import copy
-                    G_ema = copy.deepcopy(G)
-                    ema_state = torch.load(ema_path, map_location=_load_device, weights_only=True)
-                    G_ema.load_state_dict(ema_state)
-                    _save_model_state_dict("rgan_generator_ema", ema_state)
+                _save_model("rgan_generator", bundle["G"])
+                if bundle.get("D") is not None:
+                    _save_model("rgan_discriminator", bundle["D"])
+                else:
+                    log_warn("Prior results do not include rgan_discriminator.pt; skipping discriminator artifact copy.")
+                if bundle.get("G_ema") is not None:
+                    _save_model("rgan_generator_ema", bundle["G_ema"])
                     log_step("Loaded real EMA checkpoint from prior results.")
-                except Exception as e:
-                    log_step(f"WARNING: Could not load EMA checkpoint ({e}); skipping EMA artifact.")
-                    G_ema = None
 
-            rgan_eval_model = select_eval_generator_backend(G, G_ema)
-            _, rgan_train_pred_loaded = compute_metrics_backend(rgan_eval_model, Xtr, Ytr)
-            _, rgan_test_pred_loaded = compute_metrics_backend(rgan_eval_model, Xte, Yte)
+            _, rgan_train_pred_loaded = _predict_rgan_bundle(
+                bundle, Xtr, Y=Ytr, batch_size=max(1, base_config.eval_batch_size), deterministic=True, seed=args.seed
+            )
+            _, rgan_test_pred_loaded = _predict_rgan_bundle(
+                bundle, Xte, Y=Yte, batch_size=max(1, base_config.eval_batch_size), deterministic=True, seed=args.seed
+            )
             rgan_result = {
-                "G": G,
-                "D": D,
-                "G_ema": G_ema,
+                **bundle,
                 "history": {
                     "epoch": [],
                     "train_rmse": [],
@@ -1689,6 +2188,18 @@ def main():
                 "pred_test": rgan_test_pred_loaded,
             }
             log_step(f"RGAN loaded. Test RMSE={rgan_result['test_stats'].get('rmse', 'N/A')}")
+            artifact_paths = [
+                "models/rgan_generator.pt",
+                "models/rgan_discriminator.pt",
+            ] + (["models/rgan_generator_ema.pt"] if bundle.get("G_ema") is not None else [])
+            if bundle["pipeline"] == "two_stage":
+                artifact_paths = [
+                    "models/rgan_regression.pt",
+                    "models/rgan_residual_generator.pt",
+                    "models/rgan_residual_discriminator.pt",
+                    "models/rgan_generator.pt",
+                    "models/rgan_discriminator.pt",
+                ]
             _save_stage_artifact_cache(
                 resume_manifest,
                 "rgan",
@@ -1698,24 +2209,23 @@ def main():
                     "test_stats": rgan_result["test_stats"],
                     "pred_train": rgan_result.get("pred_train"),
                     "pred_test": rgan_result["pred_test"],
+                    "pipeline": bundle["pipeline"],
                 },
                 results_dir=results_dir,
                 resume_store=resume_store,
-                artifacts=[
-                    "models/rgan_generator.pt",
-                    "models/rgan_discriminator.pt",
-                ] + (["models/rgan_generator_ema.pt"] if G_ema is not None else []),
-                metadata={"loaded_from_prior_results": True, "target_epochs": args.epochs},
+                artifacts=artifact_paths,
+                metadata={
+                    "loaded_from_prior_results": True,
+                    "pipeline": bundle["pipeline"],
+                    "target_epochs": args.epochs,
+                },
             )
             stage_changed["rgan"] = True
             return rgan_result
 
     if standalone_rgan_only:
         rgan_out = _train_or_load_rgan()
-        rgan_architecture = {
-            "generator": describe_model(G),
-            "discriminator": describe_model(D),
-        }
+        rgan_architecture = _describe_rgan_architecture(rgan_out, generator_fallback=G, discriminator_fallback=D)
         env_info = _collect_environment_info(args.seed)
         skipped_models = {
             "lstm": _make_skipped_model(),
@@ -1748,33 +2258,11 @@ def main():
                 test=rgan_out["test_stats"],
                 history=rgan_out["history"],
                 architecture=rgan_architecture,
-                config=dict(
+                config=_build_rgan_metrics_config(
+                    base_config,
                     n_in=int(Xtr.shape[-1]),
-                    units_g=base_config.units_g,
-                    units_d=base_config.units_d,
-                    lambda_reg=base_config.lambda_reg,
-                    lrG=base_config.lr_g,
-                    lrD=base_config.lr_d,
-                    dropout=base_config.dropout,
-                    g_layers=base_config.g_layers,
-                    d_layers=base_config.d_layers,
-                    g_dense=(g_dense_act if g_dense_act else "linear"),
-                    g_dense_activation=(g_dense_act if g_dense_act else "linear"),
-                    d_activation=base_config.d_activation or "sigmoid",
-                    gan_variant=base_config.gan_variant,
-                    d_steps=base_config.d_steps,
-                    g_steps=base_config.g_steps,
-                    wgan_gp_lambda=base_config.wgan_gp_lambda,
-                    wgan_clip_value=base_config.wgan_clip_value,
-                    use_logits=base_config.use_logits,
-                    amp=base_config.amp,
-                    device=base_config.device,
-                    noise_dim=base_config.noise_dim,
-                    lambda_diversity=base_config.lambda_diversity,
-                    preload_to_device=base_config.preload_to_device,
-                    compile_mode=base_config.compile_mode,
-                    critic_reg_interval=base_config.critic_reg_interval,
-                    critic_arch=base_config.critic_arch,
+                    g_dense_act=g_dense_act,
+                    pipeline=rgan_out.get("pipeline", base_config.pipeline),
                 ),
             ),
             charts=dict(
@@ -2268,11 +2756,17 @@ def main():
 
     # ── Parallel bootstrap uncertainty for all models (train + test) ────
     log_info("Computing RGAN train predictions for bootstrap...")
-    rgan_eval_model = select_eval_generator_backend(rgan_out["G"], rgan_out.get("G_ema"))
     if rgan_out.get("pred_train") is not None:
         rgan_train_pred = rgan_out["pred_train"]
     else:
-        _, rgan_train_pred = compute_metrics_backend(rgan_eval_model, Xtr, Ytr)
+        _, rgan_train_pred = _predict_rgan_bundle(
+            rgan_out,
+            Xtr,
+            Y=Ytr,
+            batch_size=max(1, base_config.eval_batch_size),
+            deterministic=True,
+            seed=args.seed,
+        )
     log_info("RGAN train predictions computed.")
 
     train_kwargs = dict(
@@ -2482,7 +2976,14 @@ def main():
             _gpu_t0 = time.perf_counter()
 
             log_info("    Predicting: RGAN...")
-            _, rgan_noise_pred = compute_metrics_backend(rgan_eval_model, Xte_noisy, Yte)
+            _, rgan_noise_pred = _predict_rgan_bundle(
+                rgan_out,
+                Xte_noisy,
+                Y=Yte,
+                batch_size=max(1, base_config.eval_batch_size),
+                deterministic=True,
+                seed=args.seed,
+            )
             log_info("    Predicting: LSTM...")
             lstm_noise_pred = _gpu_predict(lstm_out["model"], Xte_noisy)
             log_info("    Predicting: DLinear...")
@@ -2864,10 +3365,7 @@ def main():
         for model_name, results in model_results.items()
     }
 
-    rgan_architecture = {
-        "generator": describe_model(G),
-        "discriminator": describe_model(D),
-    }
+    rgan_architecture = _describe_rgan_architecture(rgan_out, generator_fallback=G, discriminator_fallback=D)
     lstm_architecture = describe_model(lstm_out["model"])
 
     env_info = _collect_environment_info(args.seed)
@@ -2889,33 +3387,11 @@ def main():
             test=rgan_out["test_stats"],
             history=rgan_out["history"],
             architecture=rgan_architecture,
-            config=dict(
+            config=_build_rgan_metrics_config(
+                base_config,
                 n_in=int(Xtr.shape[-1]),
-                units_g=base_config.units_g,
-                units_d=base_config.units_d,
-                lambda_reg=base_config.lambda_reg,
-                lrG=base_config.lr_g,
-                lrD=base_config.lr_d,
-                dropout=base_config.dropout,
-                g_layers=base_config.g_layers,
-                d_layers=base_config.d_layers,
-                g_dense=(g_dense_act if g_dense_act else "linear"),
-                g_dense_activation=(g_dense_act if g_dense_act else "linear"),
-                d_activation=base_config.d_activation or "sigmoid",
-                gan_variant=base_config.gan_variant,
-                d_steps=base_config.d_steps,
-                g_steps=base_config.g_steps,
-                wgan_gp_lambda=base_config.wgan_gp_lambda,
-                wgan_clip_value=base_config.wgan_clip_value,
-                use_logits=base_config.use_logits,
-                amp=base_config.amp,
-                device=base_config.device,
-                noise_dim=base_config.noise_dim,
-                lambda_diversity=base_config.lambda_diversity,
-                preload_to_device=base_config.preload_to_device,
-                compile_mode=base_config.compile_mode,
-                critic_reg_interval=base_config.critic_reg_interval,
-                critic_arch=base_config.critic_arch,
+                g_dense_act=g_dense_act,
+                pipeline=rgan_out.get("pipeline", base_config.pipeline),
             ),
         ),
         lstm=dict(

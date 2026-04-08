@@ -164,48 +164,59 @@ def compute_metrics(
         - A dictionary of error metrics (RMSE, MAE, etc.).
         - The predicted values as a numpy array.
     """
-    G.eval()
-    # Determine device from model parameters
-    device = next(G.parameters()).device
-
-    n_samples = len(X)
-    bs = max(1, int(batch_size))
     if torch.is_tensor(Y):
-        Y_shape = tuple(Y.shape)
-        Y_dtype = np.float32
         Y_ref = Y.detach().cpu().numpy()
     else:
-        Y_shape = Y.shape
-        Y_dtype = Y.dtype
         Y_ref = Y
+    Yp = predict_generator_forecasts(G, X, batch_size=batch_size, stochastic=False)
+    stats = error_stats(Y_ref.reshape(-1), Yp.reshape(-1))
+    return stats, Yp
 
-    Yp = np.empty(Y_shape, dtype=Y_dtype)
+
+def predict_generator_forecasts(
+    G: nn.Module,
+    X: Union[np.ndarray, torch.Tensor],
+    batch_size: int = 512,
+    stochastic: bool = False,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Run generator inference without needing reference targets."""
+    G.eval()
+    device = next(G.parameters()).device
+    n_samples = len(X)
+    bs = max(1, int(batch_size))
+    noise_dim = int(getattr(G, "noise_dim", 0) or 0)
+    rng = np.random.default_rng(seed) if seed is not None else None
+    preds: List[np.ndarray] = []
 
     while True:
         try:
+            preds.clear()
             idx = 0
             with torch.inference_mode():
                 while idx < n_samples:
                     end = min(idx + bs, n_samples)
                     Xb = _prepare_batch_tensor(X[idx:end], device)
+                    z = None
+                    if stochastic and noise_dim > 0:
+                        z_np = (rng.standard_normal((Xb.size(0), Xb.size(1), noise_dim)).astype(np.float32)
+                                if rng is not None else np.random.randn(Xb.size(0), Xb.size(1), noise_dim).astype(np.float32))
+                        z = torch.from_numpy(z_np).to(device=device, non_blocking=True)
                     with AMP.autocast(
                         device.type, enabled=(device.type == "cuda" and AMP.available)
                     ):
-                        Yb = G(Xb)
-                    Yp[idx:end] = Yb.detach().cpu().numpy()
+                        Yb = G(Xb, z) if z is not None else G(Xb)
+                    preds.append(Yb.detach().cpu().float().numpy())
                     idx = end
                 if device.type == "cuda":
                     torch.cuda.synchronize()
-            break
+            return np.concatenate(preds, axis=0)
         except torch.cuda.OutOfMemoryError:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             if bs == 1:
                 raise
             bs = max(1, bs // 2)
-
-    stats = error_stats(Y_ref.reshape(-1), Yp.reshape(-1))
-    return stats, Yp
 
 
 def _gradient_penalty(
@@ -1036,6 +1047,7 @@ def train_rgan_torch(
         "G": G,
         "G_ema": G_ema,
         "D": D,
+        "pipeline": "joint",
         "history": hist,
         "train_stats": train_stats,
         "test_stats": test_stats,
@@ -1043,4 +1055,405 @@ def train_rgan_torch(
         "pred_test": Y_pred,
         "lambda_reg_final": lambda_reg,
         "resumed_from_epoch": resumed_from_epoch,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Two-Stage Pipeline (Paper Algorithm 1)
+# ---------------------------------------------------------------------------
+
+
+def _predict_batched(
+    model: nn.Module,
+    X: Union[np.ndarray, torch.Tensor],
+    device: torch.device,
+    batch_size: int = 512,
+) -> np.ndarray:
+    """Run model inference in batches and return numpy predictions."""
+    model.eval()
+    n = len(X)
+    parts: List[np.ndarray] = []
+    with torch.inference_mode():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            Xb = _prepare_batch_tensor(X[start:end], device)
+            Yb = model(Xb)
+            parts.append(Yb.detach().cpu().float().numpy())
+    return np.concatenate(parts, axis=0)
+
+
+def compute_hybrid_metrics(
+    regression_model: nn.Module,
+    residual_generator: nn.Module,
+    X: Union[np.ndarray, torch.Tensor],
+    Y: Union[np.ndarray, torch.Tensor],
+    batch_size: int = 512,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+) -> Tuple[Dict[str, float], np.ndarray]:
+    """Compute metrics using the hybrid forecast: f̂(X) + G(z).
+
+    When deterministic=True, uses f̂(X) only (G(z) has E[G(z)]≈0 when trained
+    well, so omitting it gives the point forecast). When deterministic=False,
+    adds a single stochastic residual sample.
+    """
+    Y_pred = predict_hybrid_forecasts(
+        regression_model,
+        residual_generator,
+        X,
+        batch_size=batch_size,
+        deterministic=deterministic,
+        seed=seed,
+    )
+
+    if torch.is_tensor(Y):
+        Y_ref = Y.detach().cpu().numpy()
+    else:
+        Y_ref = Y
+    stats = error_stats(Y_ref.reshape(-1), Y_pred.reshape(-1))
+    return stats, Y_pred
+
+
+def predict_hybrid_forecasts(
+    regression_model: nn.Module,
+    residual_generator: nn.Module,
+    X: Union[np.ndarray, torch.Tensor],
+    batch_size: int = 512,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Run two-stage hybrid inference, optionally sampling residual noise."""
+    device = next(regression_model.parameters()).device
+    Y_reg = _predict_batched(regression_model, X, device, batch_size)
+    if deterministic:
+        return Y_reg
+
+    residual_generator.eval()
+    noise_dim = residual_generator.noise_dim
+    H = residual_generator.H
+    n = len(X)
+    rng = np.random.default_rng(seed) if seed is not None else None
+    residual_parts: List[np.ndarray] = []
+    with torch.inference_mode():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            bs = end - start
+            z_np = (rng.standard_normal((bs, H, noise_dim)).astype(np.float32)
+                    if rng is not None else np.random.randn(bs, H, noise_dim).astype(np.float32))
+            z = torch.from_numpy(z_np).to(device=device, non_blocking=True)
+            r = residual_generator(z)
+            residual_parts.append(r.detach().cpu().float().numpy())
+    residuals = np.concatenate(residual_parts, axis=0)
+    return Y_reg + residuals
+
+
+def _score_residual_wgan(
+    critic: nn.Module,
+    residual_generator: nn.Module,
+    residuals: Union[np.ndarray, torch.Tensor],
+    device: torch.device,
+    batch_size: int = 512,
+    seed: Optional[int] = None,
+) -> float:
+    """Estimate validation Wasserstein gap on held-out residuals."""
+    critic.eval()
+    residual_generator.eval()
+    noise_dim = residual_generator.noise_dim
+    horizon = residual_generator.H
+    rng = np.random.default_rng(seed) if seed is not None else None
+    real_scores: List[float] = []
+    fake_scores: List[float] = []
+    n = len(residuals)
+    with torch.inference_mode():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            Rb = _prepare_batch_tensor(residuals[start:end], device).float()
+            bs = end - start
+            z_np = (rng.standard_normal((bs, horizon, noise_dim)).astype(np.float32)
+                    if rng is not None else np.random.randn(bs, horizon, noise_dim).astype(np.float32))
+            z = torch.from_numpy(z_np).to(device=device, non_blocking=True)
+            R_fake = residual_generator(z)
+            real_scores.append(float(critic(Rb).mean().detach().item()))
+            fake_scores.append(float(critic(R_fake).mean().detach().item()))
+    return float(np.mean(real_scores) - np.mean(fake_scores))
+
+
+def train_two_stage(
+    config: TrainConfig,
+    models: Tuple[nn.Module, nn.Module, nn.Module],
+    data_splits: Dict[str, np.ndarray],
+    results_dir: str,
+    tag: str = "rgan_two_stage",
+) -> Dict[str, Any]:
+    """Train the two-stage Regression-WGAN pipeline (Paper Algorithm 1).
+
+    Stage 1: Train regression model f̂(X) on MSE loss.
+    Stage 2: Compute residuals, train WGAN G(z)/D(r) on residuals.
+
+    Args:
+        config: Training configuration.
+        models: Tuple of (RegressionModel, ResidualGenerator, Discriminator).
+        data_splits: Dict with Xtr, Ytr, Xval, Yval, Xte, Yte.
+        results_dir: Directory for saving results.
+        tag: Experiment tag.
+
+    Returns:
+        Dict with trained models, history, and evaluation stats.
+    """
+    F_hat, G, D = models
+    console = get_console()
+
+    requested_device = torch.device(config.device)
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        if config.strict_device:
+            raise RuntimeError(f"CUDA device {config.device} requested but unavailable.")
+        requested_device = torch.device("cpu")
+    device = requested_device
+
+    F_hat.to(device)
+    G.to(device)
+    D.to(device)
+
+    Xtr, Ytr = data_splits["Xtr"], data_splits["Ytr"]
+    Xval, Yval = data_splits["Xval"], data_splits["Yval"]
+    Xte, Yte = data_splits["Xte"], data_splits["Yte"]
+
+    log_info("=" * 60)
+    log_info("TWO-STAGE PIPELINE (Paper Algorithm 1)")
+    log_info("=" * 60)
+
+    # ------------------------------------------------------------------
+    # STAGE 1: Train Regression Model f̂ (Algorithm Steps 3-6)
+    # ------------------------------------------------------------------
+    log_info("STAGE 1: Training Regression Model f̂(X)")
+    log_step(f"  epochs={config.regression_epochs}, lr={config.regression_lr}, patience={config.regression_patience}")
+
+    opt_f = torch.optim.Adam(F_hat.parameters(), lr=config.regression_lr)
+    mse_loss = nn.MSELoss()
+    best_val_rmse = float("inf")
+    best_f_state = None
+    bad_epochs = 0
+    reg_history: Dict[str, List[float]] = {"epoch": [], "train_loss": [], "val_rmse": []}
+
+    # Create DataLoader for Stage 1
+    from torch.utils.data import DataLoader, TensorDataset
+    train_ds = TensorDataset(
+        torch.from_numpy(Xtr).float(),
+        torch.from_numpy(Ytr).float(),
+    )
+    train_loader = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=True,
+        pin_memory=(device.type == "cuda"), num_workers=0, drop_last=False,
+    )
+
+    eval_bs = max(1, config.eval_batch_size)
+
+    with epoch_progress(config.regression_epochs, description="Stage 1: Regression") as (progress, task_id):
+        for epoch in range(1, config.regression_epochs + 1):
+            F_hat.train()
+            epoch_losses: List[float] = []
+            for Xb, Yb in train_loader:
+                Xb = Xb.to(device, non_blocking=True)
+                Yb = Yb.to(device, non_blocking=True)
+                opt_f.zero_grad(set_to_none=True)
+                Y_pred = F_hat(Xb)
+                if Y_pred.dtype != Yb.dtype:
+                    Yb = Yb.to(dtype=Y_pred.dtype)
+                loss = mse_loss(Y_pred, Yb)
+                loss.backward()
+                clip_grad_value_(F_hat.parameters(), config.grad_clip)
+                opt_f.step()
+                epoch_losses.append(loss.detach().item())
+
+            mean_loss = float(np.mean(epoch_losses))
+            reg_history["train_loss"].append(mean_loss)
+
+            # Validate
+            val_stats, _ = compute_metrics(F_hat, Xval, Yval, batch_size=eval_bs)
+            val_rmse = val_stats["rmse"]
+            reg_history["epoch"].append(epoch)
+            reg_history["val_rmse"].append(val_rmse)
+
+            update_epoch(progress, task_id, epoch, config.regression_epochs, {
+                "Loss": mean_loss, "Val": val_rmse,
+            })
+
+            if np.isnan(val_rmse):
+                bad_epochs += 1
+            elif val_rmse < best_val_rmse - 1e-7:
+                log_step(f"  Epoch {epoch}: new best val RMSE={val_rmse:.6f}")
+                best_val_rmse = val_rmse
+                best_f_state = copy.deepcopy(F_hat.state_dict())
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= config.regression_patience:
+                    log_info(f"  Early stopping at epoch {epoch}, best_val={best_val_rmse:.6f}")
+                    break
+
+    if best_f_state is not None:
+        F_hat.load_state_dict(best_f_state)
+    log_info(f"Stage 1 complete. Best val RMSE={best_val_rmse:.6f}")
+
+    # ------------------------------------------------------------------
+    # Compute Residuals (Algorithm Step 6): r_t = Y - f̂(X)
+    # ------------------------------------------------------------------
+    log_info("Computing residuals r_t = Y - f̂(X)")
+    Y_hat_train = _predict_batched(F_hat, Xtr, device, eval_bs)
+    R_train = Ytr - Y_hat_train  # (N, H, 1) residuals
+
+    Y_hat_val = _predict_batched(F_hat, Xval, device, eval_bs)
+    R_val = Yval - Y_hat_val
+
+    log_step(f"  Residuals — train mean={R_train.mean():.6f}, std={R_train.std():.6f}")
+    log_step(f"  Residuals — val   mean={R_val.mean():.6f}, std={R_val.std():.6f}")
+
+    # ------------------------------------------------------------------
+    # STAGE 2: Train WGAN on Residuals (Algorithm Steps 7-20)
+    # ------------------------------------------------------------------
+    log_info("STAGE 2: Training WGAN on Residuals")
+    log_step(f"  epochs={config.epochs}, d_steps={config.d_steps}, gp_lambda={config.wgan_gp_lambda}")
+
+    noise_dim = G.noise_dim
+    H = G.H
+    optG = torch.optim.Adam(G.parameters(), lr=config.lr_g, weight_decay=config.weight_decay)
+    optD = torch.optim.Adam(D.parameters(), lr=config.lr_d, weight_decay=config.weight_decay)
+
+    d_steps = max(1, config.d_steps)
+    gp_lambda = config.wgan_gp_lambda
+
+    residual_ds = TensorDataset(torch.from_numpy(R_train).float())
+    residual_loader = DataLoader(
+        residual_ds, batch_size=config.batch_size, shuffle=True,
+        pin_memory=(device.type == "cuda"), num_workers=0, drop_last=True,
+    )
+
+    wgan_history: Dict[str, List[float]] = {
+        "epoch": [], "D_loss": [], "G_loss": [],
+        "D_real_mean": [], "D_fake_mean": [],
+        "val_wasserstein": [],
+    }
+    best_val_gap = float("-inf")
+    best_g_state = copy.deepcopy(G.state_dict())
+    best_d_state = copy.deepcopy(D.state_dict())
+    bad_wgan_epochs = 0
+    val_eval_seed = int(config.seed) + 1729
+
+    with epoch_progress(config.epochs, description="Stage 2: WGAN Residuals") as (progress, task_id):
+        for epoch in range(1, config.epochs + 1):
+            G.train()
+            D.train()
+            epoch_D_losses: List[float] = []
+            epoch_G_losses: List[float] = []
+            epoch_D_real: List[float] = []
+            epoch_D_fake: List[float] = []
+
+            for (Rb,) in residual_loader:
+                Rb = Rb.to(device, non_blocking=True)
+                bs = Rb.size(0)
+
+                # --- Critic update (k steps) ---
+                for _ in range(d_steps):
+                    optD.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        z_d = torch.randn(bs, H, noise_dim, device=device)
+                        R_fake = G(z_d)
+
+                    D_real = D(Rb)
+                    D_fake = D(R_fake)
+                    D_loss_main = -(D_real.mean() - D_fake.mean())
+
+                    # Gradient penalty
+                    gp = _gradient_penalty(D, Rb, R_fake, device, gp_lambda)
+                    D_loss = D_loss_main + gp
+
+                    D_loss.backward()
+                    clip_grad_value_(D.parameters(), config.grad_clip)
+                    optD.step()
+
+                    epoch_D_losses.append(D_loss_main.detach().item())
+                    epoch_D_real.append(D_real.mean().detach().item())
+                    epoch_D_fake.append(D_fake.mean().detach().item())
+
+                # --- Generator update ---
+                optG.zero_grad(set_to_none=True)
+                z_g = torch.randn(bs, H, noise_dim, device=device)
+                R_fake = G(z_g)
+                G_loss = -D(R_fake).mean()
+
+                G_loss.backward()
+                clip_grad_value_(G.parameters(), config.grad_clip)
+                optG.step()
+
+                epoch_G_losses.append(G_loss.detach().item())
+
+            wgan_history["epoch"].append(epoch)
+            wgan_history["D_loss"].append(float(np.mean(epoch_D_losses)))
+            wgan_history["G_loss"].append(float(np.mean(epoch_G_losses)))
+            wgan_history["D_real_mean"].append(float(np.mean(epoch_D_real)))
+            wgan_history["D_fake_mean"].append(float(np.mean(epoch_D_fake)))
+            val_gap = _score_residual_wgan(
+                D,
+                G,
+                R_val,
+                device,
+                batch_size=eval_bs,
+                seed=val_eval_seed,
+            ) if len(R_val) else float("nan")
+            wgan_history["val_wasserstein"].append(val_gap)
+
+            update_epoch(progress, task_id, epoch, config.epochs, {
+                "D": wgan_history["D_loss"][-1],
+                "G": wgan_history["G_loss"][-1],
+                "ValGap": val_gap,
+            })
+
+            if np.isnan(val_gap):
+                bad_wgan_epochs += 1
+            elif val_gap > best_val_gap + 1e-7:
+                log_step(f"  Epoch {epoch}: new best residual val gap={val_gap:.6f}")
+                best_val_gap = val_gap
+                best_g_state = copy.deepcopy(G.state_dict())
+                best_d_state = copy.deepcopy(D.state_dict())
+                bad_wgan_epochs = 0
+            else:
+                bad_wgan_epochs += 1
+                if bad_wgan_epochs >= config.patience:
+                    log_info(
+                        f"  Residual WGAN early stopping at epoch {epoch}, best_val_gap={best_val_gap:.6f}"
+                    )
+                    break
+
+    log_info("Stage 2 complete.")
+    G.load_state_dict(best_g_state)
+    D.load_state_dict(best_d_state)
+
+    # ------------------------------------------------------------------
+    # Final Evaluation — Hybrid Forecast: x̂* = f̂(X) + G(z)
+    # ------------------------------------------------------------------
+    log_info("Computing final metrics with hybrid forecast f̂(X) + G(z)")
+
+    train_stats, train_pred = compute_hybrid_metrics(
+        F_hat, G, Xtr, Ytr, batch_size=eval_bs, deterministic=True,
+    )
+    test_stats, test_pred = compute_hybrid_metrics(
+        F_hat, G, Xte, Yte, batch_size=eval_bs, deterministic=True,
+    )
+    log_step(f"Final train RMSE={train_stats['rmse']:.6f}")
+    log_step(f"Final test  RMSE={test_stats['rmse']:.6f}")
+
+    return {
+        "F_hat": F_hat,
+        "G": G,
+        "G_ema": None,
+        "D": D,
+        "history": {
+            "regression": reg_history,
+            "wgan": wgan_history,
+        },
+        "train_stats": train_stats,
+        "test_stats": test_stats,
+        "pred_train": train_pred,
+        "pred_test": test_pred,
+        "pipeline": "two_stage",
     }

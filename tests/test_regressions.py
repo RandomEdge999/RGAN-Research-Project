@@ -21,7 +21,13 @@ from rgan.data import (
     make_windows_univariate,
     make_windows_with_covariates,
 )
-from rgan.models_torch import build_discriminator, build_generator
+from rgan.models_torch import (
+    build_discriminator,
+    build_generator,
+    build_regression_model,
+    build_residual_discriminator,
+    build_residual_generator,
+)
 from rgan.plots import plot_training_curves_overlay
 from rgan.rgan_torch import (
     _DEFAULT_PRELOAD_LIMIT_BYTES,
@@ -29,12 +35,16 @@ from rgan.rgan_torch import (
     _gradient_penalty,
     _should_apply_critic_regularizer,
     _should_preload_to_device,
+    compute_hybrid_metrics,
     train_rgan_torch,
 )
 from rgan.scripts.run_training import (
     _build_resume_signature,
+    _detect_rgan_pipeline,
     _extract_allowed_resume_flag_changes,
     _invalidate_stages_for_resume_flag_changes,
+    _load_rgan_bundle_from_run_dir,
+    _predict_rgan_bundle,
     _signature_differences,
     _strip_allowed_resume_flag_changes,
     _stage_entry_complete,
@@ -42,6 +52,8 @@ from rgan.scripts.run_training import (
 from rgan.scripts.run_augmentation import (
     _build_parser,
     _infer_generator_replay_config,
+    _infer_two_stage_replay_config,
+    _generate_rgan_synthetic_targets,
     _resolve_augmentation_data_config,
     _resolve_augmentation_seed,
     _resolve_rgan_source,
@@ -112,6 +124,10 @@ class ResidualFixRegressionTests(unittest.TestCase):
             instance_noise_decay=1.0,
             weight_decay=0.0,
             noise_dim=8,
+            pipeline="joint",
+            regression_epochs=10,
+            regression_lr=5e-4,
+            regression_patience=3,
             lambda_diversity=0.0,
             critic_reg_interval=1,
             critic_arch="tcn",
@@ -182,6 +198,28 @@ class ResidualFixRegressionTests(unittest.TestCase):
             self.assertEqual(_signature_differences(base_signature, _build_resume_signature(same_run_new_target)), [])
             diffs = _signature_differences(base_signature, _build_resume_signature(drifted_args))
             self.assertIn("training.batch_size: 8 -> 32", diffs)
+
+    def test_resume_signature_catches_pipeline_and_regression_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "toy.csv"
+            csv_path.write_text("timestamp,value\n1,1.0\n2,2.0\n", encoding="utf-8")
+
+            base_signature = _build_resume_signature(self._make_resume_args(csv_path))
+            changed_signature = _build_resume_signature(
+                self._make_resume_args(
+                    csv_path,
+                    pipeline="two_stage",
+                    regression_epochs=25,
+                    regression_lr=1e-3,
+                    regression_patience=9,
+                )
+            )
+
+            diffs = _signature_differences(base_signature, changed_signature)
+            self.assertIn("training.pipeline: 'joint' -> 'two_stage'", diffs)
+            self.assertIn("training.regression_epochs: 10 -> 25", diffs)
+            self.assertIn("training.regression_lr: 0.0005 -> 0.001", diffs)
+            self.assertIn("training.regression_patience: 3 -> 9", diffs)
 
     def test_resume_signature_allows_eval_flag_changes_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -709,6 +747,225 @@ class ResidualFixRegressionTests(unittest.TestCase):
                 model_label="RGAN",
             )
 
+    def test_detect_rgan_pipeline_prefers_metrics_then_run_config_then_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            models_dir = run_dir / "models"
+            models_dir.mkdir()
+
+            self.assertEqual(
+                _detect_rgan_pipeline(
+                    {"rgan": {"config": {"pipeline": "two_stage"}}},
+                    {"pipeline": "joint"},
+                    models_dir,
+                ),
+                "two_stage",
+            )
+            self.assertEqual(_detect_rgan_pipeline(None, {"pipeline": "two_stage"}, models_dir), "two_stage")
+
+            (models_dir / "rgan_regression.pt").write_bytes(b"x")
+            (models_dir / "rgan_residual_generator.pt").write_bytes(b"y")
+
+            self.assertEqual(_detect_rgan_pipeline(None, {}, models_dir), "two_stage")
+            self.assertEqual(_detect_rgan_pipeline(None, {}, None), "joint")
+
+    def test_two_stage_replay_config_uses_saved_metadata(self):
+        saved_metrics = {
+            "rgan": {
+                "config": {
+                    "pipeline": "two_stage",
+                    "n_in": 2,
+                    "units_g": 8,
+                    "g_layers": 2,
+                    "noise_dim": 4,
+                }
+            }
+        }
+
+        replay_cfg = _infer_two_stage_replay_config(saved_metrics, n_in_current=2, model_label="RGAN")
+
+        self.assertEqual(replay_cfg["pipeline"], "two_stage")
+        self.assertEqual(replay_cfg["n_in"], 2)
+        self.assertEqual(replay_cfg["units"], 8)
+        self.assertEqual(replay_cfg["num_layers"], 2)
+        self.assertEqual(replay_cfg["noise_dim"], 4)
+
+        with self.assertRaises(ValueError):
+            _infer_two_stage_replay_config(saved_metrics, n_in_current=1, model_label="RGAN")
+
+    def test_compute_hybrid_metrics_distinguishes_deterministic_and_stochastic_modes(self):
+        class ZeroRegression(torch.nn.Module):
+            def __init__(self, horizon):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.horizon = horizon
+
+            def forward(self, x):
+                return torch.zeros(x.size(0), self.horizon, 1, device=x.device, dtype=x.dtype)
+
+        class ConstantResidual(torch.nn.Module):
+            def __init__(self, horizon, value=1.0):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.noise_dim = 2
+                self.H = horizon
+                self.value = float(value)
+
+            def forward(self, z):
+                return torch.full((z.size(0), self.H, 1), self.value, device=z.device, dtype=z.dtype)
+
+        X = np.zeros((4, 5, 1), dtype=np.float32)
+        Y = np.zeros((4, 3, 1), dtype=np.float32)
+        regression = ZeroRegression(horizon=3)
+        residual = ConstantResidual(horizon=3, value=1.5)
+
+        det_stats, det_pred = compute_hybrid_metrics(regression, residual, X, Y, deterministic=True)
+        stoch_stats, stoch_pred = compute_hybrid_metrics(regression, residual, X, Y, deterministic=False)
+
+        np.testing.assert_allclose(det_pred, 0.0)
+        np.testing.assert_allclose(stoch_pred, 1.5)
+        self.assertLess(det_stats["rmse"], stoch_stats["rmse"])
+
+    def test_predict_rgan_bundle_uses_hybrid_path_for_two_stage(self):
+        class ZeroRegression(torch.nn.Module):
+            def __init__(self, horizon):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.horizon = horizon
+
+            def forward(self, x):
+                return torch.zeros(x.size(0), self.horizon, 1, device=x.device, dtype=x.dtype)
+
+        class ConstantResidual(torch.nn.Module):
+            def __init__(self, horizon, value):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.noise_dim = 2
+                self.H = horizon
+                self.value = float(value)
+
+            def forward(self, z):
+                return torch.full((z.size(0), self.H, 1), self.value, device=z.device, dtype=z.dtype)
+
+        X = np.zeros((3, 6, 1), dtype=np.float32)
+        Y = np.zeros((3, 2, 1), dtype=np.float32)
+        rgan_out = {
+            "pipeline": "two_stage",
+            "F_hat": ZeroRegression(horizon=2),
+            "G": ConstantResidual(horizon=2, value=2.0),
+            "G_ema": None,
+        }
+
+        det_stats, det_pred = _predict_rgan_bundle(rgan_out, X, Y=Y, deterministic=True, seed=7)
+        _, stoch_pred = _predict_rgan_bundle(rgan_out, X, Y=Y, deterministic=False, seed=7)
+
+        np.testing.assert_allclose(det_pred, 0.0)
+        np.testing.assert_allclose(stoch_pred, 2.0)
+        self.assertEqual(det_stats["rmse"], 0.0)
+
+    def test_load_rgan_bundle_from_run_dir_uses_two_stage_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            models_dir = run_dir / "models"
+            models_dir.mkdir()
+
+            metrics = {
+                "L": 12,
+                "H": 3,
+                "rgan": {
+                    "config": {
+                        "pipeline": "two_stage",
+                        "n_in": 1,
+                        "units_g": 8,
+                        "units_d": 8,
+                        "g_layers": 1,
+                        "d_layers": 1,
+                        "dropout": 0.0,
+                        "noise_dim": 4,
+                        "d_activation": "linear",
+                        "critic_arch": "tcn",
+                    }
+                },
+            }
+            (run_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+            (run_dir / "run_config.json").write_text(json.dumps({"args": {"pipeline": "two_stage"}}), encoding="utf-8")
+
+            regression = build_regression_model(L=12, H=3, n_in=1, units=8, num_layers=1, dropout=0.0)
+            residual = build_residual_generator(H=3, noise_dim=4, units=8, num_layers=1, dropout=0.0)
+            critic = build_residual_discriminator(
+                H=3, units=8, num_layers=1, dropout=0.0, activation="linear", critic_arch="tcn"
+            )
+            torch.save(regression.state_dict(), models_dir / "rgan_regression.pt")
+            torch.save(residual.state_dict(), models_dir / "rgan_residual_generator.pt")
+            torch.save(critic.state_dict(), models_dir / "rgan_residual_discriminator.pt")
+            torch.save(residual.state_dict(), models_dir / "rgan_generator.pt")
+            torch.save(critic.state_dict(), models_dir / "rgan_discriminator.pt")
+
+            with mock.patch("rgan.models_torch.build_generator", side_effect=AssertionError("legacy generator should not be built")):
+                bundle = _load_rgan_bundle_from_run_dir(
+                    run_dir=run_dir,
+                    n_in_current=1,
+                    L=12,
+                    H=3,
+                    device=torch.device("cpu"),
+                    prefer_ema=False,
+                )
+
+            self.assertEqual(bundle["pipeline"], "two_stage")
+            self.assertIn("F_hat", bundle)
+            self.assertEqual(type(bundle["G"]).__name__, "ResidualGenerator")
+
+    def test_generate_rgan_synthetic_targets_supports_two_stage_hybrid_forecasts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            models_dir = run_dir / "models"
+            models_dir.mkdir()
+
+            metrics = {
+                "L": 12,
+                "H": 3,
+                "rgan": {
+                    "config": {
+                        "pipeline": "two_stage",
+                        "n_in": 1,
+                        "units_g": 8,
+                        "units_d": 8,
+                        "g_layers": 1,
+                        "d_layers": 1,
+                        "dropout": 0.0,
+                        "noise_dim": 4,
+                        "d_activation": "linear",
+                        "critic_arch": "tcn",
+                    }
+                },
+            }
+            (run_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+            (run_dir / "run_config.json").write_text(json.dumps({"args": {"pipeline": "two_stage"}}), encoding="utf-8")
+
+            regression = build_regression_model(L=12, H=3, n_in=1, units=8, num_layers=1, dropout=0.0)
+            residual = build_residual_generator(H=3, noise_dim=4, units=8, num_layers=1, dropout=0.0)
+            critic = build_residual_discriminator(
+                H=3, units=8, num_layers=1, dropout=0.0, activation="linear", critic_arch="tcn"
+            )
+            torch.save(regression.state_dict(), models_dir / "rgan_regression.pt")
+            torch.save(residual.state_dict(), models_dir / "rgan_residual_generator.pt")
+            torch.save(critic.state_dict(), models_dir / "rgan_residual_discriminator.pt")
+            torch.save(residual.state_dict(), models_dir / "rgan_generator.pt")
+            torch.save(critic.state_dict(), models_dir / "rgan_discriminator.pt")
+
+            bundle = _load_rgan_bundle_from_run_dir(
+                run_dir=run_dir,
+                n_in_current=1,
+                L=12,
+                H=3,
+                device=torch.device("cpu"),
+                prefer_ema=False,
+            )
+            X = np.zeros((5, 12, 1), dtype=np.float32)
+            Y = _generate_rgan_synthetic_targets(bundle, X, seed=13, n_runs=2, batch_size=2)
+
+            self.assertEqual(Y.shape, (5, 3, 1))
+
     def test_covariate_windowing_preserves_input_width_for_augmentation(self):
         df = pd.DataFrame(
             {
@@ -911,6 +1168,74 @@ class ResidualFixRegressionTests(unittest.TestCase):
             self.assertEqual(metrics["rgan"]["config"]["critic_arch"], "tcn")
             self.assertTrue(metrics["lstm"].get("skipped", False))
             self.assertTrue(metrics["dlinear"].get("skipped", False))
+
+    def test_run_training_supports_two_stage_rgan_only_and_writes_explicit_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            csv_path = tmpdir / "toy.csv"
+            results_dir = tmpdir / "results"
+
+            rows = ["timestamp,value"]
+            start_ms = 1704067200000
+            for i in range(180):
+                rows.append(f"{start_ms + (i * 60000)},{1.0 + (i * 0.01):.6f}")
+            csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "rgan.scripts.run_training",
+                    "--csv",
+                    str(csv_path),
+                    "--target",
+                    "value",
+                    "--time_col",
+                    "timestamp",
+                    "--L",
+                    "12",
+                    "--H",
+                    "3",
+                    "--epochs",
+                    "1",
+                    "--regression_epochs",
+                    "1",
+                    "--pipeline",
+                    "two_stage",
+                    "--batch_size",
+                    "8",
+                    "--eval_batch_size",
+                    "16",
+                    "--noise_levels",
+                    "0",
+                    "--bootstrap_samples",
+                    "0",
+                    "--skip_classical",
+                    "--skip_noise_robustness",
+                    "--only_models",
+                    "rgan",
+                    "--critic_arch",
+                    "tcn",
+                    "--preload_to_device",
+                    "never",
+                    "--compile_mode",
+                    "off",
+                    "--results_dir",
+                    str(results_dir),
+                ],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            saved_models = {path.name for path in (results_dir / "models").glob("*.pt")}
+            self.assertIn("rgan_regression.pt", saved_models)
+            self.assertIn("rgan_residual_generator.pt", saved_models)
+            self.assertIn("rgan_residual_discriminator.pt", saved_models)
+            metrics = json.loads((results_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(metrics["rgan"]["config"]["pipeline"], "two_stage")
 
     def test_selective_retrain_saves_loaded_models_into_new_results_dir(self):
         from rgan.autoformer import Autoformer
