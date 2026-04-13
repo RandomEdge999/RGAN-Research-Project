@@ -123,6 +123,37 @@ Results are saved to `--results_dir` (default: `results/`):
 
 ---
 
+## Google Colab Integration
+
+The project has been adapted to run seamlessly in Google Colab, allowing easy experimentation without local setup.
+
+### What Was Changed
+- **Symlink handling**: Added conditional check to skip symlink creation in Colab (Windows-like environments don't support symlinks)
+- **Data acquisition**: Enhanced `colab_utils.py` to download real datasets via API or create synthetic fallback data
+- **Path management**: Created utilities to handle Colab's ephemeral filesystem and optional Google Drive mounting
+- **Package installation**: Automatic detection of Colab environment and installation of CUDA-compatible PyTorch
+- **Notebook generation**: Added `generate_colab_notebook.py` to produce a ready-to-run Colab notebook
+
+### How the Colab Version Works
+1. **Environment detection**: Uses `COLAB_GPU` environment variable to identify Colab runtime
+2. **Automatic setup**: `colab_utils.setup_project()` installs dependencies, configures matplotlib, and prepares data
+3. **Data flexibility**: Attempts to download real-world dataset (NASA POWER Austin hourly); falls back to synthetic sine-wave data if download fails
+4. **Demo configuration**: Uses reduced parameters (15 epochs, smaller networks) for Colab's free tier time limits
+5. **Optional persistence**: Can mount Google Drive to save results permanently
+
+### Inputs Needed
+- **Google Colab account** (free tier sufficient)
+- **Internet connection** (for dataset download if using real data)
+- **Optional**: Google Drive mounted for result persistence
+- **No local files required** – everything clones from GitHub
+
+### Outputs Produced
+- **Training results**: Saved to `results/colab_demo/` (or custom `--results_dir`)
+- **Metrics**: `metrics.json` with RMSE, MAE for all models
+- **Noise robustness tables**: CSV files showing performance under varying noise levels
+- **Visualizations**: Training curves, forecast plots, noise robustness charts
+- **Optional augmentation results**: Synthetic data quality metrics and augmentation comparison tables
+
 ## Cloud Training (AWS SageMaker)
 
 See `cloud/` for SageMaker infrastructure. Requires `cloud/config.yaml` (not tracked — contains AWS credentials).

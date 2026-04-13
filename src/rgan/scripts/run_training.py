@@ -1355,13 +1355,15 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Create/update a "latest" symlink for convenience
-    latest_link = results_dir.parent / "latest"
-    try:
-        if latest_link.is_symlink() or latest_link.exists():
-            latest_link.unlink()
-        latest_link.symlink_to(results_dir.name)
-    except OSError:
-        pass  # Symlinks may fail on some systems
+    # Skip symlink creation in Google Colab to avoid OSError
+    if 'COLAB_GPU' not in os.environ:
+        latest_link = results_dir.parent / "latest"
+        try:
+            if latest_link.is_symlink() or latest_link.exists():
+                latest_link.unlink()
+            latest_link.symlink_to(results_dir.name)
+        except OSError:
+            pass  # Symlinks may fail on some systems
 
     console.print(f"Results directory: {results_dir.resolve()}")
 
