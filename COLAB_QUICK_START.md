@@ -1,39 +1,39 @@
 # RGAN Colab Quick Start Guide
 
-## 🚀 One-Click Setup
+## One-Click Setup
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/RandomEdge999/RGAN-Research-Project/blob/main/RGAN_Colab_Demo.ipynb)
 
 **Quickest way to get started:** Click the button above to open the notebook in Google Colab, then click **"Runtime" → "Run all"**.
 
-## 📋 What You'll Get
+## What You'll Get
 
 This demo showcases **RGAN (Recurrent Generative Adversarial Network)** for noise-resilient time-series forecasting. In ~10-15 minutes you'll:
 
-1. ✅ **Install** all dependencies (PyTorch, NumPy, pandas, etc.)
-2. ✅ **Download** real-world dataset (NASA POWER Austin weather data)
-3. ✅ **Train** RGAN with LSTM generator/discriminator
-4. ✅ **Compare** against baselines (LSTM, DLinear, NLinear, etc.)
-5. ✅ **Visualize** results with interactive plots
-6. ✅ **Optional**: Generate synthetic data and run augmentation experiments
+1. **Install** all dependencies (PyTorch, NumPy, pandas, etc.)
+2. **Download** real-world dataset (NASA POWER Austin weather data)
+3. **Train** RGAN with LSTM generator/discriminator
+4. **Compare** against baselines (LSTM, DLinear, NLinear, etc.)
+5. **Visualize** results with interactive plots
+6. **Optional**: Generate synthetic data and run augmentation experiments
 
-## 🎯 Key Features
+## Key Features
 
 | Feature | Benefit |
 |---------|---------|
 | **Zero local setup** | Everything runs in your browser |
 | **Free GPU acceleration** | Colab provides T4/P100 GPU |
-| **Real + synthetic data** | Works even if APIs are down |
+| **Real + synthetic data** | Works even if APIs down |
 | **Complete workflow** | From data to results in one notebook |
 | **Educational** | Clear explanations at each step |
 
-## 🛠️ Step-by-Step Instructions
+## Step-by-Step Instructions
 
 ### Option 1: Colab (Recommended)
 1. **Click** the "Open in Colab" badge above
 2. **Sign in** to your Google account
 3. **Click** "Runtime" → "Run all" (or press `Ctrl+F9`)
-4. **Watch** the magic happen! ⚡
+4. **Watch** the magic happen! 
 
 ### Option 2: Local Jupyter
 ```bash
@@ -48,7 +48,7 @@ pip install -e .
 jupyter notebook RGAN_Colab_Demo.ipynb
 ```
 
-## 📊 What to Expect
+## What to Expect
 
 ### During Execution:
 1. **Setup (2-3 mins)**: Package installation and environment configuration
@@ -63,7 +63,7 @@ jupyter notebook RGAN_Colab_Demo.ipynb
 - **Training curves** visualizing generator/discriminator loss
 - **Forecast plots** comparing predictions vs actuals
 
-## 🔧 Customization Options
+## Customization Options
 
 ### Want a longer experiment?
 Modify the configuration cell to:
@@ -91,7 +91,7 @@ demo_config['time_col'] = 'your_time_column'
 2. Set `use_drive=True` in the `setup_project()` call
 3. Results will be saved to `Drive/MyDrive/RGAN-Research-Project/RGAN_Results/`
 
-## ⚠️ Common Issues & Solutions
+## Common Issues & Solutions
 
 | Issue | Solution |
 |-------|----------|
@@ -101,7 +101,7 @@ demo_config['time_col'] = 'your_time_column'
 | **"Symlink error"** | Ignore - non-critical convenience feature |
 | **"Package not found"** | Run the setup cell again |
 
-## 🎓 Learning Resources
+## Learning Resources
 
 ### Understanding RGAN:
 - **Core idea**: Train LSTM generator and discriminator adversarially
@@ -122,7 +122,7 @@ demo_config['time_col'] = 'your_time_column'
 - **Noise levels**: Controlled additive noise for robustness testing
 - **GAN variants**: WGAN-GP (Wasserstein GAN with gradient penalty)
 
-## 📈 Expected Results
+## Expected Results
 
 ### Typical Metrics (Synthetic Dataset):
 | Model | RMSE | MAE | Noise Robustness |
@@ -138,7 +138,7 @@ demo_config['time_col'] = 'your_time_column'
 3. **Forecast plots**: Predicted vs actual time series
 4. **Model comparison**: Bar charts of RMSE across models
 
-## 🚀 Next Steps After Demo
+## Next Steps After Demo
 
 ### For Researchers:
 1. **Full datasets**: Use `scripts/fetch_natural_datasets.py` to download all 15+ real datasets
@@ -158,7 +158,7 @@ demo_config['time_col'] = 'your_time_column'
 3. **Assignment ideas**: Have students implement new baseline models
 4. **Research projects**: Extend RGAN to new domains (finance, healthcare, etc.)
 
-## 🆘 Getting Help
+## Getting Help
 
 ### Documentation:
 - **Project README**: `README.md` (main documentation)
@@ -175,19 +175,19 @@ demo_config['time_col'] = 'your_time_column'
 
 ### Community:
 - **GitHub Discussions**: Feature requests and questions
-- **Star the repo**: Show your support! ⭐
+- **Star the repo**: Show your support! 
 
-## 🎉 Congratulations!
+## Congratulations!
 
 You're now ready to experiment with state-of-the-art noise-resilient time-series forecasting! The RGAN Colab demo provides:
 
-- ✅ **Zero-friction** experimentation
-- ✅ **GPU acceleration** for free
-- ✅ **Complete** research workflow
-- ✅ **Educational** value with clear explanations
-- ✅ **Scalable** to serious research
+- **Zero-friction** experimentation
+- **GPU acceleration** for free
+- **Complete** research workflow
+- **Educational** value with clear explanations
+- **Scalable** to serious research
 
-**Happy forecasting!** 🚀
+**Happy forecasting!** 
 
 ---
 

@@ -41,6 +41,7 @@ def install_packages(colab_quiet=True):
         "scikit-learn>=1.1",
         "rich>=13.0",
         "plotly>=5.22",
+        "pyyaml",
         "psutil>=5.9",
         "datasets>=2.0",
         "ipywidgets",  # for interactive plots
